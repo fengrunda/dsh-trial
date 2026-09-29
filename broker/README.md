@@ -35,11 +35,19 @@
 Pack 仍在共享：`~/.dsh/supervisor/thin-state/packs/`（票名用 `impl-trial-*` / `gate-trial-*` 隔离）。  
 Pack 字节上限默认 **12288**（与 `dsh-design-pack` maxPackBytes 对齐）；diff 截断默认 6144。
 
+人工 **不要**把本目录当 UX：Mac 路径是装 `plugins/dsh-trial-desk` → `dsh-trial start` → `dsh web`。desk ≠ 本 broker；web 只投 inbox / 读状态。短票仍 `--final`。无房间。**永不**碰 `broker-khub-prod`。
+
 ## 启动 / 停止
 
 ```bash
 source $DSH_HOME/load-env.sh   # Official DeepSeek；勿把 key 打进日志
 export DSH_PERMISSION_MODE=danger-full-access
+
+# 推荐包装（与 ./start.sh 相同进程）
+dsh-trial start
+dsh-trial start --once
+dsh-trial broker-status
+dsh-trial stop
 
 ./start.sh
 # 或：TRIAL_BROKER_POLL=30 ./start.sh

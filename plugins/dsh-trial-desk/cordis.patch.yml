@@ -1,0 +1,16 @@
+# Human/supervisor desk for dsh-trial.
+# Install into the profile used by `dsh web` (web / acp-lite) — UX only.
+# Desk ≠ broker: this plugin only writes trial inbox + reads thin-state.
+# Never open-slice, never rooms, never Hub webhooks, never broker-khub-prod.
+# Install sketch: dsh plugin --profile web add -w ./plugins/dsh-trial-desk
+- insert:
+    - id: trial-desk
+      name: dsh-trial-desk
+      config:
+        # Absolute, or relative to $DSH_HOME (default ~/.dsh when unset)
+        # dshHome:            # default: $DSH_HOME or $DSH_GLOBAL_HOME or ~/.dsh
+        # inboxRoot:          # default: $DSH_HOME/supervisor/trial/inbox
+        # thinStateRoot:      # default: $DSH_TRIAL_THIN_STATE or $DSH_HOME/supervisor/thin-state
+        # mailboxRoot:        # default: $DSH_TRIAL_MAILBOX or <thinState>/mailbox
+        # brokerDir:          # default: $TRIAL_BROKER_DIR or $DSH_HOME/broker-dsh-trial
+        # recentLimit: 8

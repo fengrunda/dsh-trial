@@ -10,7 +10,7 @@
   ],
   "profile": "acp-lite",
   "gate_profile": "acp-lite",
-  "cwd": "/path/to/your/workdir",
+  "cwd": "/tmp/dsh-trial-example-workdir",
   "max_rounds": 2,
   "notify": "hub",
   "notify_dry_run": true,

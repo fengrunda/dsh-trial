@@ -1,0 +1,45 @@
+{
+  "name": "dsh-trial-desk",
+  "version": "0.1.0-dev",
+  "private": true,
+  "description": "Human/supervisor desk for dsh-trial: drop Goal/chain/chain-reply into trial inbox and read thin-state. Not the broker; install into a web-facing profile.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./desk": "./lib/desk.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "schemas",
+    "examples",
+    "test",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check lib/desk.js && node --check lib/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-trial",
+    "desk",
+    "inbox"
+  ],
+  "license": "MIT"
+}

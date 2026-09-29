@@ -1,0 +1,10 @@
+# Example cordis.patch.yml fragment for dsh-trial-desk.
+# Merge under the *web-facing* profile (dsh web), not impl/gate trial tickets.
+- id: trial-desk
+  config:
+    # dshHome:            # $DSH_HOME / $DSH_GLOBAL_HOME / ~/.dsh
+    # inboxRoot: supervisor/trial/inbox
+    # thinStateRoot: supervisor/thin-state
+    # mailboxRoot: mailbox
+    # brokerDir: broker-dsh-trial
+    recentLimit: 8

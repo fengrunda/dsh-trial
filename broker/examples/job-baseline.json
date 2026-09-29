@@ -3,7 +3,7 @@
   "ticket": "impl-trial-broker-smoke-20260924",
   "pack": "trial-broker-smoke.pack.md",
   "profile": "acp-lite",
-  "cwd": "/workspace",
+  "cwd": "/tmp/dsh-trial-example-workdir",
   "role": "impl",
   "summary_name": "trial-broker-smoke",
   "note": "broker-dsh-trial smoke: open-slice --final, no rooms, no prod broker"

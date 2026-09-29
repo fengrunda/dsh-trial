@@ -209,5 +209,5 @@ dsh plugin --profile acp remove -w dsh-design-pack
 
 - trial profile：`acp-lite-trial` / `acp-trial`（含 `dsh-role-bridge`）。
 - 路由：`~/.dsh/supervisor/trial/routes.json`；上限：`…/limits.json`。
-- CLI：`dsh-trial status|report|limits`。
+- CLI：`dsh-trial start|stop|broker-status`；`status|goals` / `report` / `limits`。人工入口：`dsh-trial-desk` + `dsh web`（desk ≠ broker）。
 - 工头工具：`ask_supervisor` / `submit_for_review`（禁止执行票进房）。

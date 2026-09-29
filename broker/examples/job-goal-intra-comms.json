@@ -3,7 +3,7 @@
   "id": "job-goal-intra-comms-proto",
   "goal": "intra-comms-proto",
   "brief": "In /path/to/your/workdir, add farewell(name=None) -> str next to greet. Done when: function exists with one-line docstring, returns a farewell string, and a tiny test is added. IMPORTANT for this prototype: in the slice pack you write, leave the farewell *phrase/style* unspecified (e.g. say 'use the project farewell style' without defining the exact string) so the foreman must status=question to ask supervisor which exact template to use.",
-  "cwd": "/path/to/your/workdir",
+  "cwd": "/tmp/dsh-trial-example-workdir",
   "profile": "acp-lite",
   "gate_profile": "acp-lite",
   "supervisor_profile": "acp-lite",

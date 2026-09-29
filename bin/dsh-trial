@@ -1,39 +1,57 @@
 #!/usr/bin/env python3
-"""dsh-trial — observe & tune isolated broker-dsh-trial goals."""
+"""dsh-trial — start/stop the trial broker daemon; observe & tune goals.
+
+start / stop wrap broker/start.sh and broker/stop.sh (do not reinvent the daemon).
+status / goals list thin-state goals. broker-status prints pid/inbox (trial-broker.py --status).
+Desk (dsh web) is the human UX; this CLI is not a second inbox writer.
+Never touches broker-khub-prod.
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-_broker_candidates = []
-if os.environ.get("DSH_TRIAL_ROOT"):
-    _broker_candidates.append(Path(os.environ["DSH_TRIAL_ROOT"]) / "broker")
-_broker_candidates.append(_HERE.parent / "broker")
-_broker_candidates.append(Path("/workspace/dsh-trial/broker"))  # legacy box default
-for _b in _broker_candidates:
-    if (_b / "trial_lib.py").is_file():
-        sys.path.insert(0, str(_b))
-        break
-else:
-    sys.path.insert(0, str(_HERE.parent / "broker"))
 
-from trial_lib import (  # noqa: E402
-    GOALS,
-    LIMITS_PATH,
-    aggregate_report,
-    format_report_zh,
-    load_global_limits,
-    save_global_limits,
-    DEFAULT_LIMITS,
-    now_iso,
-)
+
+def _broker_candidates() -> list[Path]:
+    rows: list[Path] = []
+    if os.environ.get("DSH_TRIAL_ROOT"):
+        rows.append(Path(os.environ["DSH_TRIAL_ROOT"]) / "broker")
+    rows.append(_HERE.parent / "broker")
+    rows.append(Path("/workspace/dsh-trial/broker"))  # legacy box default
+    return rows
+
+
+def broker_dir() -> Path:
+    for b in _broker_candidates():
+        if (b / "trial_lib.py").is_file() or (b / "start.sh").is_file():
+            return b
+    return _HERE.parent / "broker"
+
+
+def _ensure_trial_lib() -> Path:
+    found = None
+    for b in _broker_candidates():
+        if (b / "trial_lib.py").is_file():
+            found = b
+            break
+    if found is None:
+        found = _HERE.parent / "broker"
+    inserted = str(found)
+    if inserted not in sys.path:
+        sys.path.insert(0, inserted)
+    return found
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    _ensure_trial_lib()
+    from trial_lib import GOALS  # noqa: E402
+
     if args.goal:
         path = GOALS / f"{args.goal}.json"
         if not path.is_file():
@@ -96,6 +114,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
+    _ensure_trial_lib()
+    from trial_lib import aggregate_report, format_report_zh  # noqa: E402
+
     rep = aggregate_report(since=args.since)
     if args.json:
         print(json.dumps(rep, ensure_ascii=False, indent=2))
@@ -105,6 +126,15 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def cmd_limits(args: argparse.Namespace) -> int:
+    _ensure_trial_lib()
+    from trial_lib import (  # noqa: E402
+        DEFAULT_LIMITS,
+        LIMITS_PATH,
+        load_global_limits,
+        now_iso,
+        save_global_limits,
+    )
+
     if args.limits_action == "show":
         data = load_global_limits()
         if args.json:
@@ -132,14 +162,65 @@ def cmd_limits(args: argparse.Namespace) -> int:
     return 2
 
 
+def _run_broker_script(script_name: str, extra: list[str] | None = None) -> int:
+    root = broker_dir()
+    script = root / script_name
+    if not script.is_file():
+        print(f"missing {script} (set DSH_TRIAL_ROOT to the dsh-trial checkout)", file=sys.stderr)
+        return 2
+    cmd = [str(script), *(extra or [])]
+    return subprocess.call(cmd)
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    return _run_broker_script("start.sh", list(args.passthrough or []))
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    return _run_broker_script("stop.sh", list(args.passthrough or []))
+
+
+def cmd_broker_status(args: argparse.Namespace) -> int:
+    root = broker_dir()
+    py = root / "trial-broker.py"
+    if not py.is_file():
+        print(f"missing {py} (set DSH_TRIAL_ROOT)", file=sys.stderr)
+        return 2
+    return subprocess.call([sys.executable, str(py), "--status"])
+
+
+def _add_goal_status_parser(sub: argparse._SubParsersAction, name: str, help_text: str) -> None:
+    st = sub.add_parser(name, help=help_text)
+    st.add_argument("goal", nargs="?", help="goal id")
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=cmd_status)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="dsh-trial", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    st = sub.add_parser("status", help="list goals or show one")
-    st.add_argument("goal", nargs="?", help="goal id")
-    st.add_argument("--json", action="store_true")
-    st.set_defaults(func=cmd_status)
+    start_p = sub.add_parser(
+        "start",
+        help="start broker-dsh-trial daemon (wraps broker/start.sh; never prod)",
+        description="Wraps broker/start.sh. Extra flags (e.g. --once) are passed through. Never touches broker-khub-prod.",
+    )
+    start_p.set_defaults(func=cmd_start, passthrough=[])
+
+    stop_p = sub.add_parser(
+        "stop",
+        help="stop broker-dsh-trial daemon (wraps broker/stop.sh; never prod)",
+    )
+    stop_p.set_defaults(func=cmd_stop, passthrough=[])
+
+    bs = sub.add_parser(
+        "broker-status",
+        help="pid/inbox/chains (python3 broker/trial-broker.py --status)",
+    )
+    bs.set_defaults(func=cmd_broker_status)
+
+    _add_goal_status_parser(sub, "status", "list goals or show one (thin-state)")
+    _add_goal_status_parser(sub, "goals", "alias for status (list/show goals)")
 
     rp = sub.add_parser("report", help="cross-goal aggregate report")
     rp.add_argument("--since", help="ISO timestamp lower bound on goal created_at")
@@ -157,7 +238,15 @@ def main() -> int:
     lim.add_argument("--prompt-timeout-sec", dest="prompt_timeout_sec", type=int)
     lim.set_defaults(func=cmd_limits)
 
-    args = ap.parse_args()
+    args, unknown = ap.parse_known_args()
+    if args.cmd in ("start", "stop"):
+        extra = list(unknown)
+        if extra[:1] == ["--"]:
+            extra = extra[1:]
+        args.passthrough = extra
+        return args.func(args)
+    if unknown:
+        ap.error("unrecognized arguments: " + " ".join(unknown))
     return args.func(args)
 
 

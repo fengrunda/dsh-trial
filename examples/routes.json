@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "updated_at": null,
+  "routes": [
+    {
+      "to_role": "supervisor",
+      "kind": "ask_supervisor",
+      "handler": "supervisor_answer",
+      "profile_from": "goal.supervisor_profile",
+      "default_profile": "acp-lite-trial",
+      "role_home": "supervisor",
+      "prompt_mode": "supervisor-answer",
+      "context": ["questions", "context", "goal_state"],
+      "limits": {
+        "count_as": "supervisor_ticket",
+        "timeout_key": "ask_supervisor_timeout_sec"
+      },
+      "metrics_kind": "ask_supervisor"
+    },
+    {
+      "to_role": "gate",
+      "kind": "submit_for_review",
+      "handler": "gate_review",
+      "profile_from": "goal.gate_profile",
+      "default_profile": "acp-lite-trial",
+      "role_home": "gate",
+      "prompt_mode": "gate",
+      "context": ["acceptance", "diff", "prior_findings", "foreman_summary"],
+      "limits": {
+        "timeout_key": "ask_supervisor_timeout_sec",
+        "inplace_prompt_key": "inplace_rework_max_prompt",
+        "inplace_findings_key": "inplace_rework_max_findings"
+      },
+      "metrics_kind": "submit_for_review"
+    }
+  ],
+  "notes": "Template for $DSH_HOME/supervisor/trial/routes.json. Add mid-ticket kinds by appending routes."
+}

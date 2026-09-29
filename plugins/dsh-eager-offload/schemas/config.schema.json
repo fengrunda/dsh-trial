@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.dsh/plugins/dsh-eager-offload/config.schema.json",
+  "title": "dsh-eager-offload config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "offloadRoot": {
+      "type": "string",
+      "description": "Absolute path, or path relative to $DSH_HOME. Default: offload (= $DSH_HOME/offload)."
+    },
+    "inlineMaxBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 4096,
+      "description": "UTF-8 byte cap for model-facing plain-text tool results. Over → write full output to offload file + head/tail preview."
+    },
+    "previewHeadBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 1536
+    },
+    "previewTailBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 1024
+    },
+    "offloadReadMaxInlineBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 16384,
+      "description": "When read targets a path under offloadRoot: allow this much inline; above → in-place truncate (no second offload file)."
+    },
+    "excludeTools": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Tool names that skip eager offload entirely."
+    },
+    "toolOverrides": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "inlineMaxBytes": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "description": "Per-tool inlineMaxBytes overrides (e.g. tighter for bash)."
+    }
+  }
+}

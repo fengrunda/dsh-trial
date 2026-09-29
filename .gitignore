@@ -1,0 +1,16 @@
+.env
+.env.*
+*.pyc
+__pycache__/
+.pytest_cache/
+node_modules/
+*.bak
+*.bak-*
+.DS_Store
+sessions/
+scratch/
+scratch-repo/
+*.log
+*.pid
+.idea/
+.vscode/

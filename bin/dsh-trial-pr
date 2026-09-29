@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# dsh-trial-pr — controlled git push + gh pr create for broker-dsh-trial only.
+# Allowlist is configurable (env or edit below). Feature branch only. No force / merge / main.
+set -euo pipefail
+
+# Comma-separated owner/repo list. Default empty → you must configure before use.
+# Example: DSH_TRIAL_PR_ALLOWLIST=owner/repo,other/repo
+# Example hardcode (commented): ALLOWLIST=("fengrunda/knowledge-hub")
+ALLOWLIST=()
+if [[ -n "${DSH_TRIAL_PR_ALLOWLIST:-}" ]]; then
+  IFS=',' read -r -a ALLOWLIST <<< "${DSH_TRIAL_PR_ALLOWLIST}"
+fi
+DEFAULT_REPO="${DSH_TRIAL_PR_DEFAULT_REPO:-}"
+DEFAULT_BASE="main"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  dsh-trial-pr push|create-pr|push-and-pr
+    --repo owner/repo [--cwd DIR] [--branch NAME]
+    [--title TEXT] [--body TEXT | --body-file PATH] [--base main]
+
+Subcommands:
+  push         git push -u origin <feature-branch> (never main/master; never --force)
+  create-pr    gh pr create --base <base> (idempotent if open PR already exists)
+  push-and-pr  push then create-pr
+
+Auth: uses env GH_TOKEN or existing `gh auth` (do not echo tokens).
+Allowlist: set DSH_TRIAL_PR_ALLOWLIST=owner/repo[,...] or edit ALLOWLIST in this script.
+Example (commented in source): fengrunda/knowledge-hub
+USAGE
+}
+
+die() { echo "dsh-trial-pr: $*" >&2; exit 1; }
+
+load_github_token_from_env() {
+  # Only read exact GH_TOKEN=/GITHUB_TOKEN= lines; never print their values.
+  if [[ -n "${GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" ]]; then
+    return 0
+  fi
+  local envf="${DSH_HOME:-$HOME/.dsh}/.env" line value
+  [[ -f "$envf" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      GH_TOKEN=*)
+        value="${line#GH_TOKEN=}"
+        [[ -n "$value" ]] && export GH_TOKEN="$value"
+        ;;
+      GITHUB_TOKEN=*)
+        value="${line#GITHUB_TOKEN=}"
+        [[ -n "$value" ]] && export GITHUB_TOKEN="$value"
+        ;;
+    esac
+    [[ -n "${GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" ]] && break
+  done < "$envf"
+  unset value line
+}
+
+ensure_auth() {
+  load_github_token_from_env
+  if [[ -n "${GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" ]]; then
+    return 0
+  fi
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status --hostname github.com >/dev/null 2>&1; then
+    die "认证失败：未检测到 GH_TOKEN/GITHUB_TOKEN，且 gh auth status 失败；请补充 ~/.dsh/.env 或注入 GitHub token。"
+  fi
+}
+
+normalize_owner_repo() {
+  local url="$1"
+  # strip trailing .git and whitespace
+  url="${url%.git}"
+  url="${url%%[[:space:]]*}"
+  # https://github.com/owner/repo  or  https://github.com/owner/repo/
+  # git@github.com:owner/repo
+  # ssh://git@github.com/owner/repo
+  if [[ "$url" =~ github\.com[:/]+([^/]+)/([^/]+) ]]; then
+    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    return 0
+  fi
+  # already owner/repo
+  if [[ "$url" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "$url"
+    return 0
+  fi
+  return 1
+}
+
+in_allowlist() {
+  local repo="$1"
+  local a
+  for a in "${ALLOWLIST[@]}"; do
+    [[ "$repo" == "$a" ]] && return 0
+  done
+  return 1
+}
+
+REPO="$DEFAULT_REPO"
+CWD=""
+BRANCH=""
+TITLE=""
+BODY=""
+BODY_FILE=""
+BASE="$DEFAULT_BASE"
+CMD=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    push|create-pr|push-and-pr)
+      [[ -z "$CMD" ]] || die "duplicate subcommand"
+      CMD="$1"; shift ;;
+    --repo) REPO="${2:-}"; shift 2 ;;
+    --cwd) CWD="${2:-}"; shift 2 ;;
+    --branch) BRANCH="${2:-}"; shift 2 ;;
+    --title) TITLE="${2:-}"; shift 2 ;;
+    --body) BODY="${2:-}"; shift 2 ;;
+    --body-file) BODY_FILE="${2:-}"; shift 2 ;;
+    --base) BASE="${2:-}"; shift 2 ;;
+    --force|-f)
+      die "refused: --force / force-push is forbidden" ;;
+    --merge|merge|delete|--delete)
+      die "refused: merge/delete is forbidden" ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      die "unknown arg: $1 (merge/delete/force not allowed)" ;;
+  esac
+done
+
+[[ -n "$CMD" ]] || { usage; exit 2; }
+
+ensure_auth
+
+# Reject force-ish title/body flags already handled; also reject if base is weird later.
+
+[[ ${#ALLOWLIST[@]} -gt 0 ]] || die "allowlist empty: set DSH_TRIAL_PR_ALLOWLIST=owner/repo or edit ALLOWLIST in script"
+[[ -n "$REPO" ]] || die "missing --repo (or DSH_TRIAL_PR_DEFAULT_REPO); example: --repo owner/repo"
+REPO_NORM="$(normalize_owner_repo "$REPO" || true)"
+[[ -n "$REPO_NORM" ]] || die "invalid --repo: $REPO"
+in_allowlist "$REPO_NORM" || die "repo not in allowlist: $REPO_NORM (allowed: ${ALLOWLIST[*]})"
+REPO="$REPO_NORM"
+
+[[ "$BASE" == "main" || "$BASE" == "master" ]] || die "refused: --base must be main or master (got: $BASE)"
+
+if [[ -n "$CWD" ]]; then
+  [[ -d "$CWD" ]] || die "cwd not a directory: $CWD"
+  cd "$CWD"
+fi
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repo (cwd=$(pwd))"
+
+ORIGIN_URL="$(git remote get-url origin 2>/dev/null || true)"
+[[ -n "$ORIGIN_URL" ]] || die "no origin remote"
+ORIGIN_REPO="$(normalize_owner_repo "$ORIGIN_URL" || true)"
+[[ -n "$ORIGIN_REPO" ]] || die "cannot parse origin URL: $ORIGIN_URL"
+in_allowlist "$ORIGIN_REPO" || die "origin repo not in allowlist: $ORIGIN_REPO (url=$ORIGIN_URL)"
+[[ "$ORIGIN_REPO" == "$REPO" ]] || die "origin ($ORIGIN_REPO) != --repo ($REPO)"
+
+if [[ -z "$BRANCH" ]]; then
+  BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+fi
+[[ -n "$BRANCH" && "$BRANCH" != "HEAD" ]] || die "detached HEAD; pass --branch"
+case "$BRANCH" in
+  main|master) die "refused: cannot push/PR from protected branch: $BRANCH" ;;
+esac
+
+# Extra safety: reject if any remaining argv-like force in env (noop) — done via arg parse.
+
+do_push() {
+  # Configure GitHub's credential helper, but do not make push interactive.
+  gh auth setup-git >/dev/null 2>&1 || true
+  echo "dsh-trial-pr: pushing $BRANCH → origin ($REPO)…" >&2
+  # Explicitly no --force / --force-with-lease; clear inherited helpers.
+  git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push -u origin "$BRANCH"
+}
+
+find_open_pr_url() {
+  # head may be owner:branch for forks; for same-repo use branch
+  local url
+  url="$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)"
+  if [[ -z "$url" ]]; then
+    url="$(gh pr list --repo "$REPO" --head "${REPO%%/*}:$BRANCH" --base "$BASE" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)"
+  fi
+  echo "$url"
+}
+
+do_create_pr() {
+  local existing
+  existing="$(find_open_pr_url)"
+  if [[ -n "$existing" ]]; then
+    echo "dsh-trial-pr: open PR already exists" >&2
+    echo "$existing"
+    return 0
+  fi
+
+  [[ -n "$TITLE" ]] || TITLE="$BRANCH"
+  local -a gh_args=(pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" --title "$TITLE")
+  if [[ -n "$BODY_FILE" ]]; then
+    [[ -f "$BODY_FILE" ]] || die "body-file missing: $BODY_FILE"
+    gh_args+=(--body-file "$BODY_FILE")
+  elif [[ -n "$BODY" ]]; then
+    gh_args+=(--body "$BODY")
+  else
+    gh_args+=(--body "Opened by dsh-trial-pr for broker-dsh-trial (controlled PR).")
+  fi
+
+  echo "dsh-trial-pr: creating PR $BRANCH → $BASE on $REPO…" >&2
+  local out
+  out="$(gh "${gh_args[@]}")"
+  # gh prints URL on last line typically
+  echo "$out" | tail -n1
+}
+
+case "$CMD" in
+  push)
+    do_push
+    echo "dsh-trial-pr: push ok ($BRANCH)" >&2
+    ;;
+  create-pr)
+    do_create_pr
+    ;;
+  push-and-pr)
+    do_push
+    do_create_pr
+    ;;
+esac

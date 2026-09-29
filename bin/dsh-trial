@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""dsh-trial — observe & tune isolated broker-dsh-trial goals."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+_broker_candidates = []
+if os.environ.get("DSH_TRIAL_ROOT"):
+    _broker_candidates.append(Path(os.environ["DSH_TRIAL_ROOT"]) / "broker")
+_broker_candidates.append(_HERE.parent / "broker")
+_broker_candidates.append(Path("/workspace/dsh-trial/broker"))  # legacy box default
+for _b in _broker_candidates:
+    if (_b / "trial_lib.py").is_file():
+        sys.path.insert(0, str(_b))
+        break
+else:
+    sys.path.insert(0, str(_HERE.parent / "broker"))
+
+from trial_lib import (  # noqa: E402
+    GOALS,
+    LIMITS_PATH,
+    aggregate_report,
+    format_report_zh,
+    load_global_limits,
+    save_global_limits,
+    DEFAULT_LIMITS,
+    now_iso,
+)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    if args.goal:
+        path = GOALS / f"{args.goal}.json"
+        if not path.is_file():
+            print(f"goal not found: {path}", file=sys.stderr)
+            return 1
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if args.json:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+            return 0
+        print(f"goal={data.get('goal')} status={data.get('status')}")
+        print(f"slices={data.get('slices')} supervisor_tickets={data.get('supervisor_ticket_count')}")
+        print(f"limits_effective={json.dumps(data.get('limits_effective'), ensure_ascii=False)}")
+        print(f"limits_sources={json.dumps(data.get('limits_sources'), ensure_ascii=False)}")
+        if data.get("limit_hit"):
+            print(f"limit_hit={json.dumps(data.get('limit_hit'), ensure_ascii=False)}")
+        m = data.get("metrics") or {}
+        print(
+            f"metrics: holds={m.get('hold_count')} rework={m.get('rework_rounds')} "
+            f"asks={m.get('ask_count')} prompt_token_total={m.get('prompt_token_total')}"
+        )
+        for t in m.get("tickets") or []:
+            print(
+                f"  - {t.get('role')} {t.get('ticket')} peak={t.get('peak_prompt')} "
+                f"steps={t.get('steps')} total={t.get('prompt_token_total')} "
+                f"tool_res={t.get('tool_res')} clean={t.get('assert_clean')}"
+            )
+        return 0
+
+    goals = sorted(GOALS.glob("*.json")) if GOALS.is_dir() else []
+    if args.json:
+        rows = []
+        for p in goals:
+            try:
+                g = json.loads(p.read_text(encoding="utf-8"))
+                rows.append({
+                    "goal": g.get("goal"),
+                    "status": g.get("status"),
+                    "slices": g.get("slices"),
+                    "supervisor_ticket_count": g.get("supervisor_ticket_count"),
+                    "prompt_token_total": (g.get("metrics") or {}).get("prompt_token_total"),
+                    "limit_hit": g.get("limit_hit"),
+                })
+            except (OSError, json.JSONDecodeError):
+                pass
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    print(f"goals_dir={GOALS} count={len(goals)}")
+    for p in goals:
+        try:
+            g = json.loads(p.read_text(encoding="utf-8"))
+            print(
+                f"- {g.get('goal')}: status={g.get('status')} slices={len(g.get('slices') or [])} "
+                f"sup_tickets={g.get('supervisor_ticket_count')} "
+                f"tokens={(g.get('metrics') or {}).get('prompt_token_total')} "
+                f"hit={g.get('limit_hit') and (g.get('limit_hit') or {}).get('limit')}"
+            )
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"- {p.name}: read error {e}")
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    rep = aggregate_report(since=args.since)
+    if args.json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    else:
+        print(format_report_zh(rep), end="")
+    return 0
+
+
+def cmd_limits(args: argparse.Namespace) -> int:
+    if args.limits_action == "show":
+        data = load_global_limits()
+        if args.json:
+            print(json.dumps({"path": str(LIMITS_PATH), "limits": data}, ensure_ascii=False, indent=2))
+        else:
+            print(f"path={LIMITS_PATH}")
+            for k, v in data.items():
+                print(f"  {k}={v}")
+        return 0
+    if args.limits_action == "set":
+        data = load_global_limits()
+        changed = {}
+        for k in DEFAULT_LIMITS:
+            val = getattr(args, k, None)
+            if val is not None:
+                data[k] = type(DEFAULT_LIMITS[k])(val)
+                changed[k] = data[k]
+        if not changed:
+            print("nothing to set; pass e.g. --max-slices 5", file=sys.stderr)
+            return 2
+        save_global_limits(data)
+        print(json.dumps({"updated": changed, "at": now_iso()}, ensure_ascii=False))
+        return 0
+    print("usage: dsh-trial limits show|set", file=sys.stderr)
+    return 2
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="dsh-trial", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    st = sub.add_parser("status", help="list goals or show one")
+    st.add_argument("goal", nargs="?", help="goal id")
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=cmd_status)
+
+    rp = sub.add_parser("report", help="cross-goal aggregate report")
+    rp.add_argument("--since", help="ISO timestamp lower bound on goal created_at")
+    rp.add_argument("--json", action="store_true")
+    rp.set_defaults(func=cmd_report)
+
+    lim = sub.add_parser("limits", help="show/set global trial limits")
+    lim.add_argument("limits_action", choices=["show", "set"])
+    lim.add_argument("--json", action="store_true")
+    lim.add_argument("--max-slices", dest="max_slices", type=int)
+    lim.add_argument("--max-supervisor-tickets", dest="max_supervisor_tickets", type=int)
+    lim.add_argument("--max-rounds", dest="max_rounds", type=int)
+    lim.add_argument("--ask-supervisor-timeout-sec", dest="ask_supervisor_timeout_sec", type=int)
+    lim.add_argument("--ask-supervisor-poll-ms", dest="ask_supervisor_poll_ms", type=int)
+    lim.add_argument("--prompt-timeout-sec", dest="prompt_timeout_sec", type=int)
+    lim.set_defaults(func=cmd_limits)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

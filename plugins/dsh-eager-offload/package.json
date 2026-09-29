@@ -1,0 +1,47 @@
+{
+  "name": "dsh-eager-offload",
+  "version": "0.1.0-dev",
+  "private": true,
+  "description": "Eager tool-output offload for dsh: tools/post-execute writes oversized plain-text results (including read) to ~/.dsh/offload before compaction pressure.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./offload": "./lib/offload.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/offload.js",
+    "cordis.patch.yml",
+    "schemas",
+    "examples",
+    "test",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check lib/offload.js && node --check lib/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "eager-offload",
+    "spill",
+    "tool-result",
+    "ACP"
+  ],
+  "license": "MIT"
+}

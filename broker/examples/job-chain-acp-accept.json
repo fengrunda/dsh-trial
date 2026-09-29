@@ -1,0 +1,21 @@
+{
+  "type": "chain",
+  "id": "job-chain-acp-accept-strict",
+  "slice": "scratch-greet-strict",
+  "pack": "scratch-greet-strict.pack.md",
+  "acceptance": [
+    "hello.py defines greet(name=None) -> str with a one-line docstring",
+    "empty string name is treated via is not None (not falsy), so greet('') does not become 'World'",
+    "test_hello.py exists with at least 3 pytest-style tests: None default, normal name, empty string edge",
+    "tests can be run with: python3 -m pytest test_hello.py -q (or unittest)",
+    "no room_*; no remote push"
+  ],
+  "profile": "acp",
+  "gate_profile": "acp",
+  "cwd": "/path/to/your/workdir",
+  "max_rounds": 2,
+  "notify": "hub",
+  "notify_dry_run": false,
+  "notify_prefix": "[测试·无需动作] ",
+  "goal": "notify-test"
+}

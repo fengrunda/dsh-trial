@@ -1,0 +1,24 @@
+{
+  "name": "dsh-role-bridge",
+  "version": "0.1.0-dev",
+  "private": true,
+  "description": "Reusable mid-ticket role bridge: send_to_role + thin wrappers (ask_supervisor, submit_for_review). Trial-only; needs broker-dsh-trial routes.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./bridge": "./lib/bridge.js",
+    "./mailbox": "./lib/mailbox.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "cordis.patch.yml", "test", "README.md", "README.zh.md"],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check lib/mailbox.js && node --check lib/bridge.js && node --check lib/index.js"
+  },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "engines": { "node": "^22.19.0 || >=24.0.0" },
+  "peerDependencies": { "@deepseek-ai/cordis": "^4.0.2" },
+  "license": "MIT"
+}

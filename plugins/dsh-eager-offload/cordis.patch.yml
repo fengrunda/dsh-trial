@@ -1,0 +1,19 @@
+# Dev bundle patch for dsh-eager-offload.
+# Do NOT merge into acp / acp-lite / broker-khub-prod until parent/user approves.
+# Install sketch: dsh plugin --profile <name> add -w ./plugins/dsh-eager-offload
+- insert:
+    - id: eager-offload
+      name: dsh-eager-offload
+      config:
+        # Absolute path, or relative to $DSH_HOME (default: offload → ~/.dsh/offload)
+        # offloadRoot: offload
+        # Model-facing UTF-8 byte cap (default 4096; below official spill 12288)
+        # inlineMaxBytes: 4096
+        # previewHeadBytes: 1536
+        # previewTailBytes: 1024
+        # Cap for read of paths under offloadRoot (in-place truncate, no new file)
+        # offloadReadMaxInlineBytes: 16384
+        # excludeTools: []
+        # toolOverrides:
+        #   bash:
+        #     inlineMaxBytes: 3072

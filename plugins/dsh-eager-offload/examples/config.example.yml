@@ -1,0 +1,15 @@
+# Example cordis.patch.yml fragment for dsh-eager-offload
+# (merge under the profile's patch list, or rely on the bundle insert defaults).
+- id: eager-offload
+  config:
+    offloadRoot: offload
+    inlineMaxBytes: 4096
+    previewHeadBytes: 1536
+    previewTailBytes: 1024
+    offloadReadMaxInlineBytes: 16384
+    excludeTools: []
+    toolOverrides:
+      bash:
+        inlineMaxBytes: 3072
+      read:
+        inlineMaxBytes: 4096

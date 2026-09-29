@@ -1,0 +1,10 @@
+# Trial-only. Install into acp-lite-trial / acp-trial — NOT product acp/acp-lite.
+- insert:
+    - id: role-bridge
+      name: dsh-role-bridge
+      config:
+        # mailboxRoot: mailbox
+        # timeoutSec: 600
+        # pollMs: 2000
+        # wrappers: [ask_supervisor, submit_for_review]   # thin tools to register
+        # enableSendToRole: true                          # expose generic primitive

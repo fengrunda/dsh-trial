@@ -1,0 +1,6 @@
+{
+  "type": "chain-reply",
+  "id": "job-chain-reply-scratch-hello",
+  "slice": "scratch-hello",
+  "answer": "Use def greet(name: str | None = None) -> str; docstring one line; return f'Hello, {name or \"world\"}!'."
+}

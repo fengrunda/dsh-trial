@@ -1,0 +1,18 @@
+{
+  "type": "chain",
+  "id": "job-chain-scratch-hello",
+  "slice": "scratch-hello",
+  "pack": "scratch-hello.pack.md",
+  "acceptance": [
+    "hello.py exposes greet(name) returning a greeting string",
+    "function has a one-line docstring",
+    "no room_*; no push"
+  ],
+  "profile": "acp-lite",
+  "gate_profile": "acp-lite",
+  "cwd": "/path/to/your/workdir",
+  "max_rounds": 2,
+  "notify": "hub",
+  "notify_dry_run": true,
+  "goal": "scratch-hello"
+}

@@ -1,0 +1,12 @@
+{
+  "max_slices": 3,
+  "max_supervisor_tickets": 8,
+  "max_rounds": 2,
+  "ask_supervisor_timeout_sec": 600,
+  "ask_supervisor_poll_ms": 2000,
+  "prompt_timeout_sec": 1800,
+  "inplace_rework_max_prompt": 20000,
+  "inplace_rework_max_findings": 3,
+  "impl_max_steps": 30,
+  "notes": "Template for $DSH_HOME/supervisor/trial/limits.json. Copy and tune; no tenant secrets."
+}

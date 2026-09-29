@@ -1,0 +1,25 @@
+{
+  "type": "goal",
+  "id": "job-goal-intra-comms-proto",
+  "goal": "intra-comms-proto",
+  "brief": "In /path/to/your/workdir, add farewell(name=None) -> str next to greet. Done when: function exists with one-line docstring, returns a farewell string, and a tiny test is added. IMPORTANT for this prototype: in the slice pack you write, leave the farewell *phrase/style* unspecified (e.g. say 'use the project farewell style' without defining the exact string) so the foreman must status=question to ask supervisor which exact template to use.",
+  "cwd": "/path/to/your/workdir",
+  "profile": "acp-lite",
+  "gate_profile": "acp-lite",
+  "supervisor_profile": "acp-lite",
+  "max_slices": 1,
+  "max_supervisor_tickets": 8,
+  "max_rounds": 2,
+  "suggested_slice": "intra-comms-proto-s1",
+  "suggested_pack": "intra-comms-proto-s1.pack.md",
+  "acceptance_hint": [
+    "hello.py exposes farewell(name=None) -> str with a one-line docstring",
+    "farewell returns a string using the supervisor-approved template",
+    "test_hello.py covers default and named farewell",
+    "no room_*; no push"
+  ],
+  "notify": "hub",
+  "notify_dry_run": true,
+  "notify_prefix": "[dry-run intra-comms] ",
+  "auto_supervisor_answer": true
+}

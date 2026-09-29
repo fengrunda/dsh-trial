@@ -107,6 +107,47 @@ test('validateJob rejects missing fields, rooms, bad profile', () => {
   assert.equal(validateJob({ ticket: 't1' }).ok, false)
 })
 
+test('validateJob rejects bad cwd for goal / chain / ticket', () => {
+  const goalBase = { type: 'goal', goal: 'g', brief: 'b', profile: 'acp-lite' }
+  const chainBase = { type: 'chain', slice: 's', pack: 'p.pack.md', profile: 'acp-lite' }
+  const ticketBase = { ticket: 't1', pack: 'p.pack.md' }
+
+  for (const [name, base] of [
+    ['goal', goalBase],
+    ['chain', chainBase],
+    ['ticket', ticketBase],
+  ]) {
+    const missing = validateJob({ ...base })
+    assert.equal(missing.ok, false, `${name} missing cwd should fail`)
+    assert.match(missing.errors.join(' '), /绝对路径|absolute|Mac/i)
+
+    const empty = validateJob({ ...base, cwd: '' })
+    assert.equal(empty.ok, false, `${name} empty cwd should fail`)
+    assert.match(empty.errors.join(' '), /绝对路径|absolute|Mac/i)
+
+    const blank = validateJob({ ...base, cwd: '   ' })
+    assert.equal(blank.ok, false, `${name} whitespace cwd should fail`)
+
+    const placeholder = validateJob({ ...base, cwd: '/path/to/your/workdir' })
+    assert.equal(placeholder.ok, false, `${name} placeholder cwd should fail`)
+    assert.match(placeholder.errors.join(' '), /绝对路径|absolute|Mac/i)
+
+    const ws = validateJob({ ...base, cwd: '/workspace' })
+    assert.equal(ws.ok, false, `${name} /workspace cwd should fail`)
+    assert.match(ws.errors.join(' '), /绝对路径|absolute|Mac/i)
+
+    const okCwd = validateJob({ ...base, cwd: '/tmp/dsh-trial-example-workdir' })
+    assert.equal(okCwd.ok, true, `${name} legal cwd should pass: ${okCwd.errors?.join('; ')}`)
+  }
+
+  // chain-reply / goal-update are exempt from cwd checks
+  assert.equal(
+    validateJob({ type: 'chain-reply', slice: 's', answer: 'ok' }).ok,
+    true,
+  )
+  assert.equal(validateJob({ type: 'goal-update', goal: 'g' }).ok, true)
+})
+
 test('safeJobId rejects path traversal', () => {
   assert.equal(safeJobId('../etc'), '')
   assert.equal(safeJobId('a/b'), '')
@@ -122,7 +163,7 @@ test('dropJob writes inbox; dry_run does not; no overwrite', async () => {
       id: 'job-desk-unit-goal',
       goal: 'desk-unit',
       brief: 'add farewell next to greet',
-      cwd: '/path/to/your/workdir',
+      cwd: '/tmp/dsh-trial-example-workdir',
       profile: 'acp-lite',
       supervisor_profile: 'acp-lite',
       max_slices: 1,
@@ -139,7 +180,7 @@ test('dropJob writes inbox; dry_run does not; no overwrite', async () => {
     const saved = JSON.parse(await readFile(dest, 'utf8'))
     assert.equal(saved.type, 'goal')
     assert.equal(saved.goal, 'desk-unit')
-    assert.equal(saved.cwd, '/path/to/your/workdir')
+    assert.equal(saved.cwd, '/tmp/dsh-trial-example-workdir')
     assert.ok(!JSON.stringify(saved).includes('/workspace'))
 
     const again = await dropJob(job, {}, cfg)
@@ -261,7 +302,7 @@ test('parseJobArg accepts JSON string', () => {
   assert.equal(r.job.slice, 's')
 })
 
-test('dropJob does not inject /workspace cwd default', async () => {
+test('dropJob without cwd fails validate and writes nothing', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'dsh-trial-desk-'))
   try {
     const cfg = cfgFor(tmp)
@@ -277,9 +318,28 @@ test('dropJob does not inject /workspace cwd default', async () => {
       {},
       cfg,
     )
-    assert.equal(r.ok, true)
-    const saved = JSON.parse(await readFile(r.path, 'utf8'))
-    assert.equal(saved.cwd, undefined)
+    assert.equal(r.ok, false)
+    assert.match(r.errors.join(' '), /绝对路径|absolute|Mac/i)
+    assert.equal(r.path, undefined)
+    assert.deepEqual(await readdir(join(tmp, 'supervisor/trial/inbox')).catch(() => []), [])
+    assert.ok(!JSON.stringify(r).includes('/workspace'))
+
+    const withCwd = await dropJob(
+      {
+        type: 'chain',
+        id: 'job-chain-with-cwd',
+        slice: 's1',
+        pack: 's1.pack.md',
+        profile: 'acp-lite',
+        cwd: '/tmp/dsh-trial-example-workdir',
+        acceptance: ['no room_*'],
+      },
+      {},
+      cfg,
+    )
+    assert.equal(withCwd.ok, true)
+    const saved = JSON.parse(await readFile(withCwd.path, 'utf8'))
+    assert.equal(saved.cwd, '/tmp/dsh-trial-example-workdir')
     assert.ok(!JSON.stringify(saved).includes('/workspace'))
     assert.ok(!JSON.stringify(saved).includes('/home/box'))
   } finally {

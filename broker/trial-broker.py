@@ -13,7 +13,7 @@ Single ticket JSON (*.json)::
     "ticket": "impl-…",
     "pack": "name.pack.md",
     "profile": "acp" | "acp-lite",
-    "cwd": "/workspace",
+    "cwd": "/tmp/dsh-trial-example-workdir",
     "role": "impl" | "gate",
     "summary_name": "optional",
     "notify": "hub",
@@ -27,7 +27,7 @@ Chain (supervisor → foreman → gate over files)::
     "pack": "scratch-hello.pack.md",
     "acceptance": "text or list",
     "profile": "acp-lite",
-    "cwd": "/path/to/your/workdir",
+    "cwd": "/tmp/dsh-trial-example-workdir",
     "max_rounds": 2,
     "gate_profile": "acp-lite",
     "notify": "hub",
@@ -46,7 +46,7 @@ Goal (dsh supervisor plans slices; Hub only drops Goal)::
     "type": "goal",
     "goal": "intra-comms-proto",
     "brief": "natural language goal…",
-    "cwd": "/path/to/your/workdir",
+    "cwd": "/tmp/dsh-trial-example-workdir",
     "profile": "acp-lite",
     "supervisor_profile": "acp-lite",
     "max_slices": 3,
@@ -221,6 +221,21 @@ def _enforce_pack_bytes(path: Path, cap: int = MAX_PACK_BYTES) -> None:
         )
 
 
+def _job_cwd(data: dict, path: Path) -> str:
+    """Return the job's cwd, warning and falling back to the broker's own
+    cwd when the job omits it (never silently default to /workspace)."""
+    raw = data.get("cwd")
+    s = str(raw).strip() if raw is not None else ""
+    if not s:
+        cwd = os.getcwd()
+        print(
+            f"[trial-broker] job {path} missing cwd; defaulting to broker cwd {cwd}",
+            flush=True,
+        )
+        return cwd
+    return str(raw)
+
+
 def load_job(path: Path) -> dict:
     raw = path.read_text(encoding="utf-8")
     if path.suffix == ".json":
@@ -263,7 +278,7 @@ def load_job(path: Path) -> dict:
             "acceptance": data.get("acceptance") or "",
             "profile": profile,
             "gate_profile": gate_profile,
-            "cwd": str(data.get("cwd") or "/workspace"),
+            "cwd": _job_cwd(data, path),
             "max_rounds": max_rounds,
         }
 
@@ -318,7 +333,7 @@ def load_job(path: Path) -> dict:
             "profile": profile,
             "supervisor_profile": sup_profile,
             "gate_profile": str(data.get("gate_profile") or profile),
-            "cwd": str(data.get("cwd") or "/workspace"),
+            "cwd": _job_cwd(data, path),
             "max_slices": max_slices,
             "max_supervisor_tickets": max_sup,
             "max_rounds": max_rounds,
@@ -343,7 +358,7 @@ def load_job(path: Path) -> dict:
         "ticket": str(ticket),
         "pack": str(pack),
         "profile": str(data.get("profile") or "acp"),
-        "cwd": str(data.get("cwd") or "/workspace"),
+        "cwd": _job_cwd(data, path),
         "role": data.get("role"),
         "summary_name": data.get("summary_name") or data.get("summary"),
     }

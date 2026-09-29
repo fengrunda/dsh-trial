@@ -214,9 +214,28 @@ function asInt(value, fallback) {
   return n
 }
 
+/** Cwd values that are never acceptable as a real workdir. */
+const PLACEHOLDER_CWDS = new Set(['/path/to/your/workdir', '/workspace'])
+
+/**
+ * Enforce a non-empty real cwd for goal / chain / single-ticket jobs.
+ * Returns an error string, or null when cwd is acceptable.
+ */
+function cwdError(cwd) {
+  const s = cwd == null ? '' : String(cwd).trim()
+  if (!s) {
+    return 'cwd required (non-empty absolute path). Mac/本机请写绝对路径 — do not omit cwd'
+  }
+  if (PLACEHOLDER_CWDS.has(s)) {
+    return `cwd rejects placeholder or /workspace (${JSON.stringify(s)}). Mac/本机请写绝对路径，例如 /Users/you/proj 或 /tmp/dsh-trial-example-workdir`
+  }
+  return null
+}
+
 /**
  * Validate a job against broker `load_job` rules. Extra keys are kept (pass-through).
- * Does not default cwd to /workspace.
+ * Rejects missing / placeholder / `/workspace` cwd for goal, chain and single-ticket
+ * jobs (never silently defaults cwd). `chain-reply` / `goal-update` are exempt.
  *
  * @param {Record<string, unknown>} data
  * @returns {{ ok: true, type: string, errors: [] } | { ok: false, type: string, errors: string[] }}
@@ -288,6 +307,13 @@ export function validateJob(data) {
     const profile = data.profile == null || data.profile === '' ? 'acp' : data.profile
     const pe = profileError('profile', profile)
     if (pe) errors.push(pe)
+  }
+
+  // Real cwd is required for goal / chain / single-ticket jobs.
+  // Skip for chain-reply and goal-update (no cwd needed).
+  if (jtype !== 'chain-reply' && jtype !== 'goal-update') {
+    const ce = cwdError(data.cwd)
+    if (ce) errors.push(ce)
   }
 
   return errors.length

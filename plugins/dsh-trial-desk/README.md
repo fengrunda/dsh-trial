@@ -28,7 +28,7 @@
 | `trial_chain_reply` | 写 `type: chain-reply`（`slice` + `answer`），形状同 `broker/examples/job-chain-reply.json` |
 | `trial_status` | 只读：broker 是否活着、inbox pending、recent chains / summaries / mailbox pending / goals |
 
-Job 形状 **不要自造**：抄 `broker/examples/job-goal-*.json`、`job-chain-*.json`。`cwd` 由人填工作树路径；desk **不会**默认 `/workspace`。
+Job 形状 **不要自造**：抄 `broker/examples/job-goal-*.json`、`job-chain-*.json`。`cwd` 由人填工作树路径；desk **不会**默认 `/workspace`。示例用 `/tmp/dsh-trial-example-workdir` 作占位——**请改成你的仓路径**（Mac/本机请写绝对路径，如 `/Users/you/proj`）。desk 会拒绝 goal / chain / ticket 的空 `cwd`、占位符 `/path/to/your/workdir` 与字面 `/workspace`（`chain-reply` / `goal-update` 无需 cwd）。
 
 含 `room_*` / `join_room` 等键的 JSON 会被拒绝。
 

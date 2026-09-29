@@ -3,7 +3,7 @@
   "id": "job-goal-medium-bridge",
   "goal": "medium-bridge",
   "brief": "In /path/to/your/workdir extend hello.py with TWO slices (emit_chains).\n\nSlice A `medium-bridge-shout`: add shout(name=None)->str mirroring greet/farewell. DELIBERATELY leave the exclamation/template ambiguous so foreman must ask_supervisor mid-ticket. In the pack Steps: tell foreman to call ask_supervisor before coding; after coding call submit_for_review with usage_prompt=8000 (simulate small context). Acceptance must require: function+docstring+tests for default and named; omit requiring empty-string name behavior so gate can HOLD once on a small P1/P2 (e.g. empty string) — prefer ≤2 findings no P0 so inplace rework triggers.\n\nSlice B `medium-bridge-whisper`: add whisper(name=None)->str. Leave one ambiguity OR require exact template via supervisor if asked. In pack Steps: tell foreman submit_for_review with usage_prompt=50000 (force fresh rework path on HOLD). Acceptance: function+docstring+two tests; also require handling name='' as 'World' (easy for gate to HOLD if missing).\n\nmax_slices=2. No room_*; no push.",
-  "cwd": "/path/to/your/workdir",
+  "cwd": "/tmp/dsh-trial-example-workdir",
   "profile": "acp-lite",
   "gate_profile": "acp-lite",
   "supervisor_profile": "acp-lite",

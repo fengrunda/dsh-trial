@@ -14,7 +14,7 @@
 | 隔离 | 独立 `$DSH_HOME/broker-dsh-trial`；**绝不**碰 `broker-khub-prod` | 产品侧常驻编排 |
 | 典型用途 | 试用 / Goal·chain·gate 烟雾 / 插件联调 | 长期会话与工具面 |
 
-**有 broker吗？有。** 入口是 [`broker/trial-broker.py`](broker/trial-broker.py)（`start.sh` / `stop.sh` 包装）。
+**有 broker吗？有。** 人的入口不是它。Mac / 人工只走 `dsh web` + desk 插件；broker 是后台 daemon（[`broker/trial-broker.py`](broker/trial-broker.py)，`dsh-trial start` 包装 `start.sh` / `stop.sh`）。**desk ≠ broker**；web 只是 UX。短票仍 `--final`。无房间。**永不**碰 `broker-khub-prod`。
 
 ## 仓库内容
 
@@ -22,9 +22,9 @@
 broker/           trial-broker.py · trial_lib.py · trial_mailbox.py · start/stop · tests · examples
 open-slice.sh     拼 prompt → dsh-acp-ask.py --final
 assert-no-room-inject.py
-bin/dsh-trial     status / report / limits
+bin/dsh-trial     start / stop / broker-status / status|goals / report / limits
 bin/dsh-trial-pr  受控 push + gh pr（allowlist 可配）
-plugins/          dsh-role-bridge · dsh-eager-offload（无 node_modules）
+plugins/          dsh-trial-desk · dsh-role-bridge · dsh-eager-offload（无 node_modules）
 examples/         limits.json · routes.json 模板（无租户密钥）
 docs/             runbook / reuse-publish / token-opt / gh-pr 笔记
 ```
@@ -52,43 +52,70 @@ cp examples/limits.json examples/routes.json "$DSH_HOME/supervisor/trial/"
 ln -sf "$(pwd)/bin/dsh-trial" "$DSH_HOME/bin/dsh-trial"
 ln -sf "$(pwd)/bin/dsh-trial-pr" "$DSH_HOME/bin/dsh-trial-pr"
 
-# 插件 → trial profile（勿装进产品 acp / acp-lite）
+# 人工 UX：desk → web-facing profile（dsh web 的唯一入口；不是 broker）
+dsh plugin --profile web add -w "$(pwd)/plugins/dsh-trial-desk"
+# 若 `dsh web` 用的是 acp-lite：dsh plugin --profile acp-lite add -w "$(pwd)/plugins/dsh-trial-desk"
+
+# 短票 trial profile（工头/监理票中桥；勿装进产品 acp / acp-lite 本体）
 dsh plugin --profile acp-lite-trial add -w "$(pwd)/plugins/dsh-role-bridge"
 dsh plugin --profile acp-lite-trial add -w "$(pwd)/plugins/dsh-eager-offload"
 ```
 
 环境变量由 `$DSH_HOME/load-env.sh` 或进程环境注入（**不要**把 API key / `GH_TOKEN` 写进仓或打进日志）。
 
-## 启动
+## Mac / 人工路径（web 是唯一入口）
+
+desk 只写 inbox、只读 thin-state；**不会**自己开短票。broker 必须作为后台 daemon 先起来。短票 `--final` 行为不变。无房间。
 
 ```bash
-# 单次消费 inbox
-./broker/start.sh --once
+# 1) desk → 给人用的 web profile（结构上：dsh plugin add -w …/plugins/dsh-trial-desk）
+dsh plugin --profile web add -w "$(pwd)/plugins/dsh-trial-desk"
 
-# 常驻 poll（默认 20s）
-TRIAL_BROKER_POLL=20 ./broker/start.sh
-./broker/stop.sh
+# 2) 后台 daemon（包装 broker/start.sh；绝不碰 broker-khub-prod）
+dsh-trial start
+# 等价：./broker/start.sh
+# 单次：dsh-trial start --once
 
-# 状态
-python3 ./broker/trial-broker.py --status
-dsh-trial status
+# 3) 唯一人工 UX
+dsh web
+# 会话工具：trial_drop_job / trial_validate_job / trial_chain_reply / trial_status
+# Job JSON 与 broker/examples/job-goal-*.json、job-chain-*.json、job-chain-reply.json 相同
+
+# 4) 观察
+dsh-trial broker-status    # pid / inbox / chains（trial-broker.py --status）
+dsh-trial status           # goals 列表（兼容旧调用）
+dsh-trial goals            # status 的别名
+dsh-trial stop             # 包装 broker/stop.sh
+```
+
+不要用 CLI 当第二个人工投放面（可以继续把 JSON 拷进 inbox，但推荐只走 desk）。**不要**把 desk 装进 impl/gate 短票 profile 当 broker 用。
+
+## 启动（daemon）
+
+```bash
+dsh-trial start              # 常驻 poll（默认 20s；TRIAL_BROKER_POLL 可改）
+dsh-trial start --once       # 单次消费 inbox
+dsh-trial stop
+dsh-trial broker-status
+dsh-trial status             # goals
 dsh-trial limits show
 ```
 
-投放任务：把 JSON 放到 `$DSH_HOME/supervisor/trial/inbox/`（示例见 `broker/examples/`）。  
+底层仍是 `./broker/start.sh` / `./broker/stop.sh` / `python3 ./broker/trial-broker.py --status`。  
 Job 形态：单票 / `chain` / `chain-reply` / `goal`（详见 `broker/README.md` 与 `broker/trial-broker.py` 文档字符串）。
 
 ## 与插件的关系
 
 ```
-Hub/操作者 ──inbox──▶ trial-broker ──open-slice──▶ ACP ticket (profile)
-                              │
-                              ├─ poll thin-state/mailbox ◀── dsh-role-bridge (ask_supervisor / submit_for_review)
-                              └─ routes.json 决定 (to_role, kind) → handler
+人 ── dsh web + dsh-trial-desk ──inbox──▶ trial-broker daemon ──open-slice --final──▶ ACP 短票
+                                         │
+                                         ├─ poll thin-state/mailbox ◀── dsh-role-bridge
+                                         └─ routes.json 决定 (to_role, kind) → handler
 
-dsh-eager-offload：tools/post-execute 提前 spill 大工具结果，降低 compact 压力（可与产品 profile 共用；role-bridge 仅 trial）。
+dsh-eager-offload：tools/post-execute 提前 spill 大工具结果（可与产品 profile 共用；role-bridge 仅 trial）。
 ```
 
+- **`dsh-trial-desk`**：人/监理会话；只写 inbox、只读状态。**不是** broker。
 - **`dsh-role-bridge`**：票中发往 supervisor/gate；**必须**有本 broker 的 mailbox watcher + `routes.json`。
 - **`dsh-eager-offload`**：相对独立；默认 root `$DSH_HOME/offload`。
 - 更完整说明：[`plugins/README.md`](plugins/README.md)。

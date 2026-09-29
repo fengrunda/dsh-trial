@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.dsh/plugins/dsh-trial-desk/config.schema.json",
+  "title": "dsh-trial-desk config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "dshHome": {
+      "type": "string",
+      "description": "Trial host $DSH_HOME. Default: env DSH_HOME, else DSH_GLOBAL_HOME, else ~/.dsh. Never /home/box or /workspace."
+    },
+    "inboxRoot": {
+      "type": "string",
+      "description": "Absolute, or relative to dshHome. Default: supervisor/trial/inbox."
+    },
+    "thinStateRoot": {
+      "type": "string",
+      "description": "Absolute, or relative to dshHome. Default: $DSH_TRIAL_THIN_STATE or supervisor/thin-state."
+    },
+    "mailboxRoot": {
+      "type": "string",
+      "description": "Absolute, or relative to thinStateRoot. Default: $DSH_TRIAL_MAILBOX or mailbox."
+    },
+    "brokerDir": {
+      "type": "string",
+      "description": "Absolute, or relative to dshHome. Default: $TRIAL_BROKER_DIR or broker-dsh-trial."
+    },
+    "recentLimit": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 8,
+      "description": "How many recent chain/summary/inbox/mailbox rows trial_status returns."
+    }
+  }
+}

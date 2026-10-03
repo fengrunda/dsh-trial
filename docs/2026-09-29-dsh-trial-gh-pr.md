@@ -10,12 +10,12 @@
 | Skill | `/home/box/agent-data/workflows/dsh-trial/SKILL.md`（id `dsh-trial`） |
 
 ## 安全边界
-- **Allowlist**：仅 `fengrunda/knowledge-hub`（校验 `--repo` 与 `git remote get-url origin`，https / `git@` 均归一成 `owner/repo`）。
+- **Allowlist**：`fengrunda/knowledge-hub`、`fengrunda/memory-as-training`（校验 `--repo` 与 `git remote get-url origin`，https / `git@` 均归一成 `owner/repo`）。环境变量 `DSH_TRIAL_PR_ALLOWLIST` 若设置则整表替换，不追加。
 - **允许**：feature 分支 `git push -u origin <branch>` + `gh pr create --base main`（经包装）。
 - **禁止**：force-push、push/PR 自 main/master、`gh pr merge`、删仓、其他 remote/仓、裸 `git push`/`gh`（执行票默认）、打印 `GH_TOKEN`/API key。
 - **凭据**：Cursor 注入或 `~/.dsh/.env` 的 `GH_TOKEN`/`GITHUB_TOKEN`（经 `load-env.sh` 或包装脚本自读）；git 走 `gh auth git-credential`；与 NEWAPICY1 隔离；勿另造 `NEW_API_KEY`；勿把 token 写入文件/prompt/summary。
 - **角色**：impl/foreman、supervisor-close 可调包装；supervisor-plan / supervisor-answer / gate 仍禁 push。
-- **未纳入**：memory 仓；真 PR 留给下一 Goal（本变更只落薄壳 + 拒绝路径烟测）。
+- **2026-10-03**：allowlist 增加 `fengrunda/memory-as-training`。仍禁止 force、main/master、merge，以及其他未列入的仓。
 
 ## 用法
 ```bash

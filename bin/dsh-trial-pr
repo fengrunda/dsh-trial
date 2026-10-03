@@ -3,10 +3,10 @@
 # Allowlist is configurable (env or edit below). Feature branch only. No force / merge / main.
 set -euo pipefail
 
-# Comma-separated owner/repo list. Default empty → you must configure before use.
-# Example: DSH_TRIAL_PR_ALLOWLIST=owner/repo,other/repo
-# Example hardcode (commented): ALLOWLIST=("fengrunda/knowledge-hub")
-ALLOWLIST=()
+# Comma-separated owner/repo list. Env replaces the default; it does not append.
+# Default: knowledge-hub and the engine repo. Example override:
+#   DSH_TRIAL_PR_ALLOWLIST=owner/repo,other/repo
+ALLOWLIST=("fengrunda/knowledge-hub" "fengrunda/memory-as-training")
 if [[ -n "${DSH_TRIAL_PR_ALLOWLIST:-}" ]]; then
   IFS=',' read -r -a ALLOWLIST <<< "${DSH_TRIAL_PR_ALLOWLIST}"
 fi
@@ -26,8 +26,8 @@ Subcommands:
   push-and-pr  push then create-pr
 
 Auth: uses env GH_TOKEN or existing `gh auth` (do not echo tokens).
-Allowlist: set DSH_TRIAL_PR_ALLOWLIST=owner/repo[,...] or edit ALLOWLIST in this script.
-Example (commented in source): fengrunda/knowledge-hub
+Allowlist: fengrunda/knowledge-hub, fengrunda/memory-as-training.
+Override with DSH_TRIAL_PR_ALLOWLIST=owner/repo[,...] (replaces the default).
 USAGE
 }
 

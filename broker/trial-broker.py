@@ -1582,6 +1582,57 @@ def _write_goal(state: dict) -> Path:
     return path
 
 
+def _slice_has_review_pass(
+    goal: dict | None, slice_id: str, *, reload: bool = False
+) -> tuple[bool, str]:
+    """True when this slice already has a PASS verdict independent of impl summary.
+
+    Covers two real paths:
+      * an inline (mid-ticket) ``submit_for_review`` gate that returned PASS —
+        recorded as a ``goal["metrics"]["tickets"]`` row with
+        ``kind in ("submit_for_review", "gate")`` and ``verdict == "PASS"``;
+      * a gate summary file on disk whose parsed verdict is PASS.
+
+    ``reload=True`` re-reads the goal from disk first, so mailbox-watcher
+    metric writes (which happen in another code path) are visible to a
+    long-running chain. Reload-friendly: callers may pass either a live goal
+    dict or one freshly loaded from ``GOALS``.
+    """
+    slice_id = str(slice_id or "")
+    if not slice_id:
+        return (False, "")
+    if reload and isinstance(goal, dict) and goal.get("goal"):
+        goal = _read_goal(str(goal["goal"])) or goal
+    if isinstance(goal, dict):
+        rows = ((goal.get("metrics") or {}).get("tickets")) or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("slice") or "") != slice_id:
+                continue
+            kind = str(row.get("kind") or "")
+            verdict = str(row.get("verdict") or "").strip().upper()
+            if kind == "submit_for_review" and verdict == VERDICT_PASS:
+                return (True, f"submit_for_review PASS ({row.get('ticket') or 'inline gate'})")
+            if kind == "gate" and verdict == VERDICT_PASS:
+                return (True, f"gate PASS ({row.get('ticket') or 'gate'})")
+    # Disk gate summaries: {slice}-gate-rev*.md / {slice}-gate-r*.md
+    try:
+        candidates = sorted(SUMMARIES.glob(f"{slice_id}-gate-rev*.md"))
+        candidates += sorted(SUMMARIES.glob(f"{slice_id}-gate-r*.md"))
+    except OSError:
+        candidates = []
+    for cand in candidates:
+        try:
+            parsed = _parse_gate_verdict(cand)
+            block = enforce_gate_verdict(parsed["block"])
+        except Exception:  # noqa: BLE001 — unreadable summary is simply no evidence
+            continue
+        if str(block.get("verdict") or "").strip().upper() == VERDICT_PASS:
+            return (True, f"gate summary PASS ({cand.name})")
+    return (False, "")
+
+
 def _bump_supervisor_tickets(goal: dict | None, ticket: str) -> dict | None:
     if not goal:
         return None
@@ -1950,6 +2001,63 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
         _write_chain(chain)
 
         if ec != 0 and not impl_summary.is_file():
+            # Salvage: a mid-ticket submit_for_review gate may already have
+            # PASSed this slice, and the foreman then exited non-zero without
+            # writing a disk impl summary. That is not a real failure — closing
+            # failed here falsely failed the whole Goal (Menu-4 r3).
+            # Re-read the goal so mailbox-watcher PASS metrics are visible.
+            salvage_goal = goal_obj
+            if goal_id:
+                salvage_goal = _read_goal(str(goal_id)) or goal_obj
+            salvaged, salvage_reason = _slice_has_review_pass(
+                salvage_goal, slice_id, reload=True
+            )
+            if salvaged:
+                block["status"] = FOREMAN_STATUS_DONE
+                round_rec["foreman_status"] = FOREMAN_STATUS_DONE
+                round_rec["foreman_block"] = block
+                round_rec["salvaged_missing_summary"] = True
+                round_rec["salvage_reason"] = salvage_reason
+                chain["rounds"][-1] = round_rec
+                # Synthetic summary so later tools still see status=done.
+                try:
+                    impl_summary.parent.mkdir(parents=True, exist_ok=True)
+                    impl_summary.write_text(
+                        f"# {impl_summary_name} (broker salvage)\n\n"
+                        f"<!-- broker salvage: foreman exit {ec} without summary, "
+                        f"but slice already had {salvage_reason} -->\n\n"
+                        "```json\n"
+                        + json.dumps(block, ensure_ascii=False, indent=2)
+                        + "\n```\n",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+                chain["state"] = VERDICT_PASS
+                chain["salvage_note"] = (
+                    f"salvaged: missing impl summary after gate PASS ({salvage_reason})"
+                )
+                chain["error"] = ""
+                chain["last_verdict"] = VERDICT_PASS
+                _write_chain(chain)
+                print(
+                    f"[trial-broker] chain {slice_id} SALVAGE PASS r{round_n} "
+                    f"(foreman exit {ec}, no summary; {salvage_reason})",
+                    flush=True,
+                )
+                if (job.get("from_goal") or job.get("goal")) and not job.get(
+                    "defer_supervisor_close"
+                ):
+                    try:
+                        maybe_supervisor_close(job, chain)
+                    except Exception as e:  # noqa: BLE001 — close best-effort
+                        print(f"[trial-broker] supervisor close error: {e}", flush=True)
+                out = _terminal_outbox(job, chain, dest, ok=True)
+                print(
+                    f"[trial-broker] chain {slice_id} PASS (salvaged) outbox={out.name}",
+                    flush=True,
+                )
+                return 0
             chain["state"] = "failed"
             chain["error"] = f"foreman exit {ec} without summary"
             _write_chain(chain)
@@ -2130,6 +2238,54 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
 
         # HOLD
         if round_n >= max_rounds:
+            # Salvage: the final-round gate timed out or wrote no usable
+            # summary (file absent / empty text → parse defaults to an empty
+            # HOLD with no findings and no unmet_acceptance). If this slice
+            # already has PASS evidence and the impl summary exists, closing
+            # failed here would falsely fail the whole Goal — adopt the prior
+            # PASS instead. A real HOLD (findings / unmet_acceptance) or a
+            # round without PASS evidence still escalates below.
+            gate_summary_missing = (
+                verdict == VERDICT_HOLD
+                and not (gblock.get("findings") or [])
+                and not (gblock.get("unmet_acceptance") or [])
+                and (not gate_summary.is_file() or not gparsed["text"].strip())
+            )
+            if gate_summary_missing and impl_summary.is_file():
+                salvage_goal = goal_obj
+                if goal_id:
+                    salvage_goal = _read_goal(str(goal_id)) or goal_obj
+                salvaged, salvage_reason = _slice_has_review_pass(
+                    salvage_goal, slice_id, reload=True
+                )
+                if salvaged:
+                    round_rec["salvaged_missing_gate_summary"] = True
+                    round_rec["salvage_reason"] = salvage_reason
+                    round_rec["verdict"] = VERDICT_PASS
+                    chain["rounds"][-1] = round_rec
+                    chain["state"] = VERDICT_PASS
+                    chain["salvage_note"] = (
+                        "salvaged: last-round gate missing summary; adopting prior PASS "
+                        f"({salvage_reason})"
+                    )
+                    chain["error"] = ""
+                    chain["last_verdict"] = VERDICT_PASS
+                    _write_chain(chain)
+                    print(
+                        f"[trial-broker] chain {slice_id} SALVAGE PASS r{round_n} "
+                        f"(gate missing summary; {salvage_reason})",
+                        flush=True,
+                    )
+                    if (job.get("from_goal") or job.get("goal")) and not job.get(
+                        "defer_supervisor_close"
+                    ):
+                        try:
+                            maybe_supervisor_close(job, chain)
+                        except Exception as e:  # noqa: BLE001 — close best-effort
+                            print(f"[trial-broker] supervisor close error: {e}", flush=True)
+                    out = _terminal_outbox(job, chain, dest, ok=True)
+                    print(f"[trial-broker] chain {slice_id} PASS outbox={out.name}", flush=True)
+                    return 0
             chain["state"] = "escalated"
             chain["escalate_reason"] = f"HOLD at max_rounds={max_rounds}"
             _write_chain(chain)
@@ -2388,8 +2544,35 @@ def run_goal_job(path: Path, job: dict) -> int:
             m["slices_completed"] = int(m.get("slices_completed") or 0) + 1
             _write_goal(goal_state)
             continue
-        all_pass = False
         goal_state = _read_goal(goal_id) or goal_state
+        # Belt-and-suspenders: never fail a slice solely because the impl
+        # summary was missing when a gate/submit_for_review PASS already
+        # proved this slice done. run_chain_rounds salvages this case itself;
+        # this covers chains written before that fix landed.
+        if state == "failed" and "without summary" in str(final_chain.get("error") or ""):
+            salvaged, salvage_reason = _slice_has_review_pass(
+                goal_state, slice_id, reload=True
+            )
+            if salvaged:
+                print(
+                    f"[trial-broker] slice {slice_id} salvage PASS at goal level "
+                    f"({salvage_reason}); ignoring missing-summary failure",
+                    flush=True,
+                )
+                final_chain["state"] = VERDICT_PASS
+                final_chain["salvage_note"] = (
+                    f"salvaged at goal level: missing impl summary after "
+                    f"gate PASS ({salvage_reason})"
+                )
+                final_chain["error"] = ""
+                _write_chain(final_chain)
+                state = VERDICT_PASS
+                goal_state = _read_goal(goal_id) or goal_state
+                m = goal_state.setdefault("metrics", T.empty_metrics())
+                m["slices_completed"] = int(m.get("slices_completed") or 0) + 1
+                _write_goal(goal_state)
+                continue
+        all_pass = False
         goal_state["last_chain_state"] = state
         if state in ("failed", "escalated", "cancelled"):
             goal_state["status"] = state

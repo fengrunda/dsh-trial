@@ -63,6 +63,13 @@ with top-level slice/pack/acceptance) or many (``action=emit_chains`` with a
 first failed/escalated slice unless ``on_slice_fail=continue``, and runs the
 supervisor close once after every slice PASSes.
 
+``type:goal-update`` with ``resume: true`` on a goal already ``failed``
+continues only when that failure is a missing impl summary and the slice
+already has gate PASS. A metrics row may name the slice ``s1`` while the
+chain slice is ``{goal}-s1``; those are the same slice for this goal only.
+Slices already PASS are not re-opened. A real failure without gate PASS
+is rejected and is not turned into PASS.
+
 Usage
 -----
   trial-broker.py --once
@@ -1610,6 +1617,33 @@ def _write_goal(state: dict) -> Path:
     return path
 
 
+def _slice_names_same(recorded: str, chain_slice: str, goal_id: str) -> bool:
+    """True when a metrics ``row.slice`` names the same slice as the chain.
+
+    Exact equality always matches. The other real shape is a
+    ``submit_for_review`` row whose ``slice`` is the short name the agent
+    sent (``s1``) while the chain slice is ``{goal}-s1``. That matches only
+    when ``chain_slice == f"{goal_id}-{recorded}"`` (or the reverse). A bare
+    ``s1`` does not match another goal's ``other-goal-s1``, and a suffix
+    check is not used.
+    """
+    recorded = str(recorded or "").strip()
+    chain_slice = str(chain_slice or "").strip()
+    if not recorded or not chain_slice:
+        return False
+    if recorded == chain_slice:
+        return True
+    goal_id = str(goal_id or "").strip()
+    if not goal_id:
+        return False
+    prefix = goal_id + "-"
+    if chain_slice.startswith(prefix) and recorded == chain_slice[len(prefix):]:
+        return True
+    if recorded.startswith(prefix) and chain_slice == recorded[len(prefix):]:
+        return True
+    return False
+
+
 def _slice_has_review_pass(
     goal: dict | None, slice_id: str, *, reload: bool = False
 ) -> tuple[bool, str]:
@@ -1618,7 +1652,11 @@ def _slice_has_review_pass(
     Covers two real paths:
       * an inline (mid-ticket) ``submit_for_review`` gate that returned PASS —
         recorded as a ``goal["metrics"]["tickets"]`` row with
-        ``kind in ("submit_for_review", "gate")`` and ``verdict == "PASS"``;
+        ``kind in ("submit_for_review", "gate")`` and ``verdict == "PASS"``.
+        ``row.slice`` may be the full chain slice or the short name under
+        this goal (``s1`` vs ``{goal}-s1``). Another goal's ``s1`` does not
+        match. Disk gate summaries are still looked up by the full slice id
+        only — a shared ``s1-gate-rev*.md`` name is not evidence;
       * a gate summary file on disk whose parsed verdict is PASS.
 
     ``reload=True`` re-reads the goal from disk first, so mailbox-watcher
@@ -1636,7 +1674,8 @@ def _slice_has_review_pass(
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            if str(row.get("slice") or "") != slice_id:
+            goal_id = str(goal.get("goal") or "")
+            if not _slice_names_same(str(row.get("slice") or ""), slice_id, goal_id):
                 continue
             kind = str(row.get("kind") or "")
             verdict = str(row.get("verdict") or "").strip().upper()
@@ -2550,114 +2589,24 @@ def _normalize_goal_slices(block: dict, job: dict, goal_id: str) -> list[dict]:
     return out
 
 
-def run_goal_job(path: Path, job: dict) -> int:
-    """Hub drops Goal → dsh supervisor plans pack → inline chain (+ auto answer/close)."""
-    dest = PROCESSING / f"{_stamp()}-{path.name}"
-    shutil.move(str(path), str(dest))
-    goal_id = job["goal"]
-    print(f"[trial-broker] processing GOAL {dest.name} goal={goal_id}", flush=True)
+def _execute_goal_slices(
+    goal_state: dict,
+    job: dict,
+    slice_specs: list[dict],
+    dest: Path,
+    *,
+    on_slice_fail: str,
+    plan_ticket: str | None,
+    skip_passed: bool = False,
+) -> int:
+    """Run planned slices in order and close the goal when every slice PASSes.
 
-    goal_state = {
-        "goal": goal_id,
-        "status": "planning",
-        "brief": job["brief"][:4000],
-        "cwd": job["cwd"],
-        "profile": job["profile"],
-        "supervisor_profile": job.get("supervisor_profile") or "acp-lite",
-        "max_slices": job.get("max_slices") or 1,
-        "max_supervisor_tickets": job.get("max_supervisor_tickets") or 8,
-        "max_rounds": job.get("max_rounds") or 2,
-        "slices": [],
-        "supervisor_ticket_count": 0,
-        "supervisor_tickets": [],
-        "created_at": _iso(),
-        "source_job": job.get("id"),
-        "notify": job.get("notify"),
-        "notify_dry_run": job.get("notify_dry_run"),
-        "notify_prefix": job.get("notify_prefix"),
-    }
-    _write_goal(goal_state)
-
-    try:
-        brief_pack = build_goal_brief_pack(job)
-    except ValueError as e:
-        goal_state["status"] = "failed"
-        goal_state["error"] = f"brief pack: {e}"
-        _write_goal(goal_state)
-        shutil.move(str(dest), str(FAILED / dest.name))
-        return 1
-
-    plan_ticket = f"supervisor-plan-{goal_id}"
-    ec, art, summary_path = run_supervisor_ticket(
-        ticket=plan_ticket,
-        pack_name=brief_pack,
-        profile=str(job.get("supervisor_profile") or "acp-lite"),
-        cwd=str(job["cwd"]),
-        summary_name=f"goal-{goal_id}-plan",
-        prompt_mode="supervisor-plan",
-        goal=goal_state,
-    )
-    goal_state = _read_goal(goal_id) or goal_state
-    parsed = _parse_supervisor_summary(summary_path)
-    block = parsed["block"]
-    if ec != 0 and not summary_path.is_file():
-        goal_state["status"] = "failed"
-        goal_state["error"] = f"plan ticket exit {ec}"
-        _write_goal(goal_state)
-        (FAILED / f"{dest.stem}.error.json").write_text(
-            json.dumps({"error": goal_state["error"], "job": job, "at": _iso()}, ensure_ascii=False, indent=2)
-        )
-        shutil.move(str(dest), str(FAILED / dest.name))
-        return ec or 1
-
-    action = str(block.get("action") or "")
-    if action not in ("emit_chain", "emit_chains"):
-        # soft: try to recover fields anyway
-        print(f"[trial-broker] WARN plan action={action!r}, trying field recovery", flush=True)
-
-    slice_specs = _normalize_goal_slices(block, job, goal_id)
-
-    # Enforce max_slices (goal-update overrides > job > global default).
-    limits = T.resolve_limits(job=job, goal=goal_state)
-    max_slices = int(limits.get("max_slices") or 1)
-    if len(slice_specs) > max_slices:
-        hit = T.limit_hit_payload(
-            which="max_slices",
-            limit=max_slices,
-            used=len(slice_specs),
-            slice_id=slice_specs[0]["slice"] if slice_specs else None,
-            step="emit_chains",
-            goal_id=goal_id,
-            suggestion=f"投 type:goal-update 提高 max_slices（当前 {max_slices}）",
-        )
-        goal_state["limit_hit"] = hit
-        goal_state.setdefault("metrics", T.empty_metrics())["limit_hits"].append(hit)
-        goal_state["status"] = "escalated"
-        goal_state["plan_summary"] = str(summary_path)
-        _write_goal(goal_state)
-        _notify_goal_event(goal_state, kind="dsh-trial-limit", ok=False, extra=hit)
-        (FAILED / f"{dest.stem}.error.json").write_text(
-            json.dumps(
-                {"error": "max_slices exceeded", "limit_hit": hit, "at": _iso()},
-                ensure_ascii=False,
-                indent=2,
-            ) + "\n"
-        )
-        shutil.move(str(dest), str(FAILED / dest.name))
-        print(
-            f"[trial-broker] FAIL goal {goal_id} planned {len(slice_specs)} slices "
-            f"> max_slices={max_slices}",
-            flush=True,
-        )
-        return 1
-
-    goal_state["status"] = "running"
-    goal_state["plan_summary"] = str(summary_path)
-    goal_state["plan_artifacts"] = art
-    goal_state.setdefault("metrics", T.empty_metrics())["slices_planned"] = len(slice_specs)
-    _write_goal(goal_state)
-
-    on_slice_fail = str(block.get("on_slice_fail") or job.get("on_slice_fail") or "stop").strip().lower()
+    ``skip_passed=False`` is the fresh goal path (always opens each slice).
+    ``skip_passed=True`` is the resume path after a salvageable false failure:
+    a chain already in PASS is not re-opened, so a salvaged s1 is not rewritten
+    and the next slice still runs.
+    """
+    goal_id = str(job.get("goal") or goal_state.get("goal") or "")
     if on_slice_fail not in ("continue", "stop"):
         on_slice_fail = "stop"
 
@@ -2667,6 +2616,35 @@ def run_goal_job(path: Path, job: dict) -> int:
     last_chain_job: dict | None = None
     for spec in slice_specs:
         slice_id = str(spec["slice"])
+        if skip_passed:
+            existing = _read_chain(slice_id)
+            if isinstance(existing, dict) and str(existing.get("state") or "") == VERDICT_PASS:
+                last_chain = existing
+                last_chain_job = {
+                    "id": job.get("id") or f"goal-chain-{slice_id}",
+                    "type": "chain",
+                    "slice": slice_id,
+                    "pack": Path(str(spec.get("pack") or existing.get("pack") or f"{slice_id}.pack.md")).name,
+                    "acceptance": spec.get("acceptance") or existing.get("acceptance") or [],
+                    "profile": job.get("profile") or existing.get("profile") or "acp",
+                    "gate_profile": job.get("gate_profile") or job.get("profile") or existing.get("gate_profile") or "acp",
+                    "supervisor_profile": job.get("supervisor_profile") or "acp-lite",
+                    "cwd": job.get("cwd") or existing.get("cwd") or "/workspace",
+                    "max_rounds": int(job.get("max_rounds") or existing.get("max_rounds") or 2),
+                    "notify": job.get("notify"),
+                    "notify_dry_run": job.get("notify_dry_run"),
+                    "notify_prefix": job.get("notify_prefix"),
+                    "goal": goal_id,
+                    "from_goal": True,
+                    "auto_supervisor_answer": job.get("auto_supervisor_answer", True),
+                    "max_supervisor_tickets": job.get("max_supervisor_tickets") or 8,
+                    "defer_supervisor_close": True,
+                }
+                print(
+                    f"[trial-broker] goal {goal_id} skip already-PASS slice={slice_id}",
+                    flush=True,
+                )
+                continue
         pack_name = Path(spec["pack"]).name
         pack_abs = PACKS / pack_name
         if not pack_abs.is_file():
@@ -2778,6 +2756,126 @@ def run_goal_job(path: Path, job: dict) -> int:
     if all_pass or (len(slice_specs) == 1 and rc == 0):
         return 0
     return 1
+
+
+
+def run_goal_job(path: Path, job: dict) -> int:
+    """Hub drops Goal → dsh supervisor plans pack → inline chain (+ auto answer/close)."""
+    dest = PROCESSING / f"{_stamp()}-{path.name}"
+    shutil.move(str(path), str(dest))
+    goal_id = job["goal"]
+    print(f"[trial-broker] processing GOAL {dest.name} goal={goal_id}", flush=True)
+
+    goal_state = {
+        "goal": goal_id,
+        "status": "planning",
+        "brief": job["brief"][:4000],
+        "cwd": job["cwd"],
+        "profile": job["profile"],
+        "supervisor_profile": job.get("supervisor_profile") or "acp-lite",
+        "max_slices": job.get("max_slices") or 1,
+        "max_supervisor_tickets": job.get("max_supervisor_tickets") or 8,
+        "max_rounds": job.get("max_rounds") or 2,
+        "slices": [],
+        "supervisor_ticket_count": 0,
+        "supervisor_tickets": [],
+        "created_at": _iso(),
+        "source_job": job.get("id"),
+        "notify": job.get("notify"),
+        "notify_dry_run": job.get("notify_dry_run"),
+        "notify_prefix": job.get("notify_prefix"),
+    }
+    _write_goal(goal_state)
+
+    try:
+        brief_pack = build_goal_brief_pack(job)
+    except ValueError as e:
+        goal_state["status"] = "failed"
+        goal_state["error"] = f"brief pack: {e}"
+        _write_goal(goal_state)
+        shutil.move(str(dest), str(FAILED / dest.name))
+        return 1
+
+    plan_ticket = f"supervisor-plan-{goal_id}"
+    ec, art, summary_path = run_supervisor_ticket(
+        ticket=plan_ticket,
+        pack_name=brief_pack,
+        profile=str(job.get("supervisor_profile") or "acp-lite"),
+        cwd=str(job["cwd"]),
+        summary_name=f"goal-{goal_id}-plan",
+        prompt_mode="supervisor-plan",
+        goal=goal_state,
+    )
+    goal_state = _read_goal(goal_id) or goal_state
+    parsed = _parse_supervisor_summary(summary_path)
+    block = parsed["block"]
+    if ec != 0 and not summary_path.is_file():
+        goal_state["status"] = "failed"
+        goal_state["error"] = f"plan ticket exit {ec}"
+        _write_goal(goal_state)
+        (FAILED / f"{dest.stem}.error.json").write_text(
+            json.dumps({"error": goal_state["error"], "job": job, "at": _iso()}, ensure_ascii=False, indent=2)
+        )
+        shutil.move(str(dest), str(FAILED / dest.name))
+        return ec or 1
+
+    action = str(block.get("action") or "")
+    if action not in ("emit_chain", "emit_chains"):
+        # soft: try to recover fields anyway
+        print(f"[trial-broker] WARN plan action={action!r}, trying field recovery", flush=True)
+
+    slice_specs = _normalize_goal_slices(block, job, goal_id)
+
+    # Enforce max_slices (goal-update overrides > job > global default).
+    limits = T.resolve_limits(job=job, goal=goal_state)
+    max_slices = int(limits.get("max_slices") or 1)
+    if len(slice_specs) > max_slices:
+        hit = T.limit_hit_payload(
+            which="max_slices",
+            limit=max_slices,
+            used=len(slice_specs),
+            slice_id=slice_specs[0]["slice"] if slice_specs else None,
+            step="emit_chains",
+            goal_id=goal_id,
+            suggestion=f"投 type:goal-update 提高 max_slices（当前 {max_slices}）",
+        )
+        goal_state["limit_hit"] = hit
+        goal_state.setdefault("metrics", T.empty_metrics())["limit_hits"].append(hit)
+        goal_state["status"] = "escalated"
+        goal_state["plan_summary"] = str(summary_path)
+        _write_goal(goal_state)
+        _notify_goal_event(goal_state, kind="dsh-trial-limit", ok=False, extra=hit)
+        (FAILED / f"{dest.stem}.error.json").write_text(
+            json.dumps(
+                {"error": "max_slices exceeded", "limit_hit": hit, "at": _iso()},
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n"
+        )
+        shutil.move(str(dest), str(FAILED / dest.name))
+        print(
+            f"[trial-broker] FAIL goal {goal_id} planned {len(slice_specs)} slices "
+            f"> max_slices={max_slices}",
+            flush=True,
+        )
+        return 1
+
+    goal_state["status"] = "running"
+    goal_state["plan_summary"] = str(summary_path)
+    goal_state["plan_artifacts"] = art
+    goal_state.setdefault("metrics", T.empty_metrics())["slices_planned"] = len(slice_specs)
+    _write_goal(goal_state)
+
+    on_slice_fail = str(block.get("on_slice_fail") or job.get("on_slice_fail") or "stop").strip().lower()
+    return _execute_goal_slices(
+        goal_state,
+        job,
+        slice_specs,
+        dest,
+        on_slice_fail=on_slice_fail,
+        plan_ticket=plan_ticket,
+        skip_passed=False,
+    )
 
 
 def run_chain_job(path: Path, job: dict) -> int:
@@ -2976,8 +3074,162 @@ def _notify_goal_terminal(goal_id: str) -> None:
         _notify_goal_event(goal, kind="dsh-trial-goal-failed", ok=False)
 
 
+def _slice_specs_from_plan(goal: dict) -> list[dict]:
+    """Slice specs from the goal's plan summary. Empty when the plan has none.
+
+    Does not invent ``{goal}-s1`` from a missing block. Callers that need the
+    next slice (s2 after a salvaged s1) must read the plan the supervisor
+    already emitted.
+    """
+    path_s = str(goal.get("plan_summary") or "").strip()
+    if not path_s:
+        return []
+    path = Path(path_s)
+    if not path.is_file():
+        return []
+    try:
+        parsed = _parse_supervisor_summary(path)
+    except OSError:
+        return []
+    block = parsed.get("block") or {}
+    if not isinstance(block, dict):
+        return []
+    raw = block.get("slices")
+    has_list = isinstance(raw, list) and any(isinstance(item, dict) for item in raw)
+    has_one = bool(str(block.get("slice") or "").strip())
+    if not has_list and not has_one:
+        return []
+    return _normalize_goal_slices(block, {}, str(goal.get("goal") or ""))
+
+
+def _classify_failed_goal_resume(goal: dict) -> dict:
+    """Whether a failed goal may continue without re-running a PASS slice.
+
+    Allowed only when every non-PASS chain is a missing-summary failure that
+    already has gate PASS, and at least one such chain exists. A later slice
+    with no chain is the next work. Any real failure (no gate PASS, or any
+    other terminal state) refuses the whole resume so it cannot become PASS.
+    """
+    specs = _slice_specs_from_plan(goal)
+    if not specs:
+        return {
+            "ok": False,
+            "reason": "no planned slices in plan summary",
+            "salvage": [],
+            "specs": [],
+        }
+    salvage: list[tuple[str, str]] = []
+    opened = False
+    for spec in specs:
+        sid = str(spec["slice"])
+        chain = _read_chain(sid)
+        if not isinstance(chain, dict):
+            opened = True
+            continue
+        state = str(chain.get("state") or "")
+        if state == VERDICT_PASS:
+            if opened:
+                return {
+                    "ok": False,
+                    "reason": f"slice {sid} is PASS after an unstarted slice",
+                    "salvage": [],
+                    "specs": specs,
+                }
+            continue
+        err = str(chain.get("error") or "")
+        if state == "failed" and "without summary" in err and not opened:
+            ok, reason = _slice_has_review_pass(goal, sid, reload=False)
+            if not ok:
+                return {
+                    "ok": False,
+                    "reason": f"slice {sid} missing summary without gate PASS",
+                    "salvage": [],
+                    "specs": specs,
+                }
+            salvage.append((sid, reason))
+            continue
+        return {
+            "ok": False,
+            "reason": (
+                f"slice {sid} state={state or 'unknown'} "
+                "is not a salvageable false fail"
+            ),
+            "salvage": [],
+            "specs": specs,
+        }
+    if not salvage:
+        return {
+            "ok": False,
+            "reason": "no salvageable false-fail slice",
+            "salvage": [],
+            "specs": specs,
+        }
+    return {"ok": True, "reason": "", "salvage": salvage, "specs": specs}
+
+
+def _apply_summary_salvage(goal: dict, slice_id: str, reason: str) -> None:
+    """Mark a missing-summary chain PASS. Does not open a ticket or add a round."""
+    chain = _read_chain(slice_id)
+    if not isinstance(chain, dict):
+        return
+    chain["state"] = VERDICT_PASS
+    chain["error"] = ""
+    chain["last_verdict"] = VERDICT_PASS
+    chain["salvage_note"] = (
+        f"salvaged on resume: missing impl summary after gate PASS ({reason})"
+    )
+    _write_chain(chain)
+    metrics = goal.setdefault("metrics", T.empty_metrics())
+    metrics["slices_completed"] = int(metrics.get("slices_completed") or 0) + 1
+    _write_goal(goal)
+
+
+def _resume_job_from_goal(goal: dict) -> dict:
+    goal_id = str(goal.get("goal") or "")
+    return {
+        "id": goal.get("source_job") or f"resume-{goal_id}",
+        "type": "goal",
+        "goal": goal_id,
+        "profile": goal.get("profile") or "acp",
+        "gate_profile": goal.get("gate_profile") or goal.get("profile") or "acp",
+        "supervisor_profile": goal.get("supervisor_profile") or "acp-lite",
+        "cwd": goal.get("cwd") or "/workspace",
+        "max_rounds": int(goal.get("max_rounds") or 2),
+        "max_supervisor_tickets": goal.get("max_supervisor_tickets") or 8,
+        "notify": goal.get("notify"),
+        "notify_dry_run": goal.get("notify_dry_run"),
+        "notify_prefix": goal.get("notify_prefix"),
+        "auto_supervisor_answer": True,
+        "on_slice_fail": "stop",
+    }
+
+
+def _continue_salvaged_goal(goal: dict, specs: list[dict], dest: Path) -> int:
+    """Run the plan again with skip_passed, so salvaged PASS slices stay closed."""
+    plan_ticket = None
+    for sid in _goal_slice_ids(goal):
+        chain = _read_chain(sid)
+        if isinstance(chain, dict) and chain.get("plan_ticket"):
+            plan_ticket = str(chain.get("plan_ticket"))
+            break
+    return _execute_goal_slices(
+        goal,
+        _resume_job_from_goal(goal),
+        specs,
+        dest,
+        on_slice_fail="stop",
+        plan_ticket=plan_ticket,
+        skip_passed=True,
+    )
+
+
 def run_goal_update_job(path: Path, job: dict) -> int:
-    """Apply a type:goal-update onto goal state; optionally resume the last chain."""
+    """Apply a type:goal-update onto goal state; optionally resume.
+
+    A failed goal resumes only when the failure is a salvageable missing
+    summary with gate PASS. That slice is not re-run; the next planned
+    slice is. Other failed goals are rejected.
+    """
     dest = PROCESSING / f"{_stamp()}-{path.name}"
     shutil.move(str(path), str(dest))
     goal_id = str(job.get("goal") or job.get("id"))
@@ -3028,6 +3280,39 @@ def run_goal_update_job(path: Path, job: dict) -> int:
         goal["resumed_at"] = _iso()
         _write_goal(goal)
         return _resume_goal_chain(goal)
+
+    # failed is not a normal resume. Only a missing-summary false fail that
+    # already has gate PASS may continue, and only onto slices that are not
+    # already PASS. A real failure is rejected.
+    if job.get("resume") and str(goal.get("status") or "") == "failed":
+        plan = _classify_failed_goal_resume(goal)
+        if not plan["ok"]:
+            goal["resume_rejected"] = plan["reason"]
+            _write_goal(goal)
+            if dest.exists():
+                shutil.move(str(dest), str(FAILED / dest.name))
+            print(
+                f"[trial-broker] goal {goal_id} resume rejected: {plan['reason']}",
+                flush=True,
+            )
+            return 1
+        for sid, reason in plan["salvage"]:
+            goal = _read_goal(goal_id) or goal
+            _apply_summary_salvage(goal, sid, reason)
+        goal = _read_goal(goal_id) or goal
+        goal["status"] = "running"
+        goal["resumed_at"] = _iso()
+        goal["resume_reason"] = (
+            "salvaged missing-summary false fail with gate PASS; "
+            "continuing remaining slices without re-running PASS slices"
+        )
+        _write_goal(goal)
+        print(
+            f"[trial-broker] goal {goal_id} resume after false-fail salvage "
+            f"slices={[sid for sid, _reason in plan['salvage']]}",
+            flush=True,
+        )
+        return _continue_salvaged_goal(goal, plan["specs"], dest)
 
     shutil.move(str(dest), str(OUTBOX / dest.name))
     print(

@@ -1,0 +1,9 @@
+{
+  "goal": "hub-kg-dsh-hub-read-wire-v1",
+  "status": "running",
+  "slices": [
+    "hub-kg-dsh-hub-read-wire-v1-s1",
+    "hub-kg-dsh-hub-read-wire-v1-s2"
+  ],
+  "updated_at": "2026-09-30T17:48:07+08:00"
+}

@@ -1,0 +1,18 @@
+{
+  "slice": "hub-kg-reflect-proposals-read-v1-s1",
+  "type": "chain",
+  "state": "failed",
+  "last_verdict": null,
+  "error": "foreman exit 1 without summary",
+  "goal": "hub-kg-reflect-proposals-read-v1",
+  "from_goal": true,
+  "rounds": [
+    {
+      "round": 1,
+      "impl_exit": 1,
+      "impl_summary": "hub-kg-reflect-proposals-read-v1-s1-impl-r1.md",
+      "impl_artifacts": {"exit_code": 1, "summary_exists": false},
+      "foreman_status": "blocked"
+    }
+  ]
+}

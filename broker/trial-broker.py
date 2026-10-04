@@ -1651,6 +1651,153 @@ def _parse_supervisor_summary(summary_path: Path) -> dict:
     return {"block": block, "text": text, "action": action}
 
 
+# Chain states that mean the slice already finished. Anything else
+# (running, awaiting_supervisor, empty) is still in flight.
+_CHAIN_TERMINAL_STATES = frozenset({"PASS", "failed", "escalated", "cancelled"})
+
+
+def _goal_slice_ids(goal: dict) -> list[str]:
+    ids: list[str] = []
+    for raw in goal.get("slices") or []:
+        if isinstance(raw, str) and raw.strip():
+            ids.append(raw.strip())
+        elif isinstance(raw, dict):
+            sid = str(raw.get("slice") or raw.get("id") or "").strip()
+            if sid:
+                ids.append(sid)
+    return ids
+
+
+def _close_summary_says_done(goal: dict) -> bool:
+    """True when the supervisor close summary already recorded goal_done.
+
+    Reads the file named by ``goal["close_summary"]`` when present, otherwise
+    the conventional ``summaries/goal-{id}-close.md``. Only an explicit
+    ``action=goal_done`` (or ``goal_status=done``) counts. Missing summary,
+    missing file, or a close that does not say done is not evidence of PASS.
+    """
+    path_s = str(goal.get("close_summary") or "").strip()
+    path = Path(path_s) if path_s else None
+    if path is None or not path.is_file():
+        gid = str(goal.get("goal") or "").strip()
+        if not gid:
+            return False
+        path = SUMMARIES / f"goal-{gid}-close.md"
+    if not path.is_file():
+        return False
+    try:
+        parsed = _parse_supervisor_summary(path)
+    except OSError:
+        return False
+    block = parsed.get("block") or {}
+    action = str(parsed.get("action") or "").strip()
+    gstatus = str(block.get("goal_status") or "").strip().lower()
+    return action == "goal_done" or gstatus == "done"
+
+
+def reconcile_running_goal(goal: dict) -> str | None:
+    """Fold a terminal chain back onto a Goal still stuck at ``running``.
+
+    Call only at process start. Returns the new status (``done`` or
+    ``failed``) when this Goal was reconciled, else ``None``.
+
+    Rules (chain JSON is the source of truth; this does not re-run salvage):
+
+    * status other than ``running`` (cancelled, done, failed, planning, …)
+      is left untouched.
+    * no slices, or any slice whose chain is missing / not yet terminal
+      (``running``, ``awaiting_supervisor``, …) → leave it.
+    * every slice chain ``state == PASS``, and the close summary says
+      ``action=goal_done`` (or ``goal_status=done``) → ``done``.
+    * any slice chain already ``failed`` / ``escalated`` / ``cancelled``,
+      including ``error`` like ``foreman exit 1 without summary`` with
+      ``last_verdict`` empty and no gate PASS → that chain state.
+      A missing summary is **not** turned into PASS here. 1a8fe63 salvage
+      stays on the live close path only.
+    """
+    if not isinstance(goal, dict):
+        return None
+    if str(goal.get("status") or "") != "running":
+        return None
+    slice_ids = _goal_slice_ids(goal)
+    if not slice_ids:
+        return None
+    chains: list[dict] = []
+    for sid in slice_ids:
+        chain = _read_chain(sid)
+        if not isinstance(chain, dict):
+            return None
+        state = str(chain.get("state") or "")
+        if state not in _CHAIN_TERMINAL_STATES:
+            return None
+        chains.append(chain)
+    if any(str(c.get("state") or "") != "PASS" for c in chains):
+        # First non-PASS terminal state wins; never invent PASS.
+        bad = next(c for c in chains if str(c.get("state") or "") != "PASS")
+        new_status = str(bad.get("state") or "failed")
+        goal["status"] = new_status
+        goal["last_chain_state"] = new_status
+        err = str(bad.get("error") or "").strip()
+        if err:
+            goal["error"] = err
+        goal["reconciled_at_start"] = True
+        goal["reconcile_reason"] = (
+            f"chain {bad.get('slice')} already {new_status}"
+            + (f" ({err})" if err else "")
+        )
+        _write_goal(goal)
+        print(
+            f"[trial-broker] startup reconcile {goal.get('goal')} "
+            f"running → {new_status} ({goal['reconcile_reason']})",
+            flush=True,
+        )
+        return new_status
+    if not _close_summary_says_done(goal):
+        # All chains PASS but close never recorded goal_done. Do not invent
+        # done, and do not salvage a missing summary into PASS.
+        return None
+    goal["status"] = "done"
+    goal["last_chain_state"] = "PASS"
+    goal["reconciled_at_start"] = True
+    goal["reconcile_reason"] = "all slice chains PASS and close action=goal_done"
+    _write_goal(goal)
+    print(
+        f"[trial-broker] startup reconcile {goal.get('goal')} running → done "
+        f"({goal['reconcile_reason']})",
+        flush=True,
+    )
+    return "done"
+
+
+def reconcile_terminal_goals_at_start() -> list[str]:
+    """At process start, settle Goals left ``running`` after a terminal chain.
+
+    Does not enqueue, open a slice, or resume. Cancelled goals stay cancelled.
+    """
+    settled: list[str] = []
+    if not GOALS.is_dir():
+        return settled
+    for path in sorted(GOALS.glob("*.json")):
+        try:
+            goal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(goal, dict):
+            continue
+        if str(goal.get("status") or "") != "running":
+            continue
+        new_status = reconcile_running_goal(goal)
+        if new_status:
+            settled.append(str(goal.get("goal") or path.stem))
+    if settled:
+        print(
+            f"[trial-broker] startup reconcile settled {len(settled)} goal(s): "
+            + ", ".join(settled),
+            flush=True,
+        )
+    return settled
+
+
 def build_goal_brief_pack(job: dict) -> str:
     goal_id = job["goal"]
     slice_hint = job.get("suggested_slice") or f"{goal_id}-s1"
@@ -2958,6 +3105,9 @@ def cmd_status(_: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     _ensure_dirs()
+    # Fold terminal chains back onto Goals still marked running. Never
+    # resumes them and never touches cancelled / in-flight goals.
+    reconcile_terminal_goals_at_start()
     if not OPEN_SLICE.is_file():
         print(f"missing {OPEN_SLICE}", file=sys.stderr)
         return 2

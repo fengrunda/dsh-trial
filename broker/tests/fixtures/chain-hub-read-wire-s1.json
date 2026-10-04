@@ -1,0 +1,11 @@
+{
+  "slice": "hub-kg-dsh-hub-read-wire-v1-s1",
+  "type": "chain",
+  "state": "PASS",
+  "last_verdict": "PASS",
+  "goal": "hub-kg-dsh-hub-read-wire-v1",
+  "from_goal": true,
+  "rounds": [
+    {"round": 1, "verdict": "PASS"}
+  ]
+}

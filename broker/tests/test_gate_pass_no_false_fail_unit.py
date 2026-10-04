@@ -9,8 +9,10 @@ then the foreman exited non-zero **without** writing a disk impl summary.
 
 Rules under test:
   A) missing summary + gate PASS evidence  -> chain PASS (salvage), rc 0
+     (non-zero exit, and exit 0 with the summary file absent)
   B) missing summary + NO PASS evidence    -> chain failed, error mentions
                                               "without summary", rc != 0
+     (including exit 0: do not invent blocked / awaiting_supervisor)
   C) final-round gate missing/empty summary (timeout) + prior gate PASS
      evidence + impl summary present        -> chain PASS (salvage), rc 0
   D) final-round gate missing/empty summary + NO PASS evidence
@@ -239,6 +241,62 @@ def test_helper_sees_inline_pass_and_disk_gate_pass(tmp_path: Path):
 # --------------------------------------------------------------------------
 # B) missing summary + NO PASS evidence -> still failed
 # --------------------------------------------------------------------------
+
+def test_exit0_missing_summary_with_prior_pass_closes_pass(tmp_path: Path):
+    """Exit 0, summary path missing, prior gate PASS → PASS, not blocked."""
+    slice_id = "unit-gp-exit0-pass"
+    goal_id = "unit-gp-exit0-pass-goal"
+    ctx, dirs = _patched_dirs(tmp_path / "state")
+    with ctx:
+        (dirs["packs"] / f"{slice_id}.pack.md").write_text(
+            f"---\nslice_id: {slice_id}\n---\n# exit0 salvage\n", encoding="utf-8"
+        )
+        _seed_goal(dirs, goal_id, slice_id, gate_verdict="PASS")
+
+        def fake_open_slice(**kwargs):
+            kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+            kwargs["log_path"].write_text("ok but summary elsewhere\n", encoding="utf-8")
+            return 0  # exit 0, no summary at the broker path
+
+        ec = _run_chain(_chain_job(slice_id, tmp_path, goal=goal_id), tmp_path, fake_open_slice)
+        chain = json.loads((dirs["chains"] / f"{slice_id}.json").read_text())
+        assert ec == 0, f"exit-0 salvage should return 0, got {ec}"
+        assert chain["state"] == "PASS", chain
+        assert chain["state"] != "awaiting_supervisor", chain
+        assert chain.get("awaiting_reason") != "blocked", chain
+        assert not chain.get("error"), chain
+        assert "salvage" in str(chain.get("salvage_note") or ""), chain
+        assert chain["last_verdict"] == "PASS", chain
+        print("OK exit0 missing summary + gate PASS ->", chain["state"])
+
+
+def test_exit0_missing_summary_without_pass_is_not_pass(tmp_path: Path):
+    """Exit 0, summary missing, no gate PASS → failed, never PASS or blocked."""
+    slice_id = "unit-gp-exit0-nopass"
+    goal_id = "unit-gp-exit0-nopass-goal"
+    ctx, dirs = _patched_dirs(tmp_path / "state")
+    with ctx:
+        (dirs["packs"] / f"{slice_id}.pack.md").write_text(
+            f"---\nslice_id: {slice_id}\n---\n# exit0 no pass\n", encoding="utf-8"
+        )
+        _seed_goal(dirs, goal_id, slice_id, gate_verdict=None)
+
+        def fake_open_slice(**kwargs):
+            kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+            kwargs["log_path"].write_text("ok but no summary\n", encoding="utf-8")
+            return 0
+
+        ec = _run_chain(_chain_job(slice_id, tmp_path, goal=goal_id), tmp_path, fake_open_slice)
+        chain = json.loads((dirs["chains"] / f"{slice_id}.json").read_text())
+        assert chain["state"] != "PASS", chain
+        assert chain["state"] == "failed", chain
+        assert chain["state"] != "awaiting_supervisor", chain
+        assert "without summary" in str(chain.get("error") or ""), chain
+        assert not chain.get("salvage_note"), chain
+        assert ec != 0, f"no-PASS missing summary must not return 0 (got {ec})"
+        print("OK exit0 missing summary + no PASS ->", chain["state"])
+
+
 def test_missing_summary_without_pass_still_fails(tmp_path: Path):
     """No PASS evidence anywhere: the failure must be preserved, not masked."""
     slice_id = "unit-gp-real-fail"
@@ -445,6 +503,8 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         p = Path(td)
         test_missing_summary_with_submit_for_review_pass_is_salvaged(p / "a")
+        test_exit0_missing_summary_with_prior_pass_closes_pass(p / "a2")
+        test_exit0_missing_summary_without_pass_is_not_pass(p / "a3")
         test_salvage_writes_synthetic_impl_summary(p / "b")
         test_helper_sees_inline_pass_and_disk_gate_pass(p / "c")
         test_missing_summary_without_pass_still_fails(p / "d")

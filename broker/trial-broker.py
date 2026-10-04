@@ -2000,11 +2000,15 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
         chain["rounds"].append(round_rec)
         _write_chain(chain)
 
-        if ec != 0 and not impl_summary.is_file():
+        if not impl_summary.is_file():
             # Salvage: a mid-ticket submit_for_review gate may already have
-            # PASSed this slice, and the foreman then exited non-zero without
-            # writing a disk impl summary. That is not a real failure — closing
-            # failed here falsely failed the whole Goal (Menu-4 r3).
+            # PASSed this slice, and the foreman then left no disk impl
+            # summary — non-zero exit, or exit 0 with the file written off
+            # the summaries dir. A missing file is not status=blocked (the
+            # parser default) and must not sit in awaiting_supervisor.
+            # Closing PASS is allowed only when this slice already has gate
+            # PASS evidence (Menu-4 r3, and the exit-0 wrong-path case).
+            # No prior PASS still fails. A real HOLD is on the gate path.
             # Re-read the goal so mailbox-watcher PASS metrics are visible.
             salvage_goal = goal_obj
             if goal_id:

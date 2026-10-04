@@ -31,7 +31,12 @@ DEFAULT_LIMITS = {
     "max_rounds": 2,
     "ask_supervisor_timeout_sec": 600,
     "ask_supervisor_poll_ms": 2000,
-    "prompt_timeout_sec": 1800,
+    # Hard wall clock for one session/prompt. Idle resets on ACP stdout;
+    # this cap still reaps a hung agent so it cannot hold the broker forever.
+    "prompt_timeout_sec": 3600,
+    # No ACP stdout for this long ends the prompt even if the hard cap remains.
+    # Above ask_supervisor_timeout_sec so a full supervisor wait is not a hang.
+    "prompt_idle_timeout_sec": 900,
     "inplace_rework_max_prompt": 20000,
     "inplace_rework_max_findings": 3,
     # Soft reference for impl/foreman prompt discipline (default 30).
@@ -59,7 +64,7 @@ def load_global_limits() -> dict:
             if isinstance(data, dict):
                 out = dict(DEFAULT_LIMITS)
                 out.update({k: data[k] for k in DEFAULT_LIMITS if k in data})
-                return out
+                return _migrate_legacy_prompt_wall(data, out)
         except (OSError, json.JSONDecodeError):
             pass
     return dict(DEFAULT_LIMITS)
@@ -72,6 +77,27 @@ def save_global_limits(limits: dict) -> Path:
     body["updated_at"] = now_iso()
     LIMITS_PATH.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
     return LIMITS_PATH
+
+
+
+# Box limits.json written before idle timeouts pinned this whole-prompt wall.
+LEGACY_PROMPT_WALL_SEC = 1800
+
+
+def _migrate_legacy_prompt_wall(file_data: dict, out: dict) -> dict:
+    """1800 with no idle key is the old wall clock, not an intentional hard cap.
+
+    Set prompt_idle_timeout_sec in limits.json to keep a shorter hard cap.
+    """
+    if "prompt_idle_timeout_sec" in file_data:
+        return out
+    try:
+        pinned = int(file_data.get("prompt_timeout_sec"))
+    except (TypeError, ValueError):
+        return out
+    if pinned == LEGACY_PROMPT_WALL_SEC:
+        out["prompt_timeout_sec"] = DEFAULT_LIMITS["prompt_timeout_sec"]
+    return out
 
 
 def load_routes(path: Path | None = None) -> dict:

@@ -546,7 +546,13 @@ def write_artifacts(job: dict, log_path: Path, summary_path: Path, ec: int, tick
     return result
 
 
-def _spawn_env(role: str | None, *, ticket: str | None = None, prompt_timeout_sec: int | None = None) -> dict[str, str]:
+def _spawn_env(
+    role: str | None,
+    *,
+    ticket: str | None = None,
+    prompt_timeout_sec: int | None = None,
+    prompt_idle_timeout_sec: int | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     if role:
         env.pop("DSH_HOME", None)
@@ -558,9 +564,25 @@ def _spawn_env(role: str | None, *, ticket: str | None = None, prompt_timeout_se
         )
     env.setdefault("DSH_PERMISSION_MODE", "danger-full-access")
     env["PATH"] = f"{DSH_HOME / 'bin'}:{Path.home() / '.local/bin'}:{env.get('PATH', '')}"
-    # ask_supervisor sync wait needs long ACP prompt budget (tool timeoutMs ~ timeoutSec+60s)
-    pt = int(prompt_timeout_sec or T.load_global_limits().get("prompt_timeout_sec") or 1800)
+    # ask_supervisor sync wait needs long ACP prompt budget (tool timeoutMs ~ timeoutSec+60s).
+    # DSH_ACP_PROMPT_TIMEOUT is the hard cap. DSH_ACP_PROMPT_IDLE_TIMEOUT resets
+    # while ACP stdout shows progress (see broker/dsh-acp-ask.py).
+    lim = T.load_global_limits()
+    pt = int(prompt_timeout_sec or lim.get("prompt_timeout_sec") or T.DEFAULT_LIMITS["prompt_timeout_sec"])
+    idle = int(
+        prompt_idle_timeout_sec
+        or lim.get("prompt_idle_timeout_sec")
+        or T.DEFAULT_LIMITS["prompt_idle_timeout_sec"]
+    )
+    if idle <= 0:
+        idle = pt
+    if pt < idle:
+        pt = idle
     env["DSH_ACP_PROMPT_TIMEOUT"] = str(pt)
+    env["DSH_ACP_PROMPT_IDLE_TIMEOUT"] = str(idle)
+    ask = Path(__file__).resolve().parent / "dsh-acp-ask.py"
+    if ask.is_file():
+        env["DSH_ACP_ASK"] = str(ask)
     if ticket:
         env["DSH_TICKET"] = str(ticket)
     env.pop("NEW_API_KEY", None)
@@ -976,11 +998,16 @@ def run_open_slice(
     env = _spawn_env(
         role,
         ticket=ticket,
-        prompt_timeout_sec=int(lim.get("prompt_timeout_sec") or 1800),
+        prompt_timeout_sec=int(lim.get("prompt_timeout_sec") or T.DEFAULT_LIMITS["prompt_timeout_sec"]),
+        prompt_idle_timeout_sec=int(
+            lim.get("prompt_idle_timeout_sec") or T.DEFAULT_LIMITS["prompt_idle_timeout_sec"]
+        ),
     )
-    # Job timeout must exceed ask wait + work
+    # Job timeout must exceed the prompt hard cap. A fixed 2400s backstop
+    # used to cut the slice before a still-working agent finished.
     ask_to = int(lim.get("ask_supervisor_timeout_sec") or 600)
-    job_timeout = int(os.environ.get("TRIAL_BROKER_JOB_TIMEOUT") or (ask_to + int(lim.get("prompt_timeout_sec") or 1800) + 120))
+    hard = int(lim.get("prompt_timeout_sec") or T.DEFAULT_LIMITS["prompt_timeout_sec"])
+    job_timeout = int(os.environ.get("TRIAL_BROKER_JOB_TIMEOUT") or 0) or (ask_to + hard + 120)
     print(
         f"[trial-broker] spawn open-slice ticket={ticket} pack={pack_name} "
         f"profile={profile} role={role} mode={prompt_mode} job_timeout={job_timeout}",
@@ -993,7 +1020,8 @@ def run_open_slice(
     if watch_mailbox:
         # 超时对齐：watcher 与插件共用同一 MAILBOX（T.MAILBOX，可读 DSH_TRIAL_MAILBOX）。
         # 插件侧同步等待超时须 ≥ 工具 timeoutSec ≤ ask_supervisor_timeout_sec；
-        # ACP prompt 预算 DSH_ACP_PROMPT_TIMEOUT / prompt_timeout_sec（默认 1800）须 ≥ timeoutSec + 余量。
+        # ACP prompt：空闲 DSH_ACP_PROMPT_IDLE_TIMEOUT（默认 900，须 > ask 等待）有进展就重置；
+        # 硬上限 DSH_ACP_PROMPT_TIMEOUT / prompt_timeout_sec（默认 3600）到点仍收口。
         def _watch():
             while not stop.is_set():
                 for ap in T.list_pending_asks(MAILBOX):

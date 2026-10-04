@@ -21,8 +21,12 @@ if [[ -f "$DSH_HOME/load-env.sh" ]]; then
 fi
 export PATH="$DSH_HOME/bin:${HOME}/.local/bin:${PATH}"
 export DSH_HOME
-export TRIAL_BROKER_JOB_TIMEOUT="${TRIAL_BROKER_JOB_TIMEOUT:-2400}"
-export DSH_ACP_PROMPT_TIMEOUT="${DSH_ACP_PROMPT_TIMEOUT:-1800}"
+# Job timeout is computed by trial-broker (ask wait + prompt hard cap + 120)
+# unless TRIAL_BROKER_JOB_TIMEOUT is already a non-empty override.
+# Prompt: idle 900s resets on ACP stdout; 3600s is the hard cap.
+export DSH_ACP_PROMPT_IDLE_TIMEOUT="${DSH_ACP_PROMPT_IDLE_TIMEOUT:-900}"
+export DSH_ACP_PROMPT_TIMEOUT="${DSH_ACP_PROMPT_TIMEOUT:-3600}"
+export DSH_ACP_ASK="${DSH_ACP_ASK:-$ROOT/dsh-acp-ask.py}"
 export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"
 # Prefer official DeepSeek env from load-env; never echo secrets
 unset NEW_API_KEY 2>/dev/null || true

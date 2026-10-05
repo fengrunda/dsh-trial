@@ -146,7 +146,7 @@ build_prompt_foreman() {
 - 除上述两个薄封装外：**禁止** send_to_role 直连、room_*、join。
 - **默认仍禁**裸 `git push` / `gh`（含 `gh pr create|merge`）。
 - **仅当** pack / Goal Done-when 要求对 main 开 PR，且 gate 已 PASS（或 pack 明确允许开 PR）时：**必须**用受控包装：
-  `dsh-trial-pr push-and-pr --repo fengrunda/knowledge-hub --cwd <repo> --branch <feature> --title "…" --body "…"`
+  `dsh-trial-pr push-and-pr --repo <fengrunda/knowledge-hub|fengrunda/memory-as-training> --cwd <repo> --branch <feature> --title "…" --body "…"`
   （或分步 `push` / `create-pr`）。仍禁 force-push、push 到 main/master、`gh pr merge`、其他 remote/仓。
 
 ## usage_prompt（submit_for_review 必填）
@@ -286,7 +286,7 @@ build_prompt_supervisor_close() {
 }
 \`\`\`
 若 Goal Done-when 要求对 main 开 PR 且 impl 未开：可用受控包装补开（仍禁改业务 src）：
-`dsh-trial-pr push-and-pr --repo fengrunda/knowledge-hub --cwd <repo> --branch <feature> --title "…" --body "…"`
+`dsh-trial-pr push-and-pr --repo <fengrunda/knowledge-hub|fengrunda/memory-as-training> --cwd <repo> --branch <feature> --title "…" --body "…"`
 仍禁 force / merge / 其他仓 / 裸 `git push` / 裸 `gh`。PR URL 写入 report 与机器块 pr_url。
 若失败/escalated：goal_status 用 failed 或 escalated，action 仍可读 goal_done 或 goal_report。
 硬禁：room_*；改业务 src；裸 push/gh；force/merge；打印 API key / GH_TOKEN。

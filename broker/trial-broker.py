@@ -579,6 +579,8 @@ def _spawn_env(
             flush=True,
         )
     env.setdefault("DSH_PERMISSION_MODE", "danger-full-access")
+    # Enforce dsh-trial-git-guard (~/.dsh/bin/git): no bare push/commit on main.
+    env["DSH_TRIAL_GUARD"] = "1"
     env["PATH"] = f"{DSH_HOME / 'bin'}:{Path.home() / '.local/bin'}:{env.get('PATH', '')}"
     # ask_supervisor sync wait needs long ACP prompt budget (tool timeoutMs ~ timeoutSec+60s).
     # DSH_ACP_PROMPT_TIMEOUT is the hard cap. DSH_ACP_PROMPT_IDLE_TIMEOUT resets
@@ -3982,16 +3984,34 @@ def run_ticket_job(path: Path, job: dict) -> int:
     return ec or 1
 
 
+def _notify_kinds_since_resume(goal: dict) -> set[str]:
+    """Terminal notify kinds already sent in the *current* Goal lifecycle.
+
+    A Goal that failed, was resumed (salvage), then escalated again must still
+    wake Hub. Events recorded *before* ``resumed_at`` belong to the previous
+    lifecycle and must not suppress the new terminal notify.
+    """
+    resumed_at = str(goal.get("resumed_at") or "").strip()
+    out: set[str] = set()
+    for e in ((goal.get("metrics") or {}).get("notify_events") or []):
+        if not isinstance(e, dict):
+            continue
+        kind = e.get("kind")
+        if not kind:
+            continue
+        at = str(e.get("at") or "").strip()
+        if resumed_at and at and at < resumed_at:
+            continue
+        out.add(str(kind))
+    return out
+
+
 def _notify_goal_terminal(goal_id: str) -> None:
     """Notify Hub once for a terminal Goal event (complete / escalated / failed / limit)."""
     goal = _read_goal(goal_id)
     if not goal:
         return
-    notified = {
-        e.get("kind")
-        for e in ((goal.get("metrics") or {}).get("notify_events") or [])
-        if isinstance(e, dict)
-    }
+    notified = _notify_kinds_since_resume(goal)
     hit = goal.get("limit_hit")
     status = str(goal.get("status") or "").lower()
     if isinstance(hit, dict) and "dsh-trial-limit" not in notified:
@@ -4152,6 +4172,111 @@ def _continue_salvaged_goal(goal: dict, specs: list[dict], dest: Path) -> int:
     )
 
 
+
+def _close_goal_as_done(
+    goal: dict,
+    *,
+    reason: str,
+    accept_slices: list[str] | None = None,
+) -> None:
+    """Close a Goal as done after supervisor/ops ruling (no re-run, no empty PR).
+
+    Marks listed (or all non-PASS terminal) escalated/failed slices as PASS with
+    an ops salvage note, writes ``goal-{id}-close.md`` with ``action=goal_done``,
+    sets goal status=done, and leaves notify to the caller.
+    """
+    goal_id = str(goal.get("goal") or "").strip()
+    if not goal_id:
+        raise ValueError("close_done: missing goal id")
+    slice_ids = _goal_slice_ids(goal)
+    if not slice_ids:
+        raise ValueError(f"close_done: goal {goal_id} has no slices")
+
+    accept_set = {str(s).strip() for s in (accept_slices or []) if str(s).strip()}
+
+    def _matched(sid: str) -> bool:
+        if not accept_set:
+            return True
+        if sid in accept_set:
+            return True
+        # allow short aliases: "s3" matches "...-s3"
+        for a in accept_set:
+            if sid.endswith(f"-{a}") or sid.endswith(a):
+                return True
+        return False
+
+    accepted: list[str] = []
+    for sid in slice_ids:
+        chain = _read_chain(sid)
+        if not isinstance(chain, dict):
+            raise ValueError(f"close_done: missing chain for slice {sid}")
+        state = str(chain.get("state") or "")
+        if state == VERDICT_PASS:
+            continue
+        if state not in ("escalated", "failed", "cancelled"):
+            raise ValueError(
+                f"close_done: slice {sid} state={state or 'unknown'} is not terminal"
+            )
+        if not _matched(sid):
+            raise ValueError(
+                f"close_done: slice {sid} state={state} not in accept_slices={sorted(accept_set)}"
+            )
+        chain["state"] = VERDICT_PASS
+        chain["last_verdict"] = VERDICT_PASS
+        chain["error"] = ""
+        chain["ops_close_done"] = True
+        chain["salvage_note"] = (
+            f"closed as PASS by goal-update action=done ({reason})"
+        )
+        _write_chain(chain)
+        accepted.append(sid)
+        metrics = goal.setdefault("metrics", T.empty_metrics())
+        metrics["slices_completed"] = int(metrics.get("slices_completed") or 0) + 1
+
+    # All slices must now be PASS.
+    for sid in slice_ids:
+        chain = _read_chain(sid)
+        if not isinstance(chain, dict) or str(chain.get("state") or "") != VERDICT_PASS:
+            st = (chain or {}).get("state") if isinstance(chain, dict) else "missing"
+            raise ValueError(f"close_done: slice {sid} still {st} after accept")
+
+    close_path = SUMMARIES / f"goal-{goal_id}-close.md"
+    body = (
+        f"# Supervisor/ops close · {goal_id}\n\n"
+        f"Closed as **done** via goal-update `action=done`.\n\n"
+        f"- Reason: {reason}\n"
+        f"- Accepted slices (ops PASS): {accepted or '(none — already PASS)'}\n"
+        f"- All slices: {slice_ids}\n"
+        f"- No empty PR / empty commit created.\n\n"
+        f"```json\n"
+        + json.dumps(
+            {
+                "action": "goal_done",
+                "goal": goal_id,
+                "goal_status": "done",
+                "report": reason,
+                "slices": slice_ids,
+                "accepted_slices": accepted,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n```\n"
+    )
+    close_path.write_text(body, encoding="utf-8")
+
+    goal["status"] = "done"
+    goal["last_chain_state"] = VERDICT_PASS
+    goal["close_summary"] = str(close_path)
+    goal["close_done_at"] = _iso()
+    goal["close_done_reason"] = reason
+    goal["close_done_accepted_slices"] = accepted
+    goal["updated_at"] = _iso()
+    # Clear residual escalate markers so status/report stay coherent.
+    goal.pop("escalate_reason", None)
+    _write_goal(goal)
+
+
 def run_goal_update_job(path: Path, job: dict) -> int:
     """Apply a type:goal-update onto goal state; optionally resume.
 
@@ -4200,6 +4325,40 @@ def run_goal_update_job(path: Path, job: dict) -> int:
         _notify_goal_terminal(goal_id)
         shutil.move(str(dest), str(OUTBOX / dest.name))
         print(f"[trial-broker] goal {goal_id} cancelled via goal-update", flush=True)
+        return 0
+
+    action = str(job.get("action") or "").strip().lower()
+    if action in ("done", "close_done", "goal_done"):
+        reason = str(
+            job.get("reason")
+            or job.get("close_reason")
+            or "goal-update action=done"
+        ).strip()
+        raw_accept = job.get("accept_slices") or job.get("slices") or []
+        if isinstance(raw_accept, str):
+            accept_slices = [raw_accept]
+        elif isinstance(raw_accept, list):
+            accept_slices = [str(x) for x in raw_accept]
+        else:
+            accept_slices = []
+        try:
+            _close_goal_as_done(goal, reason=reason, accept_slices=accept_slices or None)
+        except ValueError as e:
+            goal = _read_goal(goal_id) or goal
+            goal["close_done_rejected"] = str(e)
+            _write_goal(goal)
+            if dest.exists():
+                shutil.move(str(dest), str(FAILED / dest.name))
+            print(f"[trial-broker] goal {goal_id} close_done rejected: {e}", flush=True)
+            return 1
+        _notify_goal_terminal(goal_id)
+        if dest.exists():
+            shutil.move(str(dest), str(OUTBOX / dest.name))
+        print(
+            f"[trial-broker] goal {goal_id} closed done via goal-update "
+            f"accepted={(_read_goal(goal_id) or {}).get('close_done_accepted_slices')}",
+            flush=True,
+        )
         return 0
 
     if job.get("resume") and str(goal.get("status") or "") in (

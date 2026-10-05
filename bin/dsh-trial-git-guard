@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# dsh-trial-git-guard — when DSH_TRIAL_GUARD=1, refuse bare push/force to main|master
+# and refuse committing directly on main|master. Otherwise passthrough to real git.
+# Installed as ~/.dsh/bin/git (PATH head for trial open-slice). Never prints secrets.
+set -euo pipefail
+
+REAL_GIT="${DSH_TRIAL_REAL_GIT:-/usr/bin/git}"
+if [[ ! -x "$REAL_GIT" ]]; then
+  REAL_GIT="$(command -v -a git 2>/dev/null | while read -r c; do
+    [[ "$c" == "$0" ]] && continue
+    [[ "$(basename "$c")" == "dsh-trial-git-guard" ]] && continue
+    echo "$c"; break
+  done || true)"
+fi
+[[ -n "${REAL_GIT:-}" && -x "$REAL_GIT" ]] || REAL_GIT=/usr/bin/git
+
+# Non-trial shells: never interfere.
+if [[ "${DSH_TRIAL_GUARD:-}" != "1" && "${DSH_TRIAL_GUARD:-}" != "true" ]]; then
+  exec "$REAL_GIT" "$@"
+fi
+
+die() { echo "dsh-trial-git-guard: $*" >&2; exit 1; }
+
+# Find the git subcommand (skip global options like -C, -c, --git-dir).
+args=("$@")
+i=0
+cmd=""
+while [[ $i -lt ${#args[@]} ]]; do
+  a="${args[$i]}"
+  case "$a" in
+    -C|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)
+      i=$((i + 2)); continue ;;
+    -c)
+      i=$((i + 2)); continue ;;
+    --help|-h|help)
+      exec "$REAL_GIT" "$@"; ;;
+    -*)
+      i=$((i + 1)); continue ;;
+    *)
+      cmd="$a"; break ;;
+  esac
+done
+
+current_branch() {
+  "$REAL_GIT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo ""
+}
+
+is_protected_ref() {
+  local ref="${1:-}"
+  ref="${ref#refs/heads/}"
+  case "$ref" in
+    main|master) return 0 ;;
+  esac
+  return 1
+}
+
+case "$cmd" in
+  push)
+    # Reject force in any form.
+    for a in "${args[@]}"; do
+      case "$a" in
+        -f|--force|--force-with-lease|--force-if-includes)
+          die "refused: force-push is forbidden under DSH_TRIAL_GUARD (use dsh-trial-pr on a feature branch)" ;;
+      esac
+    done
+    # Collect refspecs after optional remote.
+    # Patterns: git push; git push origin; git push origin main; git push origin HEAD:main
+    #           git push origin +main; git push --all; git push origin refs/heads/main
+    remote=""
+    refspecs=()
+    saw_cmd=0
+    for a in "${args[@]}"; do
+      if [[ $saw_cmd -eq 0 ]]; then
+        [[ "$a" == "push" ]] && saw_cmd=1
+        continue
+      fi
+      case "$a" in
+        -*)
+          continue ;;
+        *)
+          if [[ -z "$remote" ]]; then
+            # first non-option after push is remote (or a refspec if unusual)
+            remote="$a"
+          else
+            refspecs+=("$a")
+          fi
+          ;;
+      esac
+    done
+    if [[ ${#refspecs[@]} -eq 0 ]]; then
+      # bare `git push` / `git push origin` uses upstream of current branch
+      br="$(current_branch)"
+      if is_protected_ref "$br"; then
+        die "refused: cannot push protected branch '$br' (checkout a feature branch and use dsh-trial-pr)"
+      fi
+    else
+      for rs in "${refspecs[@]}"; do
+        # strip leading + (force refspec)
+        [[ "$rs" == +* ]] && die "refused: force refspec (+$rs) forbidden under DSH_TRIAL_GUARD"
+        src="${rs%%:*}"
+        dst="$rs"
+        if [[ "$rs" == *:* ]]; then
+          dst="${rs#*:}"
+        fi
+        # empty dst means delete
+        if [[ -z "$dst" ]]; then
+          die "refused: deleting remote refs is forbidden under DSH_TRIAL_GUARD"
+        fi
+        if is_protected_ref "$dst" || is_protected_ref "$src"; then
+          die "refused: cannot push to protected ref '$rs' (use dsh-trial-pr on a feature branch)"
+        fi
+        # also catch origin main when parsed as remote=origin refspec=main → src=main
+        if is_protected_ref "$rs"; then
+          die "refused: cannot push protected branch '$rs'"
+        fi
+      done
+    fi
+    ;;
+  commit)
+    br="$(current_branch)"
+    if is_protected_ref "$br"; then
+      die "refused: cannot commit on protected branch '$br' under DSH_TRIAL_GUARD (create a feature branch first; PR via dsh-trial-pr)"
+    fi
+    ;;
+esac
+
+exec "$REAL_GIT" "$@"

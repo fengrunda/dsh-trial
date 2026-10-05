@@ -38,8 +38,9 @@ Env
 ---
 DSH_BIN, DSH_HOME, DSH_ROLE, DSH_HOMES_ROOT, DSH_PERMISSION_MODE,
 DSH_ACP_PROMPT_IDLE_TIMEOUT (default 900): reset while ACP stdout shows
-progress. DSH_ACP_PROMPT_TIMEOUT (default 3600): hard wall-clock cap for
-one session/prompt so a true hang cannot hold the broker forever.
+progress. DSH_ACP_PROMPT_TIMEOUT (default 3600): hard cap on process
+uptime (time.monotonic) for one session/prompt so a true hang cannot hold
+the broker forever and a host suspend / wall-clock jump cannot trip it.
 Loads $DSH_HOME/.env into the child without overwriting existing env.
 
 Vendored into dsh-trial so the trial broker can set DSH_ACP_ASK here.
@@ -236,7 +237,8 @@ def prompt_timeouts_from_env(env: dict[str, str] | None = None) -> tuple[int, in
     """Return (idle_seconds, hard_cap_seconds) for one session/prompt.
 
     Idle resets when ACP stdout shows progress. The hard cap is absolute
-    from prompt start. idle <= 0 disables the idle timer (wall clock only).
+    from prompt start on the monotonic clock (process uptime). idle <= 0
+    disables the idle timer (hard cap only).
     The hard cap is never shorter than the idle window.
     """
     src = env if env is not None else os.environ
@@ -295,19 +297,20 @@ class AcpClient:
     ) -> tuple[dict[str, Any] | None, list[str]]:
         """Wait until pred(msg) or a deadline.
 
-        timeout is a hard wall clock from entry. idle_timeout, when set,
-        resets on each ACP stdout line (progress) but never past the hard
-        deadline. stderr does not count as progress. On expiry,
-        self._timeout_kind is "idle" or "hard".
+        timeout is a hard cap measured on time.monotonic() (process uptime)
+        from entry, so a host suspend or wall-clock jump cannot trip it.
+        idle_timeout, when set, resets on each ACP stdout line (progress)
+        but never past the hard deadline. stderr does not count as progress.
+        On expiry, self._timeout_kind is "idle" or "hard".
         """
         errs: list[str] = []
         self._timeout_kind = None
-        hard_deadline = time.time() + timeout
+        hard_deadline = time.monotonic() + timeout
         idle_deadline = (
-            time.time() + idle_timeout if idle_timeout else hard_deadline
+            time.monotonic() + idle_timeout if idle_timeout else hard_deadline
         )
         while True:
-            now = time.time()
+            now = time.monotonic()
             if now >= hard_deadline:
                 self._timeout_kind = "hard"
                 return None, errs
@@ -329,7 +332,7 @@ class AcpClient:
             if line is None:
                 continue
             if tag == "out" and idle_timeout:
-                idle_deadline = bump_idle_deadline(time.time(), idle_timeout, hard_deadline)
+                idle_deadline = bump_idle_deadline(time.monotonic(), idle_timeout, hard_deadline)
             if tag == "err":
                 errs.append(line)
                 continue

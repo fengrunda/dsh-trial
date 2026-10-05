@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Prompt timeout is idle-reset plus a hard cap, not one 1800s wall clock."""
+"""Prompt timeout is idle-reset plus a hard cap measured on time.monotonic().
+
+The deadlines must follow process uptime, not the wall clock: a host suspend
+or NTP jump must not trip the hard/idle timer early.
+"""
 from __future__ import annotations
 
 import importlib.util
@@ -156,3 +160,99 @@ def test_hard_cap_fires_while_stdout_keeps_coming():
     assert msg is None
     assert client._timeout_kind == "hard"
     assert elapsed < 1.6
+
+
+class _WallJump:
+    """Proxy for ``time``: real monotonic (no hangs), scripted wall clock.
+
+    The wall clock starts near zero and can leap forward at a chosen step,
+    modelling a host suspend / NTP jump *during* the wait.
+    """
+
+    def __init__(self, *, jump_at: int | None = None, jump_to: float = 3600.0):
+        self.jump_at = jump_at
+        self.jump_to = jump_to
+        self.clock_calls = 0
+
+    def time(self) -> float:
+        self.clock_calls += 1
+        if self.jump_at is not None and self.clock_calls >= self.jump_at:
+            return self.jump_to
+        return float(self.clock_calls)
+
+    def __getattr__(self, name):
+        # Everything else (sleep, monotonic, ...) stays the real clock.
+        return getattr(time, name)
+
+
+def test_hard_cap_times_out_on_monotonic_not_wall(monkeypatch):
+    """A far-future wall clock must not make the hard cap fire immediately."""
+    real_sleep = time.sleep
+    fake = _WallJump()
+    fake.jump_at = 1
+    fake.jump_to = 1_700_000_000.0
+    client = _FakeClient()
+    monkeypatch.setattr(ask, "time", fake)
+
+    def later():
+        real_sleep(0.3)
+        client.q.put(("out", json.dumps({"id": 7, "result": {}})))
+
+    threading.Thread(target=later, daemon=True).start()
+    started = time.monotonic()
+    msg, _errs = client.wait_for(lambda m: m.get("id") == 7, timeout=1.0, idle_timeout=None)
+    elapsed = time.monotonic() - started
+    assert msg is not None and msg["id"] == 7
+    assert client._timeout_kind is None
+    assert elapsed < 0.8
+
+
+def test_wall_clock_jump_does_not_trip_hard_cap(monkeypatch):
+    """Host suspend mid-wait: wall clock leaps, monotonic hard cap survives."""
+    real_sleep = time.sleep
+    fake = _WallJump(jump_at=30, jump_to=1_700_000_000.0)
+    client = _FakeClient()
+    monkeypatch.setattr(ask, "time", fake)
+
+    def later():
+        real_sleep(0.12)
+        client.q.put(("out", json.dumps({"id": 7, "result": {}})))
+
+    threading.Thread(target=later, daemon=True).start()
+    started = time.monotonic()
+    msg, _errs = client.wait_for(lambda m: m.get("id") == 7, timeout=1.0, idle_timeout=None)
+    elapsed = time.monotonic() - started
+    assert msg is not None and msg["id"] == 7
+    assert client._timeout_kind is None
+    assert elapsed < 0.8
+
+
+def test_wall_clock_jump_does_not_trip_idle(monkeypatch):
+    """A wall-clock leap during progress must not expire the idle timer."""
+    real_sleep = time.sleep
+    fake = _WallJump(jump_at=30, jump_to=2_000_000_000.0)
+    client = _FakeClient()
+    monkeypatch.setattr(ask, "time", fake)
+
+    def later():
+        real_sleep(0.12)
+        # Progress: with monotonic this is the only thing that resets idle.
+        client.q.put(("out", json.dumps({"method": "session/update", "params": {}})))
+        real_sleep(0.13)
+        client.q.put(("out", json.dumps({"id": 9, "result": {}})))
+
+    threading.Thread(target=later, daemon=True).start()
+    msg, _errs = client.wait_for(lambda m: m.get("id") == 9, timeout=5, idle_timeout=0.4)
+    assert msg is not None and msg["id"] == 9
+    assert client._timeout_kind is None
+
+
+def test_hard_deadline_uses_monotonic_source():
+    """Guard: wait_for must not read the wall clock for its deadlines."""
+    src = (ROOT / "dsh-acp-ask.py").read_text(encoding="utf-8")
+    start = src.index("def wait_for(")
+    end = src.index("def initialize(", start)
+    body = src[start:end]
+    assert "time.monotonic()" in body
+    assert "time.time()" not in body
+

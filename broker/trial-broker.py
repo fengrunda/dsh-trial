@@ -3725,6 +3725,7 @@ def run_goal_job(path: Path, job: dict) -> int:
         goal_state["error"] = f"brief pack: {e}"
         _write_goal(goal_state)
         shutil.move(str(dest), str(FAILED / dest.name))
+        _notify_goal_terminal(goal_id)
         return 1
 
     plan_ticket = f"supervisor-plan-{goal_id}"
@@ -3748,6 +3749,8 @@ def run_goal_job(path: Path, job: dict) -> int:
             json.dumps({"error": goal_state["error"], "job": job, "at": _iso()}, ensure_ascii=False, indent=2)
         )
         shutil.move(str(dest), str(FAILED / dest.name))
+        # Plan-ticket failure is terminal too: wake Hub like slice failures do.
+        _notify_goal_terminal(goal_id)
         return ec or 1
 
     action = str(block.get("action") or "")

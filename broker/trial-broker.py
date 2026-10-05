@@ -63,6 +63,14 @@ with top-level slice/pack/acceptance) or many (``action=emit_chains`` with a
 first failed/escalated slice unless ``on_slice_fail=continue``, and runs the
 supervisor close once after every slice PASSes.
 
+An impl that exits without a summary because it hit the ACP hard cap
+(``timeout after Ns hard cap``) or the step cap (``max_steps`` / 步数上限)
+is not marked failed when the slice worktree already has committable
+changes. The broker closeout commits those changes, runs the tests named
+in the slice pack, opens a PR through ``dsh-trial-pr`` when the pack asks
+for one, and writes a supervisor handoff under thin-state summaries. A
+clean worktree still fails. An idle timeout is not a closeout.
+
 ``type:goal-update`` with ``resume: true`` on a goal already ``failed``
 continues only when that failure is a missing impl summary and the slice
 already has gate PASS. A metrics row may name the slice ``s1`` while the
@@ -82,6 +90,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1965,6 +1974,8 @@ def build_supervisor_close_pack(
         "last_verdict": chain.get("last_verdict"),
         "rounds": len(chain.get("rounds") or []),
         "supervisor_answers": chain.get("last_supervisor_answer"),
+        "handoff_summary": chain.get("handoff_summary") or "",
+        "closeout": chain.get("closeout") or None,
     }
     body = f"""---
 kind: supervisor-close
@@ -1981,7 +1992,10 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/goal-{goal_id}-close.md
 ```
 
 ## Instruction
+If handoff_summary is set, read that file first. It is the limit-stop handoff
+(hard cap or max_steps). Do not re-open the impl slice.
 If state/verdict is PASS: set goals/{goal_id}.json status=done and emit action=goal_done.
+If state is closeout: do not mark the goal failed and do not emit goal_done.
 Otherwise set failed/escalated accordingly.
 """
     path.write_text(body, encoding="utf-8")
@@ -2138,6 +2152,658 @@ def maybe_supervisor_close(job: dict, chain: dict) -> None:
 
 
 
+# Limit-stop closeout. Hard cap and max_steps share this path. Idle timeout
+# is intentionally not a kind: "timeout after Ns idle" must stay a plain fail.
+_HARD_CAP_RE = re.compile(r"timeout after \d+s hard cap")
+_STEP_LIMIT_RE = re.compile(
+    r"(?i)(?:"
+    r"(?:impl_)?max_steps\b[^\n]{0,80}\b(?:hit|exceed\w*|reached|limit)\b|"
+    r"\b(?:hit|exceed\w*|reached)\b[^\n]{0,80}\b(?:impl_)?max_steps\b|"
+    r"\bstep limit\b[^\n]{0,40}\b(?:hit|exceed\w*|reached)\b|"
+    r"步数上限"
+    r")"
+)
+_TEST_BACKTICK_RE = re.compile(
+    r"`((?:python3? -m )?pytest\b[^`]*|npm test[^`]*|pnpm(?: run)? test[^`]*|yarn test[^`]*)`"
+)
+_JUNK_DIRS = {
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".hypothesis",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".smoke",
+}
+_JUNK_NAMES = {".DS_Store"}
+_JUNK_SUFFIXES = {".pyc", ".pyo"}
+_LIMIT_KIND_ZH = {"hard_cap": "硬上限", "max_steps": "步数上限"}
+
+
+def _run_section(log_text: str) -> str:
+    """ACP failure text. The prompt echoed above ``=== run ===`` is not a hit."""
+    if "=== run ===" in (log_text or ""):
+        return log_text.rsplit("=== run ===", 1)[-1]
+    return log_text or ""
+
+
+def limit_stop_kind(log_text: str) -> str | None:
+    """``hard_cap`` or ``max_steps`` when the impl log says that limit stopped it.
+
+    Idle timeout is not a limit stop. Prompt text before ``=== run ===`` is
+    ignored so the soft step-discipline paragraph cannot trip this.
+    """
+    section = _run_section(log_text)
+    if _HARD_CAP_RE.search(section):
+        return "hard_cap"
+    if _STEP_LIMIT_RE.search(section):
+        return "max_steps"
+    return None
+
+
+def _is_junk_path(path: str) -> bool:
+    parts = Path(path).parts
+    if any(part in _JUNK_DIRS for part in parts):
+        return True
+    name = parts[-1] if parts else path
+    if name in _JUNK_NAMES:
+        return True
+    return Path(name).suffix in _JUNK_SUFFIXES
+
+
+def _parse_porcelain_z(blob: str) -> list[tuple[str, str]]:
+    if not blob:
+        return []
+    parts = blob.split("\0")
+    out: list[tuple[str, str]] = []
+    i = 0
+    while i < len(parts):
+        rec = parts[i]
+        if not rec:
+            i += 1
+            continue
+        if len(rec) < 4:
+            i += 1
+            continue
+        xy = rec[:2]
+        path = rec[3:]
+        i += 1
+        if "R" in xy or "C" in xy:
+            if i < len(parts) and parts[i] != "":
+                path = parts[i]
+                i += 1
+        out.append((xy, path))
+    return out
+
+
+def _git_dirty_paths(cwd: Path) -> tuple[list[str], str]:
+    """Non-junk uncommitted paths (tracked and untracked). Error string on failure."""
+    try:
+        r = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-uall", "-z"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return [], f"git status failed: {e}"
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "git status failed").strip()
+        return [], err[-400:]
+    paths: list[str] = []
+    for _xy, path in _parse_porcelain_z(r.stdout or ""):
+        if not path or _is_junk_path(path):
+            continue
+        if path not in paths:
+            paths.append(path)
+    return paths, ""
+
+
+def _head_branch(cwd: Path) -> str:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if r.returncode != 0:
+        return ""
+    return (r.stdout or "").strip()
+
+
+def _branch_token(raw: str) -> str:
+    raw = (raw or "").strip().strip("\"'")
+    if not raw:
+        return ""
+    return re.split(r"[\s（(]", raw, maxsplit=1)[0].strip()
+
+
+def _origin_repo(cwd: Path) -> str:
+    try:
+        r = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    url = (r.stdout or "").strip()
+    if r.returncode != 0 or not url:
+        return ""
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/\s]+)", url)
+    if not m:
+        return ""
+    repo = f"{m.group(1)}/{m.group(2)}"
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    return repo
+
+
+def _slice_pack_text(pack_name: str) -> str:
+    if not pack_name:
+        return ""
+    path = PACKS / Path(pack_name).name
+    try:
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
+    except OSError:
+        return ""
+
+
+def _allowed_test_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    if any(tok in arg for arg in argv for tok in (";", "|", "&", "$", "`", ">", "<")):
+        return False
+    head = argv[0]
+    if head == "pytest":
+        return True
+    if head in {"npm", "pnpm", "yarn"} and "test" in argv[1:]:
+        return True
+    if head in {"python", "python3"} and len(argv) >= 3 and argv[1] == "-m" and argv[2] == "pytest":
+        return True
+    return False
+
+
+def _test_commands_from_pack(pack_text: str) -> list[str]:
+    """Commands the slice pack already names. Never invent a test file."""
+    meta = _parse_frontmatter(pack_text)
+    found: list[str] = []
+    for key in ("test_cmd", "test_command", "test", "tests"):
+        raw = str(meta.get(key) or "").strip()
+        if raw and raw.lower() not in {"true", "false", "yes", "no"}:
+            found.append(raw)
+    for m in _TEST_BACKTICK_RE.finditer(pack_text or ""):
+        cmd = m.group(1).strip()
+        if cmd and cmd not in found:
+            found.append(cmd)
+    kept: list[str] = []
+    for cmd in found:
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            continue
+        if _allowed_test_argv(argv) and cmd not in kept:
+            kept.append(cmd)
+    return kept
+
+
+def _pack_wants_pr(pack_text: str) -> bool:
+    meta = _parse_frontmatter(pack_text)
+    flag = str(meta.get("pr") or meta.get("open_pr") or "").strip().lower()
+    if flag in {"1", "true", "yes", "required"}:
+        return True
+    body = pack_text or ""
+    if "dsh-trial-pr" in body or "开 PR" in body or "PR 已开" in body:
+        return True
+    return False
+
+
+def _pack_pr_repo(pack_text: str, cwd: Path) -> str:
+    meta = _parse_frontmatter(pack_text)
+    named = str(meta.get("pr_repo") or meta.get("github_repo") or "").strip()
+    if named:
+        return named
+    m = re.search(r"fengrunda/(?:knowledge-hub|memory-as-training)", pack_text or "")
+    if m:
+        return m.group(0)
+    return _origin_repo(cwd)
+
+
+def _commit_paths(cwd: Path, paths: list[str]) -> tuple[str, str]:
+    """Commit ``paths`` only. Does not edit file contents. Returns (sha, error)."""
+    if not paths:
+        return "", "no paths"
+    try:
+        added = subprocess.run(
+            ["git", "add", "--", *paths],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return "", f"git add failed: {e}"
+    if added.returncode != 0:
+        return "", (added.stderr or added.stdout or "git add failed").strip()[-400:]
+    msg = (
+        "chore: supervisor closeout of work left by a limit stop\n\n"
+        "Commit only files already in the worktree. No extra code edits.\n"
+    )
+    commit_argv = ["commit", "-m", msg]
+    prefix = ["git"]
+    try:
+        email = subprocess.run(
+            ["git", "config", "--get", "user.email"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        email = None
+    if email is None or email.returncode != 0 or not (email.stdout or "").strip():
+        prefix = [
+            "git",
+            "-c",
+            "user.email=dsh-trial-broker@localhost",
+            "-c",
+            "user.name=dsh-trial-broker",
+        ]
+    try:
+        committed = subprocess.run(
+            [*prefix, *commit_argv],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return "", f"git commit failed: {e}"
+    if committed.returncode != 0:
+        return "", (committed.stderr or committed.stdout or "git commit failed").strip()[-400:]
+    return _git_rev(cwd), ""
+
+
+def _run_slice_tests(cwd: Path, commands: list[str]) -> list[dict]:
+    results: list[dict] = []
+    for cmd in commands:
+        argv = shlex.split(cmd)
+        if not _allowed_test_argv(argv):
+            results.append({"cmd": cmd, "exit": 127, "error": "refused test command"})
+            break
+        try:
+            r = subprocess.run(
+                argv, cwd=str(cwd), capture_output=True, text=True, timeout=600
+            )
+            tail = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()[-800:]
+            results.append({"cmd": cmd, "exit": r.returncode, "tail": tail})
+        except (OSError, subprocess.SubprocessError) as e:
+            results.append({"cmd": cmd, "exit": 127, "error": str(e)})
+            break
+        if r.returncode != 0:
+            break
+    return results
+
+
+def _trial_pr_bin() -> Path:
+    env = os.environ.get("DSH_TRIAL_PR", "").strip()
+    if env:
+        return Path(env)
+    for cand in (DSH_HOME / "bin" / "dsh-trial-pr", _REPO_ROOT / "bin" / "dsh-trial-pr"):
+        if cand.is_file():
+            return cand
+    return _REPO_ROOT / "bin" / "dsh-trial-pr"
+
+
+def _open_slice_pr(*, cwd: Path, repo: str, branch: str, title: str, body: str) -> dict:
+    """Open a PR through the existing dsh-trial-pr wrapper. Never pushes main."""
+    if branch in {"", "HEAD", "main", "master"}:
+        return {"opened": False, "url": "", "error": f"refusing PR from branch {branch or '(empty)'}"}
+    if not repo:
+        return {"opened": False, "url": "", "error": "no allowlisted repo from pack or origin"}
+    pr_bin = _trial_pr_bin()
+    if not pr_bin.is_file():
+        return {"opened": False, "url": "", "error": f"dsh-trial-pr missing: {pr_bin}"}
+    try:
+        r = subprocess.run(
+            [
+                str(pr_bin),
+                "push-and-pr",
+                "--repo",
+                repo,
+                "--cwd",
+                str(cwd),
+                "--branch",
+                branch,
+                "--title",
+                title,
+                "--body",
+                body,
+            ],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"opened": False, "url": "", "error": f"dsh-trial-pr failed: {e}"}
+    out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+    url = ""
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("https://") or line.startswith("http://"):
+            url = line
+            break
+    if r.returncode != 0:
+        return {"opened": False, "url": url, "error": out[-500:] or f"dsh-trial-pr exit {r.returncode}"}
+    return {"opened": bool(url) or r.returncode == 0, "url": url, "error": ""}
+
+
+def _handoff_next(kind: str, *, dirty: bool, committed: str, tests: list[dict], pr: dict, blocked: str) -> str:
+    label = _LIMIT_KIND_ZH.get(kind, kind)
+    if not dirty:
+        return (
+            f"这是真撞{label}，工作区没有可提交改动。按失败处理，不要收成 PASS，"
+            "不要为了捞改动重跑整片。"
+        )
+    if blocked:
+        return (
+            f"撞上{label}，工作区有改动但收口停住：{blocked} "
+            "不要重跑整片，不要丢掉已有文件。监理在当前分支上接着处理。"
+        )
+    tests_ok = bool(tests) and all(int(row.get("exit") or 0) == 0 for row in tests)
+    if not tests:
+        return (
+            f"已提交 {committed or '(无)'}。切片 pack 没有写明可执行的测试命令，"
+            "所以没有跑测试，也没有开 PR。不要假装整片 PASS，不要重跑整片。"
+            "监理补跑 pack 里的测试后再决定 PR。"
+        )
+    if not tests_ok:
+        return (
+            f"已提交 {committed or '(无)'} 保留。测试没过，PR 没开，整片不是 PASS。"
+            "不要重跑整片，不要丢掉这个提交。监理在该提交上修到测试过。"
+        )
+    if pr.get("opened"):
+        return (
+            f"已提交 {committed}，测试已过，PR 已开（{pr.get('url') or '见上'}）。"
+            "不要重跑整片，不要改已提交的文件。监理核对交接后收口。"
+        )
+    if pr.get("error"):
+        return (
+            f"已提交 {committed} 保留，测试已过，但 PR 没开成：{pr.get('error')} "
+            "整片不是 PASS。不要重跑整片。监理用 dsh-trial-pr 补开 PR。"
+        )
+    return (
+        f"已提交 {committed}，测试已过。切片没有要求 PR。不要重跑整片。"
+        "监理核对交接后收口，不要把整片标成 gate PASS。"
+    )
+
+
+def write_limit_handoff(
+    *,
+    goal_id: str,
+    slice_id: str,
+    ticket: str,
+    kind: str,
+    round_n: int,
+    exit_code: int,
+    head_before: str,
+    commit: str,
+    committed_paths: list[str],
+    dirty_before: list[str],
+    uncommitted_after: list[str],
+    tests: list[dict],
+    pr: dict,
+    blocked: str,
+    branch: str,
+) -> Path:
+    """Handoff the supervisor already reads: thin-state summaries."""
+    SUMMARIES.mkdir(parents=True, exist_ok=True)
+    path = SUMMARIES / f"{slice_id}-sup-handoff-r{round_n}.md"
+    label = _LIMIT_KIND_ZH.get(kind, kind)
+    tests_ran = bool(tests)
+    pr_opened = bool(pr.get("opened"))
+    next_step = _handoff_next(
+        kind,
+        dirty=bool(dirty_before),
+        committed=commit,
+        tests=tests,
+        pr=pr,
+        blocked=blocked,
+    )
+    block = {
+        "action": "supervisor_handoff",
+        "limit": kind,
+        "goal": goal_id,
+        "slice": slice_id,
+        "ticket": ticket,
+        "exit": exit_code,
+        "summary": False,
+        "gate": False,
+        "slice_pass": False,
+        "branch": branch,
+        "head_before": head_before,
+        "commit": commit,
+        "committed_paths": committed_paths,
+        "dirty_before": dirty_before,
+        "uncommitted_after": uncommitted_after,
+        "tests_ran": tests_ran,
+        "tests": [{k: row.get(k) for k in ("cmd", "exit", "error")} for row in tests],
+        "pr_required_opened": pr_opened,
+        "pr_url": pr.get("url") or "",
+        "pr_error": pr.get("error") or "",
+        "blocked": blocked,
+        "next": next_step,
+    }
+    dirty_txt = "\n".join(f"- `{p}`" for p in dirty_before) or "- （没有可提交改动）"
+    left_txt = "\n".join(f"- `{p}`" for p in uncommitted_after) or "- （没有）"
+    committed_txt = "\n".join(f"- `{p}`" for p in committed_paths) or "- （这次没有新提交）"
+    if tests_ran:
+        test_txt = "\n".join(
+            f"- `{row.get('cmd')}` exit={row.get('exit')}"
+            + (f" error={row.get('error')}" if row.get("error") else "")
+            for row in tests
+        )
+    else:
+        test_txt = "- 没跑"
+    if pr_opened:
+        pr_txt = f"已开 {pr.get('url') or '(wrapper exit 0, url not parsed)'}"
+    elif pr.get("error"):
+        pr_txt = f"没开。原因：{pr.get('error')}"
+    elif not dirty_before or blocked or not tests_ran or any(int(r.get("exit") or 1) != 0 for r in tests):
+        pr_txt = "没开。"
+    else:
+        pr_txt = "没开。切片没有要求 PR。"
+    body = f"""---
+kind: supervisor-handoff
+goal: {goal_id}
+slice: {slice_id}
+ticket: {ticket}
+limit: {kind}
+round: {round_n}
+---
+
+# 监理交接 · {slice_id}
+
+不要重跑整片 impl。下面是撞上限时工作区的收口结果。
+
+## 哪一票
+- Goal: `{goal_id or "(none)"}`
+- 切片: `{slice_id}`
+- 票: `{ticket}`
+- 撞上: {label}（`{kind}`）
+- impl exit: {exit_code}
+- impl summary: 无
+- gate: 无
+- 分支: `{branch or "(unknown)"}`
+- 撞上限前 HEAD: `{head_before or "(none)"}`
+
+## 已有提交
+- 收口提交: `{commit or "（没有新提交）"}`
+{committed_txt}
+
+## 撞上限时工作区里的未提交文件
+{dirty_txt}
+
+## 收口后还剩的未提交文件
+{left_txt}
+
+## 测试
+{test_txt}
+
+## PR
+{pr_txt}
+
+## 监理接下来
+{next_step}
+
+```json
+{json.dumps(block, ensure_ascii=False, indent=2)}
+```
+"""
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def limit_stop_closeout(
+    *,
+    job: dict,
+    chain: dict,
+    cwd: Path,
+    slice_id: str,
+    round_n: int,
+    ticket: str,
+    exit_code: int,
+    log_path: Path,
+    head_before: str,
+) -> dict | None:
+    """Shared closeout for a hard cap or a step limit.
+
+    Returns None when this exit is not a limit stop (ordinary failure, or an
+    idle timeout). Otherwise returns ``action=closeout`` when there was
+    something to commit, or ``action=fail`` when the worktree had no
+    committable change. Both write a supervisor handoff. Never opens another
+    impl ticket and never checks out a different branch.
+    """
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+    except OSError:
+        log_text = ""
+    kind = limit_stop_kind(log_text)
+    if not kind:
+        return None
+    if not cwd.is_dir():
+        return {
+            "action": "fail",
+            "kind": kind,
+            "error": f"foreman exit {exit_code} without summary; {kind}; cwd missing",
+            "handoff_summary": "",
+        }
+    dirty, status_err = _git_dirty_paths(cwd)
+    pack_text = _slice_pack_text(str(job.get("pack") or chain.get("pack") or ""))
+    branch = _head_branch(cwd)
+    wanted = _branch_token(str(_parse_frontmatter(pack_text).get("branch") or ""))
+    goal_id = str(job.get("goal") or chain.get("goal") or "")
+    blocked = ""
+    commit = ""
+    committed_paths: list[str] = []
+    tests: list[dict] = []
+    pr: dict = {"opened": False, "url": "", "error": ""}
+    if status_err and not dirty:
+        blocked = status_err
+    elif not dirty:
+        blocked = ""
+    else:
+        if branch in {"main", "master", "HEAD", ""}:
+            blocked = f"refusing to commit on {branch or 'detached HEAD'}"
+        elif wanted and branch != wanted:
+            blocked = (
+                f"refusing checkout: HEAD is {branch}, slice pack branch is {wanted}"
+            )
+        else:
+            commit, commit_err = _commit_paths(cwd, dirty)
+            if commit_err:
+                blocked = commit_err
+            else:
+                committed_paths = list(dirty)
+                commands = _test_commands_from_pack(pack_text)
+                tests = _run_slice_tests(cwd, commands)
+                tests_ok = bool(tests) and all(int(row.get("exit") or 0) == 0 for row in tests)
+                if tests_ok and _pack_wants_pr(pack_text):
+                    repo = _pack_pr_repo(pack_text, cwd)
+                    pr = _open_slice_pr(
+                        cwd=cwd,
+                        repo=repo,
+                        branch=branch,
+                        title=f"closeout: {slice_id} after {kind}",
+                        body=(
+                            f"Supervisor closeout after {kind}. "
+                            f"Commit {commit}. Slice tests passed. "
+                            "Not a gate PASS. Do not merge from this ticket."
+                        ),
+                    )
+                    if not pr.get("opened"):
+                        blocked = pr.get("error") or "PR was not opened"
+    uncommitted, _ = _git_dirty_paths(cwd)
+    # A commit is kept even when tests or PR fail. ``blocked`` is only the
+    # reason we refused to commit (protected branch, checkout mismatch).
+    handoff_blocked = "" if commit else blocked
+    handoff = write_limit_handoff(
+        goal_id=goal_id,
+        slice_id=slice_id,
+        ticket=ticket,
+        kind=kind,
+        round_n=round_n,
+        exit_code=exit_code,
+        head_before=head_before,
+        commit=commit,
+        committed_paths=committed_paths,
+        dirty_before=dirty,
+        uncommitted_after=uncommitted,
+        tests=tests,
+        pr=pr,
+        blocked=handoff_blocked,
+        branch=branch,
+    )
+    record = {
+        "kind": kind,
+        "commit": commit,
+        "committed_paths": committed_paths,
+        "dirty_before": dirty,
+        "uncommitted_after": uncommitted,
+        "tests": tests,
+        "pr_url": pr.get("url") or "",
+        "pr_opened": bool(pr.get("opened")),
+        "pr_error": pr.get("error") or "",
+        "blocked": "" if commit else blocked,
+        "handoff_summary": str(handoff),
+        "slice_pass": False,
+    }
+    if dirty and (commit or blocked):
+        note = _handoff_next(
+            kind,
+            dirty=True,
+            committed=commit,
+            tests=tests,
+            pr=pr,
+            blocked="" if commit else blocked,
+        )
+        return {"action": "closeout", "error": "", "note": note, **record}
+    err = f"foreman exit {exit_code} without summary; {kind}; no committable changes"
+    if blocked and not dirty:
+        err = f"foreman exit {exit_code} without summary; {kind}; {blocked}"
+    return {"action": "fail", "error": err, "note": "", **record}
+
+
 def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, start_pack: str) -> int:
     """Run foreman→gate from start_round using start_pack for first foreman."""
     cwd = Path(job["cwd"])
@@ -2276,8 +2942,66 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
                     flush=True,
                 )
                 return 0
+            # Hard cap and max_steps share one closeout. Idle timeout and a
+            # plain non-zero exit still fail below. No second impl ticket.
+            closed = None
+            if ec != 0:
+                closed = limit_stop_closeout(
+                    job=job,
+                    chain=chain,
+                    cwd=cwd,
+                    slice_id=slice_id,
+                    round_n=round_n,
+                    ticket=impl_ticket,
+                    exit_code=ec,
+                    log_path=impl_log,
+                    head_before=base_before,
+                )
+            if closed and closed.get("action") == "closeout":
+                round_rec["limit_closeout"] = {
+                    "kind": closed.get("kind"),
+                    "commit": closed.get("commit"),
+                    "handoff_summary": closed.get("handoff_summary"),
+                }
+                chain["rounds"][-1] = round_rec
+                chain["state"] = "closeout"
+                chain["error"] = ""
+                chain["last_verdict"] = None
+                chain["closeout"] = {
+                    k: closed.get(k)
+                    for k in (
+                        "kind",
+                        "commit",
+                        "committed_paths",
+                        "pr_url",
+                        "pr_opened",
+                        "pr_error",
+                        "blocked",
+                        "slice_pass",
+                    )
+                }
+                chain["closeout_note"] = closed.get("note") or ""
+                chain["handoff_summary"] = closed.get("handoff_summary") or ""
+                _write_chain(chain)
+                print(
+                    f"[trial-broker] chain {slice_id} CLOSEOUT r{round_n} "
+                    f"kind={closed.get('kind')} commit={closed.get('commit') or '-'} "
+                    f"handoff={closed.get('handoff_summary')}",
+                    flush=True,
+                )
+                out = _terminal_outbox(job, chain, dest, ok=True)
+                print(
+                    f"[trial-broker] chain {slice_id} closeout outbox={out.name}",
+                    flush=True,
+                )
+                return 2
             chain["state"] = "failed"
-            chain["error"] = f"foreman exit {ec} without summary"
+            if closed and closed.get("action") == "fail":
+                chain["error"] = str(closed.get("error") or f"foreman exit {ec} without summary")
+                chain["handoff_summary"] = closed.get("handoff_summary") or ""
+                chain["limit_kind"] = closed.get("kind") or ""
+            else:
+                chain["error"] = f"foreman exit {ec} without summary"
             _write_chain(chain)
             _terminal_outbox(job, chain, dest, ok=False)
             return ec or 1
@@ -2701,6 +3425,23 @@ def _execute_goal_slices(
             m["slices_completed"] = int(m.get("slices_completed") or 0) + 1
             _write_goal(goal_state)
             continue
+        if state == "closeout":
+            # Limit stop with work in the tree. Not failed, not a new impl, not PASS.
+            goal_state = _read_goal(goal_id) or goal_state
+            goal_state["status"] = "closeout"
+            goal_state["last_chain_state"] = "closeout"
+            goal_state["error"] = ""
+            if final_chain.get("handoff_summary"):
+                goal_state["handoff_summary"] = final_chain["handoff_summary"]
+            if final_chain.get("closeout_note"):
+                goal_state["closeout_note"] = final_chain["closeout_note"]
+            _write_goal(goal_state)
+            all_pass = False
+            print(
+                f"[trial-broker] slice {slice_id} closeout; not marking goal failed",
+                flush=True,
+            )
+            break
         goal_state = _read_goal(goal_id) or goal_state
         # Belt-and-suspenders: never fail a slice solely because the impl
         # summary was missing when a gate/submit_for_review PASS already
@@ -2733,6 +3474,8 @@ def _execute_goal_slices(
         goal_state["last_chain_state"] = state
         if state in ("failed", "escalated", "cancelled"):
             goal_state["status"] = state
+        if final_chain.get("handoff_summary"):
+            goal_state["handoff_summary"] = final_chain["handoff_summary"]
         _write_goal(goal_state)
         if on_slice_fail != "continue":
             print(

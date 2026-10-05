@@ -671,7 +671,9 @@ def _handle_ask_supervisor(ask: dict, path: Path, *, default_profile: str, cwd: 
             return
 
     questions = ask.get("questions") or []
-    slice_id = str(ask.get("slice") or (goal or {}).get("goal") or "ask")
+    slice_id = _resolve_ask_slice_id(
+        ask, goal, fallback=str((goal or {}).get("goal") or "ask")
+    )
     round_n = int((goal or {}).get("ask_seq") or 0) + 1
     if goal is not None:
         goal["ask_seq"] = round_n
@@ -785,7 +787,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
     """Open delta gate short-ticket; write PASS/HOLD(+rework_mode) answer for submit_for_review."""
     t0 = time.monotonic()  # 处理耗时 → wait_ms / by_kind.wait_ms_total
     ask_id = str(ask.get("ask_id") or path.stem)
-    slice_id = str(ask.get("slice") or (goal or {}).get("current_slice") or "slice")
+    slice_id = _resolve_ask_slice_id(ask, goal, fallback="slice")
     lim = T.resolve_limits(goal=goal) if goal else T.load_global_limits()
     round_n = int(ask.get("round") or (goal or {}).get("review_seq") or 1)
     if goal is not None:
@@ -857,6 +859,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
         watch_mailbox=False,
     )
     gate_summary = SUMMARIES / f"{gate_summary_name}.md"
+    _adopt_misplaced_summary(gate_summary)
     gate_art = write_artifacts(
         {"ticket": gate_ticket, "role": "gate", "profile": profile, "cwd": cwd},
         gate_log, gate_summary, gec, ticket=gate_ticket,
@@ -1626,6 +1629,169 @@ def _write_goal(state: dict) -> Path:
     return path
 
 
+
+def _infer_slice_from_ticket(ticket: str) -> str | None:
+    """Pull a real slice id out of impl/gate/supervisor ticket names.
+
+    Patterns (group 1 = slice):
+      impl-trial-{slice}-r{N}
+      impl-{slice}-r{N}
+      gate-trial-{slice}-rev{N}
+      gate-{slice}-rev{N} / gate-trial-{slice}-r{N}
+      supervisor-answer-{slice}-ask{N} / -r{N}
+    The broken default literal ``slice`` is rejected so callers fall through.
+    """
+    t = str(ticket or "").strip()
+    if not t:
+        return None
+    patterns = (
+        r"^impl-trial-(.+)-r\d+$",
+        r"^impl-(.+)-r\d+$",
+        r"^gate-trial-(.+)-rev\d+$",
+        r"^gate-trial-(.+)-r\d+$",
+        r"^supervisor-answer-(.+)-ask\d+$",
+        r"^supervisor-answer-(.+)-r\d+$",
+    )
+    for pat in patterns:
+        m = re.match(pat, t)
+        if not m:
+            continue
+        got = m.group(1).strip()
+        if got and got != "slice":
+            return got
+    return None
+
+
+def _resolve_ask_slice_id(
+    ask: dict, goal: dict | None, *, fallback: str = "slice"
+) -> str:
+    """Resolve the chain slice for a mailbox ask.
+
+    Prefer explicit ask/from/goal.current_slice. When the agent omits slice
+    (common on submit_for_review), infer from ``from.ticket`` /
+    ``ask.ticket`` (``impl-trial-{slice}-rN``). Never keep the placeholder
+    literal ``slice`` when a real id is available — that placeholder made
+    gate tickets ``gate-trial-slice-revN`` and broke salvage matching.
+    """
+    frm = ask.get("from") if isinstance(ask.get("from"), dict) else {}
+    candidates = [
+        ask.get("slice"),
+        frm.get("slice"),
+        (goal or {}).get("current_slice") if isinstance(goal, dict) else None,
+    ]
+    for raw in candidates:
+        s = str(raw or "").strip()
+        if s and s != "slice":
+            return s
+    for ticket in (ask.get("ticket"), frm.get("ticket")):
+        inferred = _infer_slice_from_ticket(str(ticket or ""))
+        if inferred:
+            return inferred
+    for raw in candidates:
+        s = str(raw or "").strip()
+        if s:
+            return s
+    fb = str(fallback or "").strip()
+    return fb or "slice"
+
+
+def _misplaced_summary_roots() -> list[Path]:
+    """Dirs where agents have historically written summaries by mistake.
+
+    The recurring shape is ``~/.dsh-supervisor/thin-state/summaries/`` —
+    the model glues ``.dsh`` + ``supervisor`` and drops the ``/supervisor/``
+    segment from the canonical ``~/.dsh/supervisor/thin-state/summaries/``.
+    Canonical SUMMARIES (under DSH_HOME) remains the single source of truth.
+    """
+    home = Path.home()
+    return [
+        home / ".dsh-supervisor" / "thin-state" / "summaries",
+    ]
+
+
+def _adopt_misplaced_summary(expected: Path) -> bool:
+    """Move a same-basename summary from a known wrong dir into ``expected``.
+
+    Returns True when ``expected`` exists after this call. No-op when it
+    already exists. Does not invent content — only relocates a real file.
+    """
+    if expected.is_file():
+        return True
+    name = expected.name
+    if not name:
+        return False
+    for root in _misplaced_summary_roots():
+        cand = root / name
+        if not cand.is_file():
+            continue
+        try:
+            expected.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                cand.replace(expected)
+            except OSError:
+                expected.write_bytes(cand.read_bytes())
+                try:
+                    cand.unlink()
+                except OSError:
+                    pass
+            print(
+                f"[trial-broker] adopted misplaced summary {cand} → {expected}",
+                flush=True,
+            )
+            return expected.is_file()
+        except OSError as e:
+            print(f"[trial-broker] adopt summary failed from {cand}: {e}", flush=True)
+    return expected.is_file()
+
+
+def _review_pass_via_ask_archive(slice_id: str) -> tuple[bool, str]:
+    """Recover submit_for_review PASS when metrics recorded slice as ``slice``.
+
+    Ties the gate answer back to this chain via the archived pending ask's
+    ``from.ticket`` (``impl-trial-{slice}-rN``), which still embeds the real
+    slice id even when ask.slice was null.
+    """
+    slice_id = str(slice_id or "").strip()
+    if not slice_id:
+        return (False, "")
+    arch = MAILBOX / "archive"
+    answers = MAILBOX / "answers"
+    if not arch.is_dir() or not answers.is_dir():
+        return (False, "")
+    try:
+        pendings = sorted(arch.glob("submit-for-review-*.pending.json"), reverse=True)
+    except OSError:
+        return (False, "")
+    for pend in pendings:
+        try:
+            ask = json.loads(pend.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(ask, dict):
+            continue
+        frm = ask.get("from") if isinstance(ask.get("from"), dict) else {}
+        ticket = str(frm.get("ticket") or ask.get("ticket") or "")
+        # Real impl tickets embed the full slice id.
+        if slice_id not in ticket:
+            continue
+        ask_id = str(ask.get("ask_id") or "").strip()
+        if not ask_id:
+            # pending name: submit-for-review-….pending.json
+            ask_id = pend.name[: -len(".pending.json")] if pend.name.endswith(".pending.json") else pend.stem
+        ans_path = answers / f"{ask_id}.json"
+        if not ans_path.is_file():
+            continue
+        try:
+            ans = json.loads(ans_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(ans, dict):
+            continue
+        if str(ans.get("verdict") or "").strip().upper() == VERDICT_PASS:
+            return (True, f"submit_for_review PASS (ask archive {ask_id})")
+    return (False, "")
+
+
 def _slice_names_same(recorded: str, chain_slice: str, goal_id: str) -> bool:
     """True when a metrics ``row.slice`` names the same slice as the chain.
 
@@ -1706,6 +1872,12 @@ def _slice_has_review_pass(
             continue
         if str(block.get("verdict") or "").strip().upper() == VERDICT_PASS:
             return (True, f"gate summary PASS ({cand.name})")
+    # Metrics may have recorded the literal default "slice" when the agent
+    # omitted ask.slice. Recover PASS by tying the archived pending ask's
+    # from.ticket (impl-trial-{slice}-rN) to this chain slice.
+    ok_arch, reason_arch = _review_pass_via_ask_archive(slice_id)
+    if ok_arch:
+        return (True, reason_arch)
     return (False, "")
 
 
@@ -2825,6 +2997,16 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
         # Capture base sha before foreman (best-effort)
         base_before = _git_rev(cwd)
 
+        # Publish current slice onto the goal so mailbox submit_for_review /
+        # ask_supervisor resolve the real id when the agent omits slice.
+        if goal_obj is not None:
+            goal_obj["current_slice"] = slice_id
+            goal_obj["current_pack"] = Path(pack_for_impl).name
+            goal_obj["current_acceptance"] = list(
+                job.get("acceptance") or chain.get("acceptance") or []
+            )
+            _write_goal(goal_obj)
+
         ec = run_open_slice(
             ticket=impl_ticket,
             pack_name=Path(pack_for_impl).name,
@@ -2837,6 +3019,9 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
             goal=goal_obj,
             watch_mailbox=True,
         )
+        # Agents sometimes write the summary under ~/.dsh-supervisor/...
+        # (glued path). Adopt into canonical SUMMARIES before missing-check.
+        _adopt_misplaced_summary(impl_summary)
         impl_art = write_artifacts(
             {**job, "ticket": impl_ticket, "role": "impl"},
             impl_log, impl_summary, ec, ticket=impl_ticket,
@@ -3117,6 +3302,7 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
             goal=goal_obj,
             watch_mailbox=False,
         )
+        _adopt_misplaced_summary(gate_summary)
         gate_art = write_artifacts(
             {**job, "ticket": gate_ticket, "role": "gate"},
             gate_log, gate_summary, gec, ticket=gate_ticket,

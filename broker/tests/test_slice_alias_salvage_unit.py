@@ -378,3 +378,227 @@ def test_shared_short_gate_file_is_not_pass_evidence(tmp_path: Path):
         # Full chain id must not inherit an unscoped s1-gate-rev1.md.
         assert tb._slice_has_review_pass(goal, OTHER_S1)[0] is False
         assert tb._slice_has_review_pass(goal, SLICE_S1)[0] is False
+
+
+# --------------------------------------------------------------------------
+# Summary path + literal "slice" default (2026-10-05 entity-resolution)
+# --------------------------------------------------------------------------
+
+def test_infer_slice_from_impl_and_gate_tickets():
+    assert (
+        tb._infer_slice_from_ticket("impl-trial-engine-entity-resolution-v1-s1-r1")
+        == "engine-entity-resolution-v1-s1"
+    )
+    assert (
+        tb._infer_slice_from_ticket("gate-trial-engine-entity-resolution-v1-s1-rev1")
+        == "engine-entity-resolution-v1-s1"
+    )
+    # Broken default must not be treated as a real slice id.
+    assert tb._infer_slice_from_ticket("gate-trial-slice-rev1") is None
+    assert tb._infer_slice_from_ticket("") is None
+
+
+def test_resolve_ask_slice_id_prefers_ticket_over_literal_slice():
+    ask = {
+        "slice": None,
+        "ticket": "impl-trial-engine-entity-resolution-v1-s1-r1",
+        "from": {
+            "ticket": "impl-trial-engine-entity-resolution-v1-s1-r1",
+            "role": "impl",
+            "slice": None,
+        },
+    }
+    goal = {"goal": "engine-entity-resolution-v1", "current_slice": None}
+    assert (
+        tb._resolve_ask_slice_id(ask, goal)
+        == "engine-entity-resolution-v1-s1"
+    )
+    # Explicit real slice wins.
+    ask2 = dict(ask, slice="engine-entity-resolution-v1-s2")
+    assert tb._resolve_ask_slice_id(ask2, goal) == "engine-entity-resolution-v1-s2"
+    # current_slice on goal wins over ticket when ask.slice empty.
+    goal2 = {
+        "goal": "engine-entity-resolution-v1",
+        "current_slice": "engine-entity-resolution-v1-s2",
+    }
+    ask3 = {"slice": None, "from": {}, "ticket": ""}
+    assert tb._resolve_ask_slice_id(ask3, goal2) == "engine-entity-resolution-v1-s2"
+
+
+def test_adopt_misplaced_summary_moves_from_glued_path(tmp_path: Path, monkeypatch):
+    canonical = tmp_path / "canonical" / "summaries"
+    canonical.mkdir(parents=True)
+    expected = canonical / "engine-entity-resolution-v1-s1-impl-r1.md"
+    glued = tmp_path / "home" / ".dsh-supervisor" / "thin-state" / "summaries"
+    glued.mkdir(parents=True)
+    wrong = glued / expected.name
+    wrong.write_text("# real summary\n\n```json\n{\"status\": \"done\"}\n```\n", encoding="utf-8")
+
+    monkeypatch.setattr(tb, "_misplaced_summary_roots", lambda: [glued])
+    assert expected.is_file() is False
+    assert tb._adopt_misplaced_summary(expected) is True
+    assert expected.is_file()
+    assert wrong.is_file() is False
+    assert "status" in expected.read_text(encoding="utf-8")
+    # Second call is a no-op success.
+    assert tb._adopt_misplaced_summary(expected) is True
+
+
+def test_exit0_misplaced_summary_is_adopted_before_missing_check(tmp_path: Path, monkeypatch):
+    """Foreman wrote under glued path; broker must adopt then see the file."""
+    ctx, dirs = _patched_dirs(tmp_path / "state")
+    slice_id = SLICE_S1
+    glued = tmp_path / "glued-summaries"
+    glued.mkdir()
+    body = (
+        "# s1 impl\n\n```json\n"
+        + json.dumps(
+            {
+                "status": "done",
+                "changed_files": ["a.py"],
+                "branch": "main",
+                "commit": "abc",
+                "base": "def",
+                "questions": [],
+                "notes": "ok",
+            },
+            ensure_ascii=False,
+        )
+        + "\n```\n"
+    )
+    with ctx:
+        (dirs["packs"] / f"{slice_id}.pack.md").write_text(
+            f"---\nslice_id: {slice_id}\n---\n# s1\n", encoding="utf-8"
+        )
+        goal = _goal_with_rows(GOAL, [], cwd=str(tmp_path))
+        _write_json(dirs["goals"] / f"{GOAL}.json", goal)
+        monkeypatch.setattr(tb, "_misplaced_summary_roots", lambda: [glued])
+
+        def fake_open_slice(**kwargs):
+            kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+            kwargs["log_path"].write_text("ok\n", encoding="utf-8")
+            # Write ONLY to the wrong dir — canonical still empty at exit.
+            name = f"{kwargs['summary_name']}.md"
+            (glued / name).write_text(body, encoding="utf-8")
+            return 0
+
+        # Avoid running a real second gate: salvage path is not taken because
+        # after adopt the summary exists; patch gate open-slice to PASS quickly.
+        gate_calls = {"n": 0}
+
+        def fake_open_slice_all(**kwargs):
+            role = kwargs.get("role")
+            kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+            kwargs["log_path"].write_text(f"role={role}\n", encoding="utf-8")
+            name = f"{kwargs['summary_name']}.md"
+            if role == "impl":
+                (glued / name).write_text(body, encoding="utf-8")
+            else:
+                gate_calls["n"] += 1
+                dest = dirs["summaries"] / name
+                dest.write_text(
+                    "gate\n\n```json\n"
+                    + json.dumps(
+                        {"verdict": "PASS", "unmet_acceptance": [], "findings": []},
+                        ensure_ascii=False,
+                    )
+                    + "\n```\n",
+                    encoding="utf-8",
+                )
+            return 0
+
+        job = {
+            "id": "unit-adopt-chain",
+            "type": "chain",
+            "slice": slice_id,
+            "pack": f"{slice_id}.pack.md",
+            "acceptance": ["create_app wires extractor"],
+            "profile": "acp",
+            "gate_profile": "acp",
+            "cwd": str(tmp_path),
+            "max_rounds": 1,
+            "goal": GOAL,
+            "from_goal": True,
+            "defer_supervisor_close": True,
+            "notify_dry_run": True,
+        }
+        inbox = tmp_path / "job.json"
+        _write_json(inbox, job)
+        with mock.patch.object(tb, "run_open_slice", side_effect=fake_open_slice_all), mock.patch.object(
+            tb, "write_artifacts", side_effect=_fake_artifacts
+        ), mock.patch.object(tb, "maybe_notify_hub", return_value={"sent": False, "rc": 0}):
+            rc = tb.run_job(inbox)
+        chain = json.loads((dirs["chains"] / f"{slice_id}.json").read_text(encoding="utf-8"))
+        canonical = dirs["summaries"] / f"{slice_id}-impl-r1.md"
+        assert canonical.is_file(), "summary should have been adopted to canonical"
+        assert (glued / f"{slice_id}-impl-r1.md").is_file() is False
+        assert rc == 0, (rc, chain)
+        assert chain["state"] == "PASS", chain
+        assert gate_calls["n"] >= 1
+
+
+def test_review_pass_via_ask_archive_ties_impl_ticket(tmp_path: Path, monkeypatch):
+    mailbox = tmp_path / "mailbox"
+    arch = mailbox / "archive"
+    answers = mailbox / "answers"
+    arch.mkdir(parents=True)
+    answers.mkdir(parents=True)
+    ask_id = "submit-for-review-unit-archive-1"
+    pend = {
+        "ask_id": ask_id,
+        "kind": "submit_for_review",
+        "slice": None,
+        "from": {
+            "ticket": f"impl-trial-{SLICE_S1}-r1",
+            "role": "impl",
+            "slice": None,
+        },
+        "ticket": f"impl-trial-{SLICE_S1}-r1",
+    }
+    (arch / f"{ask_id}.pending.json").write_text(
+        json.dumps(pend, ensure_ascii=False), encoding="utf-8"
+    )
+    (answers / f"{ask_id}.json").write_text(
+        json.dumps({"ask_id": ask_id, "verdict": "PASS"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tb, "MAILBOX", mailbox)
+    ok, reason = tb._review_pass_via_ask_archive(SLICE_S1)
+    assert ok, reason
+    assert ask_id in reason
+    # Different slice must not match.
+    assert tb._review_pass_via_ask_archive(SLICE_S2)[0] is False
+
+
+def test_slice_has_review_pass_recovers_literal_slice_via_archive(tmp_path: Path, monkeypatch):
+    """Metrics row slice='slice' alone must not match; archive recovery does."""
+    mailbox = tmp_path / "mailbox"
+    arch = mailbox / "archive"
+    answers = mailbox / "answers"
+    arch.mkdir(parents=True)
+    answers.mkdir(parents=True)
+    ask_id = "submit-for-review-unit-literal-1"
+    (arch / f"{ask_id}.pending.json").write_text(
+        json.dumps(
+            {
+                "ask_id": ask_id,
+                "kind": "submit_for_review",
+                "slice": None,
+                "from": {"ticket": f"impl-trial-{SLICE_S1}-r1", "role": "impl"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (answers / f"{ask_id}.json").write_text(
+        json.dumps({"ask_id": ask_id, "verdict": "PASS"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tb, "MAILBOX", mailbox)
+    # Metrics used the broken default — must NOT match via _slice_names_same.
+    goal = _goal_with_rows(GOAL, [_pass_row(slice_name="slice")])
+    ok, reason = tb._slice_has_review_pass(goal, SLICE_S1)
+    assert ok, reason
+    assert "ask archive" in reason
+    # Other goal slice still false.
+    assert tb._slice_has_review_pass(goal, OTHER_S1)[0] is False

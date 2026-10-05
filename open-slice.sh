@@ -327,5 +327,15 @@ fi
   python3 "$ASK_BIN" "${ARGS[@]}"
   ec=$?
   echo "=== exit=$ec ==="
+  # Agents sometimes glue ~/.dsh + supervisor → ~/.dsh-supervisor/thin-state/summaries.
+  # Canonical path is $THIN_STATE/summaries (usually ~/.dsh/supervisor/thin-state/summaries).
+  if [[ ! -f "$SUMMARY_OUT" ]]; then
+    _wrong="$HOME/.dsh-supervisor/thin-state/summaries/$(basename "$SUMMARY_OUT")"
+    if [[ -f "$_wrong" ]]; then
+      mkdir -p "$(dirname "$SUMMARY_OUT")"
+      mv -f "$_wrong" "$SUMMARY_OUT"
+      echo "adopted misplaced summary $_wrong → $SUMMARY_OUT"
+    fi
+  fi
   exit $ec
 } 2>&1 | tee "$LOG"

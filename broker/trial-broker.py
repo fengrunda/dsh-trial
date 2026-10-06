@@ -246,6 +246,71 @@ def _acceptance_text(acceptance) -> str:
     return str(acceptance).strip()
 
 
+# --- Fix 2: gate acceptance must not require an already-open PR -------------
+# The gate decides code correctness; an open/unmerged PR is a post-PASS
+# delivery artifact (impl / dsh-trial-pr / supervisor-close). When a Hub brief
+# mistakenly lists PR evidence as gate acceptance, the gate could HOLD forever:
+# impl is forbidden from opening a PR before gate PASS. Strip those items from
+# the gate pack (never from the caller's own list) so it cannot deadlock.
+_GATE_ACCEPTANCE_PR_MARKERS = (
+    "dsh-trial-pr",
+    "已开 pr",
+    "pr 已开",
+    "开 pr",
+    "pull request",
+    "unmerged pr",
+    "未合并",
+    "pr url",
+)
+GATE_ACCEPTANCE_PR_FILTER_NOTE = "（已剔除 PR 证据项；PR 由 close/impl 在 gate PASS 后核对）"
+
+
+def _is_gate_acceptance_pr_item(item) -> bool:
+    """Heuristic: does this acceptance entry demand an open/unmerged PR?"""
+    low = str(item or "").lower()
+    if not low:
+        return False
+    if "github.com/" in low and "/pull/" in low:
+        return True
+    return any(marker in low for marker in _GATE_ACCEPTANCE_PR_MARKERS)
+
+
+def filter_gate_acceptance(acceptance):
+    """Return a copy of acceptance with PR-open evidence stripped (Fix 2).
+
+    Preserves the input shape as far as practical: lists lose matching items,
+    a multi-line string loses matching lines, a matching single-line string
+    becomes ``""``. The caller's object is never mutated.
+    """
+    if acceptance is None:
+        return acceptance
+    if isinstance(acceptance, list):
+        return [x for x in acceptance if not _is_gate_acceptance_pr_item(x)]
+    if isinstance(acceptance, tuple):
+        return tuple(x for x in acceptance if not _is_gate_acceptance_pr_item(x))
+    if isinstance(acceptance, str):
+        if "\n" in acceptance:
+            return "\n".join(
+                ln for ln in acceptance.splitlines()
+                if not _is_gate_acceptance_pr_item(ln)
+            )
+        return "" if _is_gate_acceptance_pr_item(acceptance) else acceptance
+    return "" if _is_gate_acceptance_pr_item(acceptance) else acceptance
+
+
+def _gate_acceptance_text(acceptance) -> tuple[str, bool]:
+    """Filter + render gate acceptance; report whether anything was stripped."""
+    filtered = filter_gate_acceptance(acceptance)
+    try:
+        stripped_any = filtered != acceptance
+    except Exception:  # pragma: no cover - exotic non-comparable input
+        stripped_any = False
+    text = _acceptance_text(filtered)
+    if stripped_any:
+        text = f"{GATE_ACCEPTANCE_PR_FILTER_NOTE}\n{text}".strip()
+    return text, stripped_any
+
+
 def _truncate_bytes(s: str, cap: int, note: str = "\n\n…[truncated]\n") -> tuple[str, bool]:
     raw = s.encode("utf-8")
     if len(raw) <= cap:
@@ -952,6 +1017,129 @@ def _notify_goal_event(
     _write_goal(goal)
 
 
+AWAITING_HUB_NOTIFY_KIND = "dsh-trial-awaiting-hub"
+
+
+def _notify_awaiting_hub(
+    job: dict | None,
+    chain: dict | None,
+    *,
+    reason: str,
+    block: dict | None = None,
+    goal: dict | None = None,
+) -> dict | None:
+    """Explicit Hub wake when a chain parks in ``awaiting_supervisor`` (Fix 1).
+
+    Decision D keeps the chain's own terminal outbox at ``notify=False`` and
+    ``_notify_goal_terminal`` ignores ``awaiting_*`` states, so a parked chain
+    used to leave the Hub blind until something else settled the goal. This
+    sends the dedicated ``dsh-trial-awaiting-hub`` event so the Hub webhook can
+    push a ``chain-reply``. Never raises.
+    """
+    try:
+        notify = ""
+        for src in (job, goal, chain):
+            if isinstance(src, dict) and src.get("notify"):
+                notify = str(src.get("notify")).strip().lower()
+                if notify:
+                    break
+        if notify not in ("hub", "khub", "true", "1", "yes"):
+            return None
+
+        job = job if isinstance(job, dict) else {}
+        chain = chain if isinstance(chain, dict) else {}
+        block = block if isinstance(block, dict) else {}
+        goal = goal if isinstance(goal, dict) else None
+
+        slice_id = str(
+            job.get("slice") or chain.get("slice") or (goal or {}).get("current_slice") or ""
+        )
+        goal_id = str(
+            job.get("goal") or chain.get("goal") or (goal or {}).get("goal") or ""
+        )
+        reason = str(reason or "blocked")
+        questions = list(block.get("questions") or [])
+
+        # Best-effort last gate verdict/summary path for the Hub to read.
+        gate_path = ""
+        if goal:
+            gate_path = str(
+                goal.get("last_gate_verdict_path")
+                or goal.get("last_gate_summary_path")
+                or ""
+            )
+        for rd in reversed(chain.get("rounds") or []):
+            if not isinstance(rd, dict):
+                continue
+            gate_path = gate_path or str(
+                rd.get("gate_summary") or rd.get("gate_verdict_path") or ""
+            )
+            if gate_path:
+                break
+
+        suggested_action = "chain-reply"
+        summary = (
+            f"dsh-trial-awaiting-hub goal={goal_id or '-'} slice={slice_id or '-'} "
+            f"reason={reason} questions={len(questions)} "
+            f"suggested_action={suggested_action}"
+        )
+        prefix = str(job.get("notify_prefix") or "").strip()
+        if prefix:
+            summary = f"{prefix}{summary}"
+
+        payload_extra = {
+            "goal": goal_id,
+            "slice": slice_id,
+            "status": reason,
+            "reason": reason,
+            "questions": questions,
+            "suggested_action": suggested_action,
+        }
+        if gate_path:
+            payload_extra["last_gate_verdict_path"] = gate_path
+
+        notify_job = dict(job)
+        notify_job.setdefault("slice", slice_id)
+        if goal_id:
+            notify_job.setdefault("goal", goal_id)
+        out_body = {
+            "status": reason,
+            "chain_state": "awaiting_supervisor",
+            "goal": goal_id,
+            "slice": slice_id,
+        }
+        result = {
+            "ticket": f"awaiting-{slice_id or goal_id or 'chain'}",
+            "composition": None,
+            "assert_clean": True,
+        }
+        info = maybe_notify_hub(
+            notify_job,
+            out_body,
+            result,
+            kind=AWAITING_HUB_NOTIFY_KIND,
+            extra_summary=summary,
+            payload_extra=payload_extra,
+        )
+        if goal and goal.get("goal"):
+            goal.setdefault("metrics", T.empty_metrics()).setdefault(
+                "notify_events", []
+            ).append({
+                "at": _iso(),
+                "kind": AWAITING_HUB_NOTIFY_KIND,
+                "info": {
+                    "reason": reason,
+                    "slice": slice_id,
+                    "sent": (info or {}).get("sent"),
+                },
+            })
+            _write_goal(goal)
+        return info
+    except Exception as e:  # never block the chain on a notify failure
+        print(f"[trial-broker] awaiting-hub notify failed: {e}", flush=True)
+        return None
+
+
 def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cwd: str, goal: dict | None) -> None:
     """Open delta gate short-ticket; write PASS/HOLD(+rework_mode) answer for submit_for_review."""
     t0 = time.monotonic()  # 处理耗时 → wait_ms / by_kind.wait_ms_total
@@ -1113,10 +1301,7 @@ def build_delta_gate_pack(
     diff = _git_diff(cwd, base if base else None, commit or "HEAD")
     diff, _ = _truncate_bytes(diff, MAX_DIFF_BYTES)
     findings_json = json.dumps(prior_findings or [], ensure_ascii=False, indent=2)
-    if isinstance(acceptance, list):
-        acc_txt = "\n".join(f"- {a}" for a in acceptance)
-    else:
-        acc_txt = str(acceptance or "")
+    acc_txt, _acc_stripped = _gate_acceptance_text(acceptance)
     name = f"{slice_id}-gate-delta-r{round_n}.pack.md"
     path = PACKS / name
     body = f"""---
@@ -1138,7 +1323,7 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-gate-rev{round
 {findings_json}
 ```
 
-## New diff
+## New diff (base...head · merge-base)
 ```diff
 {diff}
 ```
@@ -1256,10 +1441,18 @@ def _git_rev(cwd: Path, rev: str = "HEAD") -> str:
 
 
 def _git_diff(cwd: Path, base: str | None, head: str = "HEAD") -> str:
-    """Diff base..head; if no base, use HEAD vs worktree / last commit."""
+    """Diff merge-base(base, head)...head; if no base, use HEAD vs worktree/last commit.
+
+    Fix 3: use three-dot ``base...head`` when a base is set. Two-dot
+    ``base..head`` is a plain tree-to-tree diff at those two commits, so when
+    ``base`` is an older tip and ``head`` has since merged main, it reports
+    main-side files as if this branch changed them. Three-dot diffs from the
+    merge base, i.e. only what this branch actually introduced — which is what
+    the gate "New diff" must show.
+    """
     try:
         if base:
-            cmd = ["git", "diff", f"{base}..{head}"]
+            cmd = ["git", "diff", f"{base}...{head}"]
         else:
             # unstaged + staged vs HEAD
             cmd = ["git", "diff", "HEAD"]
@@ -1350,7 +1543,7 @@ def build_gate_pack(
         base = _git_rev(cwd, "HEAD~1") or ""
     diff = _git_diff(cwd, base if base else None, commit or "HEAD")
     diff, truncated = _truncate_bytes(diff, MAX_DIFF_BYTES)
-    acc = _acceptance_text(acceptance)
+    acc, _acc_stripped = _gate_acceptance_text(acceptance)
     # Keep original pack reference + truncated contents
     orig_cap = max(1024, MAX_PACK_BYTES // 3)
     orig_trunc, orig_was_trunc = _truncate_bytes(orig_body, orig_cap)
@@ -1387,7 +1580,7 @@ max_bytes_hint: {MAX_PACK_BYTES}
 ### Foreman summary text (excerpt)
 {foreman_summary_text[:2000]}
 
-## Diff (base={base or 'HEAD'} .. head={commit or 'HEAD'}; truncated={str(truncated).lower()})
+## Diff (base...head merge-base; base={base or 'HEAD'} head={commit or 'HEAD'}; truncated={str(truncated).lower()})
 ```diff
 {diff}
 ```
@@ -2436,6 +2629,7 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/goal-{goal_id}-plan.md
 - Write at most {job.get('max_slices') or 1} slice pack(s) under packs/ (one pack per slice).
 - If more than one slice, emit `action=emit_chains` with a `slices` list; a single slice may keep the legacy `emit_chain` fields.
 - Leave **one** deliberate ambiguity in exactly one slice pack so foreman must ask (status=question).
+- 禁止把「已开 PR / PR URL / dsh-trial-pr 证据 / 未合并 PR」写进 **gate** acceptance；PR 仅在 gate PASS 之后由 impl/`dsh-trial-pr` 或 supervisor-close 核对。
 - Do not modify business src yourself.
 - acceptance_hint (optional guidance for your acceptance list):
 ```json
@@ -3636,9 +3830,13 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
             chain["awaiting_reason"] = status
             chain["pending_impl_pack"] = Path(pack_for_impl).name
             _write_chain(chain)
+            # Fix 1: Decision D keeps the chain outbox notify=False, but a
+            # parked chain must still wake the Hub so it can push chain-reply.
+            _notify_awaiting_hub(job, chain, reason="blocked", block=block, goal=goal_obj)
             out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
             print(
-                f"[trial-broker] chain {slice_id} → awaiting_supervisor (blocked, no auto-wake) "
+                f"[trial-broker] chain {slice_id} → awaiting_supervisor "
+                f"(blocked; hub notified via {AWAITING_HUB_NOTIFY_KIND}) "
                 f"outbox={out.name}",
                 flush=True,
             )
@@ -3697,10 +3895,13 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
                         start_round=next_round,
                         start_pack=reply_pack,
                     )
+            # Fix 1: question parked (auto-answer off / failed) — wake the Hub
+            # too. The auto-answered path above resumes and never reaches here.
+            _notify_awaiting_hub(job, chain, reason="question", block=block, goal=goal_obj)
             out = _terminal_outbox(job, chain, dest, ok=True)
             print(
                 f"[trial-broker] chain {slice_id} → awaiting_supervisor "
-                f"({status}) outbox={out.name}",
+                f"({status}; hub notified via {AWAITING_HUB_NOTIFY_KIND}) outbox={out.name}",
                 flush=True,
             )
             return 0

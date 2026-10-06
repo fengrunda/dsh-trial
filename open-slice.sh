@@ -324,8 +324,8 @@ fi
   echo "=== prompt ==="
   echo "$PROMPT"
   echo "=== run ==="
-  python3 "$ASK_BIN" "${ARGS[@]}"
-  ec=$?
+  ec=0
+  python3 "$ASK_BIN" "${ARGS[@]}" || ec=$?
   echo "=== exit=$ec ==="
   # Agents sometimes glue ~/.dsh + supervisor → ~/.dsh-supervisor/thin-state/summaries.
   # Canonical path is $THIN_STATE/summaries (usually ~/.dsh/supervisor/thin-state/summaries).

@@ -119,6 +119,9 @@ def test_run_once_calls_notify(tmp_path):
              "reason": "dead", "suggested_action": "restart", "reason_key": "dead"}
     with patch, mock.patch.object(wd, "collect_stall_events", return_value=[event]), \
             mock.patch.object(wd, "collect_freeze_events", return_value=[]), \
+            mock.patch.object(wd, "collect_session_idle_events", return_value=([], {})), \
+            mock.patch.object(wd, "list_broker_pids", return_value=[]), \
+            mock.patch.object(wd, "list_work_pids", return_value=[]), \
             mock.patch.object(wd, "notify_event", return_value={"sent": True}) as m:
         result = wd.run_once(now=1000, dedupe=wd.Deduper(cooldown=900))
     assert m.call_count == 1
@@ -132,6 +135,9 @@ def test_run_once_dedupes_same_reason(tmp_path):
     dedupe = wd.Deduper(cooldown=900)
     with patch, mock.patch.object(wd, "collect_stall_events", return_value=[event]), \
             mock.patch.object(wd, "collect_freeze_events", return_value=[]), \
+            mock.patch.object(wd, "collect_session_idle_events", return_value=([], {})), \
+            mock.patch.object(wd, "list_broker_pids", return_value=[]), \
+            mock.patch.object(wd, "list_work_pids", return_value=[]), \
             mock.patch.object(wd, "notify_event", return_value={"sent": True}) as m:
         wd.run_once(now=1000, dedupe=dedupe)
         second = wd.run_once(now=1001, dedupe=dedupe)

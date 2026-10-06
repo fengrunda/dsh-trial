@@ -57,6 +57,41 @@ def now_iso() -> str:
     return datetime.now(TZ).isoformat(timespec="seconds")
 
 
+# Wall-clock jump (freeze / suspend / NTP step) detection. Monotonic time does
+# not advance while suspended; wall time does, so a positive drift between the
+# two clocks is a resume-after-freeze (Addendum ③). Default N = 5 minutes.
+FREEZE_JUMP_DEFAULT_SEC = 300
+FREEZE_JUMP_ENV = "DSH_TRIAL_FREEZE_JUMP_SEC"
+
+
+def freeze_jump_threshold() -> float:
+    try:
+        return float(os.environ.get(FREEZE_JUMP_ENV) or FREEZE_JUMP_DEFAULT_SEC)
+    except (TypeError, ValueError):
+        return float(FREEZE_JUMP_DEFAULT_SEC)
+
+
+def wall_clock_drift_sec(prev_wall, prev_mono, now_wall, now_mono) -> float:
+    """(wall elapsed) − (monotonic elapsed). Positive ⇒ wall jumped forward."""
+    return float(now_wall) - float(prev_wall) - (float(now_mono) - float(prev_mono))
+
+
+def detect_resumed_after_freeze(
+    prev_wall,
+    prev_mono,
+    now_wall,
+    now_mono,
+    *,
+    threshold_sec: float | None = None,
+) -> float | None:
+    """Return the forward wall-clock jump in seconds, or ``None`` when normal."""
+    threshold = freeze_jump_threshold() if threshold_sec is None else float(threshold_sec)
+    drift = wall_clock_drift_sec(prev_wall, prev_mono, now_wall, now_mono)
+    if drift >= threshold:
+        return drift
+    return None
+
+
 def load_global_limits() -> dict:
     if LIMITS_PATH.is_file():
         try:

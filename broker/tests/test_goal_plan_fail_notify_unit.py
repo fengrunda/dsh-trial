@@ -46,7 +46,7 @@ def test_plan_ticket_exit_without_summary_notifies_hub_failed(tmp_path):
     patch, d = _dirs(tmp_path)
     sent: list[str] = []
 
-    def fake_notify(job, out_body, result, *, kind, extra_summary=""):
+    def fake_notify(job, out_body, result, *, kind, extra_summary="", payload_extra=None):
         sent.append(kind)
         return {"sent": True, "kind": kind}
 

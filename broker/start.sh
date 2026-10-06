@@ -67,6 +67,11 @@ if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   echo "started broker-dsh-trial pid=$(cat "$PIDFILE") poll=${POLL}s log=$LOG"
   echo "inbox=$DSH_HOME/supervisor/trial/inbox"
   python3 "$BROKER_PY" --status || true
+  # Standalone watchdog (broker-death / heartbeat / freeze alerts). Disable
+  # with TRIAL_WATCHDOG_ENABLE=0. It has its own pidfile and log.
+  if [[ "${TRIAL_WATCHDOG_ENABLE:-1}" != "0" ]] && [[ -x "$ROOT/watchdog-start.sh" ]]; then
+    "$ROOT/watchdog-start.sh" || echo "warning: watchdog failed to start" >&2
+  fi
   exit 0
 fi
 echo "failed to start; see $LOG" >&2

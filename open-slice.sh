@@ -164,8 +164,8 @@ build_prompt_foreman() {
 3. **仅当**歧义真实影响 Done-when：调 \`ask_supervisor\`；**超时/失败**（timed_out / degrade）时不要干等，写 summary status=question，并把同样的问题放进 questions。
 4. 改完调 \`submit_for_review\`（务必带 usage_prompt）：
    - 返回 PASS → 写 summary status=done 并停止。
-   - 返回 HOLD + rework_mode=inplace → **本票内**按 findings 修完，再 \`submit_for_review\` 一次（不要提前关票）。
-   - 返回 HOLD + rework_mode=fresh → 本票写 status=done，notes 必须含 \`rework_fresh\`，由 broker 另开修复票。
+   - 返回 HOLD + rework_mode=inplace → **本票内**按 findings 逐条修完，再 \`submit_for_review\` 一次（不要提前关票）。
+   - 返回 HOLD + rework_mode=fresh → 本票写 status=done，notes 必须含 \`rework_fresh\`；**broker 会立刻另开一张 findings-first 修复票并重跑 gate**，这不是 slice 完成。
    - 工具不可用/超时（degrade=close_ticket）→ 视为普通完成，写 status=done，交给 broker 兜底 gate。
 5. 写关票摘要到：「${SUMMARY_OUT}」
    摘要必须短，并在文末含 **一个** 机器可读 fenced json 块，键固定：
@@ -177,15 +177,21 @@ build_prompt_foreman() {
   "commit": "HEAD sha 短或空",
   "base": "diff 基 sha 或空（改动前）",
   "questions": ["若 status=question 时的问题"],
-  "notes": "一两句"
+  "notes": "一两句；fresh 交接必须含 rework_fresh",
+  "finding_resolutions": [
+    {"finding": "…或 tier+issue 摘要", "change": "file:line 或路径+符号", "status": "fixed|deferred|wontfix", "reason": "未改时必填"}
+  ]
 }
 \`\`\`
+   **有 gate findings 的 pack（fix/rework/reply）**：必须逐条写 \`finding_resolutions\`；
+   未修 P0/P1 时只能写 status=blocked/question，或继续 inplace 再 \`submit_for_review\`，**禁止** status=done 假装收口。
 6. status=done 表示你认为可交 gate；blocked/question 则不要假装完成。
+   有未解决 P0/P1 却写 done：broker 不会当干净完成，会另开修复票或降级，白费一轮。
 7. 写完摘要后停止。
 
 硬禁：room_* / join / send_to_role 直连；裸 `git push` / 裸 `gh`；force-push；push main/master；`gh pr merge`；其他仓；不要把整仓灌进摘要；不要打印 API key / GH_TOKEN。
 若 Done-when 要求 PR：gate PASS（或 pack 允许）后经 `dsh-trial-pr` 开 PR，stdout 的 PR URL 写入 summary notes。
-Done when: design_pack_read +（按 pack 完成或明确 blocked/question）+（PASS 后的 done / HOLD-inplace 修完 / HOLD-fresh 的 done+rework_fresh / ask 超时的 question）+（若要求 PR 则已用 dsh-trial-pr 开出或确认已有 open PR）+ summary 含机器块 + room_joined=false。
+Done when: design_pack_read +（按 pack 完成或明确 blocked/question）+（PASS 后的 done / HOLD-inplace 修完并复提 / HOLD-fresh 的 done+rework_fresh+finding_resolutions / ask 超时的 question）+（若要求 PR 则已用 dsh-trial-pr 开出或确认已有 open PR）+ summary 含机器块 + 有 findings 时逐条 finding_resolutions + room_joined=false。
 PROMPT
 }
 

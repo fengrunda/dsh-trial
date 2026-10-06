@@ -131,6 +131,10 @@ GOALS = DSH_HOME / "supervisor" / "thin-state" / "goals"
 MAILBOX = T.MAILBOX
 HOMES_ROOT = Path(os.environ.get("DSH_HOMES_ROOT") or (Path.home() / ".dsh-homes"))
 NOTIFY = DSH_HOME / "bin" / "khub-dsh-complete-notify.py"
+HEARTBEAT = Path(
+    os.environ.get("TRIAL_BROKER_HEARTBEAT")
+    or (STATE_DIR / "trial-broker.heartbeat.json")
+)
 OFFLOAD_GC = DSH_HOME / "bin" / "dsh-offload-gc.py"
 _LAST_OFFLOAD_GC_TS = 0.0
 
@@ -163,6 +167,30 @@ def _stamp() -> str:
 def _ensure_dirs() -> None:
     for d in (INBOX, OUTBOX, PROCESSING, FAILED, STATE_DIR, ARTIFACT_ROOT, CHAINS, PACKS, SUMMARIES, GOALS, MAILBOX):
         d.mkdir(parents=True, exist_ok=True)
+
+
+def _write_heartbeat(pending: int = 0, *, extra: dict | None = None) -> None:
+    """Persist loop liveness for the independent watchdog (Addendum ②).
+
+    Path: ``$TRIAL_BROKER_DIR/trial-broker.heartbeat.json`` (or
+    ``$TRIAL_BROKER_HEARTBEAT``). Never raises.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": os.getpid(),
+            "at": _iso(),
+            "wall": time.time(),
+            "mono": time.monotonic(),
+            "pending": int(pending),
+        }
+        if extra:
+            payload.update(extra)
+        HEARTBEAT.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 def _redact_env(env: dict[str, str]) -> dict[str, str]:
@@ -746,8 +774,21 @@ def _tool_res_from_art(art: dict | None) -> str | None:
     return None
 
 
-def _notify_goal_event(goal: dict, *, kind: str, ok: bool, extra: dict | None = None) -> None:
-    """Notify Hub only for Goal complete / escalate / fail / limit (Decision D)."""
+def _notify_goal_event(
+    goal: dict,
+    *,
+    kind: str,
+    ok: bool,
+    extra: dict | None = None,
+    reason: str | None = None,
+    suggested_action: str | None = None,
+) -> None:
+    """Notify Hub only for Goal complete / escalate / fail / limit (Decision D).
+
+    Every goal-terminal event carries ``goal`` / ``status`` / ``reason`` /
+    ``suggested_action`` (structured json-body) so the webhook routine and
+    ``khub-dsh-complete-notify.py`` can act without scraping the summary.
+    """
     notify = str(goal.get("notify") or "").strip().lower()
     if notify not in ("hub", "khub", "true", "1", "yes"):
         return
@@ -767,18 +808,40 @@ def _notify_goal_event(goal: dict, *, kind: str, ok: bool, extra: dict | None = 
         "extra": extra,
     }
     result = {"ticket": f"goal-{goal.get('goal')}", "composition": None, "assert_clean": True}
+    reason = reason or (
+        str(goal.get("error") or goal.get("escalate_reason") or "").strip()
+        or (extra or {}).get("reason")
+        or ""
+    )
+    if not suggested_action:
+        suggested_action = {
+            "done": "none",
+            "escalated": "提高 limits 或人工处理",
+            "cancelled": "无需动作",
+            "failed": "检查 failed/ 并决定 salvage / 重投",
+            "closeout": "核对 handoff 后人工收口",
+        }.get(str(status), "检查 goal 状态")
     summary = (
         f"dsh-trial-goal goal={goal.get('goal')} status={status} kind={kind} "
         f"slices={goal.get('slices')} sup_tickets={goal.get('supervisor_ticket_count')} "
         f"tokens={(goal.get('metrics') or {}).get('prompt_token_total')} "
         f"limit_hit={goal.get('limit_hit')}"
     )
+    if reason:
+        summary += f" reason={reason}"
     if extra and extra.get("suggestion"):
         summary += f" suggestion={extra.get('suggestion')}"
+    summary += f" suggested_action={suggested_action}"
     prefix = str(goal.get("notify_prefix") or "").strip()
     if prefix:
         summary = f"{prefix}{summary}"
-    info = maybe_notify_hub(job, out_body, result, kind=kind, extra_summary=summary)
+    payload_extra = {"reason": reason, "suggested_action": suggested_action}
+    if isinstance(extra, dict):
+        payload_extra["extra"] = extra
+    info = maybe_notify_hub(
+        job, out_body, result, kind=kind, extra_summary=summary,
+        payload_extra=payload_extra,
+    )
     goal.setdefault("metrics", T.empty_metrics()).setdefault("notify_events", []).append({
         "at": _iso(), "kind": kind, "info": info,
     })
@@ -1045,6 +1108,7 @@ def run_open_slice(
         # 硬上限 DSH_ACP_PROMPT_TIMEOUT / prompt_timeout_sec（默认 3600）到点仍收口。
         def _watch():
             while not stop.is_set():
+                _write_heartbeat(1)
                 for ap in T.list_pending_asks(MAILBOX):
                     try:
                         _handle_pending_ask_file(
@@ -1246,6 +1310,146 @@ max_bytes_hint: {MAX_PACK_BYTES}
     return name
 
 
+# --- Gate findings are the primary task in fix / rework packs (Change ①) ---
+BLOCKING_FINDING_TIERS = ("P0", "P1")
+RESOLUTION_TERMINAL_STATUSES = ("fixed", "deferred", "wontfix", "resolved")
+
+_FIX_PACK_DONE_WHEN = """## Done when
+- Fix every P0/P1 finding above; keep changes minimal.
+- For EACH finding write a `finding_resolutions` entry in the summary machine block:
+  `{"finding": "…or tier+issue", "change": "file:line or path+symbol", "status": "fixed|deferred|wontfix", "reason": "required when not fixed"}`.
+- Unfixed P0/P1: use status=blocked/question, or keep reworking inplace and call submit_for_review again. Never status=done with an unresolved P0/P1.
+- Write the foreman structured summary machine block.
+- No room_*.
+"""
+
+
+def _finding_tier(f) -> str:
+    if not isinstance(f, dict):
+        return ""
+    return str(
+        f.get("tier") or f.get("severity") or f.get("priority") or ""
+    ).strip().upper()
+
+
+def pending_blocking_findings(findings) -> list:
+    """P0/P1 findings only; P2 nits never block completion."""
+    return [
+        f for f in (findings or [])
+        if isinstance(f, dict) and _finding_tier(f) in BLOCKING_FINDING_TIERS
+    ]
+
+
+def summary_finding_resolutions(block: dict) -> list:
+    """The machine block ``finding_resolutions`` list (tolerates nested ``machine``)."""
+    block = block or {}
+    raw = block.get("finding_resolutions")
+    if raw is None and isinstance(block.get("machine"), dict):
+        raw = block["machine"].get("finding_resolutions")
+    if not isinstance(raw, list):
+        return []
+    return [r for r in raw if isinstance(r, dict)]
+
+
+def summary_claims_rework_fresh(block: dict) -> bool:
+    """Whether the foreman explicitly handed off to a fresh fix ticket."""
+    return "rework_fresh" in str((block or {}).get("notes") or "")
+
+
+def _resolutions_cover_findings(resolutions: list, findings: list) -> bool:
+    if not findings:
+        return True
+    if len(resolutions) < len(findings):
+        return False
+    statuses = [str(r.get("status") or "").strip().lower() for r in resolutions]
+    return all(s in RESOLUTION_TERMINAL_STATUSES for s in statuses)
+
+
+def decide_impl_completion(block: dict, goal: dict | None) -> dict:
+    """Guard a ``done`` impl summary that still carries unresolved P0/P1 findings.
+
+    Change ②: a mid-ticket ``submit_for_review`` HOLD stores findings on the
+    goal (``last_gate_findings``). If the foreman then ends the ticket with
+    status=done but neither claims a fresh handoff (``rework_fresh``) nor maps
+    every blocking finding in ``finding_resolutions``, it is NOT a clean
+    completion. The broker must open a findings-first fix ticket (fresh) or
+    escalate when no round remains — never close as a clean PASS.
+
+    Returns ``{"action": "clean_done"|"open_fix", "findings": [...], "reason": str, "mode": str}``.
+    """
+    goal = goal or {}
+    findings = pending_blocking_findings(goal.get("last_gate_findings"))
+    mode = str(goal.get("pending_rework_mode") or "")
+    if not findings:
+        return {
+            "action": "clean_done",
+            "findings": [],
+            "reason": "no pending P0/P1 findings",
+            "mode": mode,
+        }
+    status = str((block or {}).get("status") or "").strip().lower()
+    if status != "done":
+        # blocked / question have their own paths; nothing to guard.
+        return {
+            "action": "clean_done",
+            "findings": findings,
+            "reason": f"status={status or 'unknown'} is not done",
+            "mode": mode,
+        }
+    if summary_claims_rework_fresh(block) or mode == "fresh":
+        return {
+            "action": "open_fix",
+            "findings": findings,
+            "reason": "fresh rework handoff on a done ticket",
+            "mode": mode or "fresh",
+        }
+    if _resolutions_cover_findings(summary_finding_resolutions(block), findings):
+        return {
+            "action": "clean_done",
+            "findings": findings,
+            "reason": "finding_resolutions cover every blocking finding",
+            "mode": mode,
+        }
+    return {
+        "action": "open_fix",
+        "findings": findings,
+        "reason": (
+            "status=done with pending P0/P1 findings and no "
+            "finding_resolutions/rework_fresh handoff"
+        ),
+        "mode": "fresh",
+    }
+
+
+def _gate_findings_section(findings: list, gate_summary_text: str = "") -> str:
+    findings_json = json.dumps(findings or [], ensure_ascii=False, indent=2)
+    section = (
+        "## Gate findings (primary task)\n"
+        "```json\n"
+        f"{findings_json}\n"
+        "```\n"
+    )
+    if gate_summary_text:
+        section += (
+            "\n### Gate notes (excerpt)\n"
+            f"{gate_summary_text[:1500]}\n"
+        )
+    return section
+
+
+def _write_pack_capped(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    for _ in range(4):
+        try:
+            _enforce_pack_bytes(path)
+            return
+        except ValueError:
+            cur = path.read_text(encoding="utf-8")
+            cut, _ = _truncate_bytes(cur, MAX_PACK_BYTES - 80)
+            path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
+    _enforce_pack_bytes(path)
+
+
 def build_fix_pack(
     *,
     slice_id: str,
@@ -1254,11 +1458,16 @@ def build_fix_pack(
     gate_findings: list,
     gate_summary_text: str,
 ) -> str:
-    """Write packs/<slice>-fix-r<N+1>.pack.md = original + gate findings only."""
+    """Write packs/<slice>-fix-r<N>.pack.md — findings first, original as appendix.
+
+    Body order is deliberate (Change ①): Gate findings (primary) → Done when
+    (per-finding ``finding_resolutions`` mapping) → Original pack abridged as an
+    appendix. The original pack must never precede the findings and steal the
+    primary-task slot.
+    """
     orig_path = PACKS / Path(original_pack_name).name
     orig_body = orig_path.read_text(encoding="utf-8") if orig_path.is_file() else "(missing)"
-    orig_trunc, _ = _truncate_bytes(orig_body, max(1024, MAX_PACK_BYTES // 2))
-    findings_json = json.dumps(gate_findings or [], ensure_ascii=False, indent=2)
+    orig_trunc, _ = _truncate_bytes(orig_body, max(1024, MAX_PACK_BYTES // 3))
     name = f"{slice_id}-fix-r{next_round}.pack.md"
     path = PACKS / name
     body = f"""---
@@ -1271,34 +1480,14 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-impl-r{next_ro
 max_bytes_hint: {MAX_PACK_BYTES}
 ---
 
-# Fix pack · {slice_id} · round {next_round}
+# Fix pack · {slice_id} · round {next_round} (gate findings first)
 
-## Original pack (authoritative intent)
+{_gate_findings_section(gate_findings, gate_summary_text)}
+{_FIX_PACK_DONE_WHEN}
+## Original pack (appendix, abridged)
 {orig_trunc}
-
-## Gate findings only (no transcripts)
-```json
-{findings_json}
-```
-
-### Gate notes (excerpt)
-{(gate_summary_text or '')[:1500]}
-
-## Done when
-- Address P0/P1 findings; keep changes minimal.
-- Write foreman structured summary (status/changed_files/base/commit/questions/notes).
-- No room_*.
 """
-    path.write_text(body, encoding="utf-8")
-    for _ in range(4):
-        try:
-            _enforce_pack_bytes(path)
-            break
-        except ValueError:
-            cur = path.read_text(encoding="utf-8")
-            cut, _ = _truncate_bytes(cur, MAX_PACK_BYTES - 80)
-            path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
-    _enforce_pack_bytes(path)
+    _write_pack_capped(path, body)
     return name
 
 
@@ -1308,18 +1497,51 @@ def build_reply_addendum_pack(
     round_n: int,
     prior_pack_name: str,
     answer: str,
+    gate_findings: list | None = None,
 ) -> str:
+    """Write packs/<slice>-reply-r<N>.pack.md for a continuing impl ticket.
+
+    When ``gate_findings`` is non-empty the gate findings are the primary task
+    and the supervisor answer is only an appendix (Change ①). Without findings
+    the supervisor answer drives continued implementation; the prior pack is
+    always an appendix, never the primary task.
+    """
     prior = PACKS / Path(prior_pack_name).name
     prior_body = prior.read_text(encoding="utf-8") if prior.is_file() else ""
-    prior_trunc, _ = _truncate_bytes(prior_body, max(1024, MAX_PACK_BYTES // 2))
+    prior_trunc, _ = _truncate_bytes(prior_body, max(1024, MAX_PACK_BYTES // 3))
+    findings = [f for f in (gate_findings or []) if isinstance(f, dict)]
     name = f"{slice_id}-reply-r{round_n}.pack.md"
     path = PACKS / name
-    body = f"""---
+    if findings:
+        body = f"""---
 slice_id: {slice_id}
 kind: reply-addendum
 round: {round_n}
 role: impl
 prior_pack: {Path(prior_pack_name).name}
+has_gate_findings: true
+summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-impl-r{round_n}.md
+max_bytes_hint: {MAX_PACK_BYTES}
+---
+
+# Gate findings + supervisor reply · {slice_id} · round {round_n}
+
+{_gate_findings_section(findings)}
+{_FIX_PACK_DONE_WHEN}
+## Supervisor answer (appendix)
+{answer.strip()}
+
+## Prior pack (appendix, abridged)
+{prior_trunc}
+"""
+    else:
+        body = f"""---
+slice_id: {slice_id}
+kind: reply-addendum
+round: {round_n}
+role: impl
+prior_pack: {Path(prior_pack_name).name}
+has_gate_findings: false
 summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-impl-r{round_n}.md
 max_bytes_hint: {MAX_PACK_BYTES}
 ---
@@ -1329,16 +1551,15 @@ max_bytes_hint: {MAX_PACK_BYTES}
 ## Supervisor answer
 {answer.strip()}
 
-## Prior pack (context)
-{prior_trunc}
-
 ## Done when
-- Incorporate supervisor answer; continue implementation.
-- Write foreman structured summary machine block.
+- Incorporate the supervisor answer; continue implementation.
+- Write the foreman structured summary machine block.
 - No room_*.
+
+## Prior pack (appendix, abridged)
+{prior_trunc}
 """
-    path.write_text(body, encoding="utf-8")
-    _enforce_pack_bytes(path)
+    _write_pack_capped(path, body)
     return name
 
 
@@ -1353,7 +1574,15 @@ def _peak_prompt(csv_path):
         return (None, 0)
 
 
-def maybe_notify_hub(job, out_body, result, *, kind: str = "dsh-trial-complete", extra_summary: str = ""):
+def maybe_notify_hub(
+    job,
+    out_body,
+    result,
+    *,
+    kind: str = "dsh-trial-complete",
+    extra_summary: str = "",
+    payload_extra: dict | None = None,
+):
     ticket = result.get("ticket") or job.get("ticket") or job.get("slice") or job.get("id")
     peak, steps = _peak_prompt(result.get("composition") or "")
     summary = extra_summary or (
@@ -1395,6 +1624,28 @@ def maybe_notify_hub(job, out_body, result, *, kind: str = "dsh-trial-complete",
             "at": _iso(),
             "summary": summary,
         }
+        payload = {k: v for k, v in payload.items() if v is not None}
+        cmd = [
+            sys.executable, str(NOTIFY),
+            "--json-body", json.dumps(payload, ensure_ascii=False),
+            "--source", "dsh",
+            "--kind", kind,
+        ]
+        if str(job.get("notify_dry_run") or "").lower() in ("true", "1", "yes"):
+            cmd.append("--dry-run")
+    elif payload_extra:
+        # Goal-terminal events: structured goal/status/reason/suggested_action.
+        payload = {
+            "source": "dsh",
+            "kind": kind,
+            "status": out_body.get("status"),
+            "goal": job.get("goal") or out_body.get("goal"),
+            "ticket": str(ticket),
+            "summary": summary,
+            "host": "box",
+            "at": _iso(),
+        }
+        payload.update(payload_extra)
         payload = {k: v for k, v in payload.items() if v is not None}
         cmd = [
             sys.executable, str(NOTIFY),
@@ -2038,7 +2289,10 @@ def reconcile_terminal_goals_at_start() -> list[str]:
             continue
         new_status = reconcile_running_goal(goal)
         if new_status:
-            settled.append(str(goal.get("goal") or path.stem))
+            gid = str(goal.get("goal") or path.stem)
+            settled.append(gid)
+            # Reconcile is a terminal transition too: never leave Hub blind.
+            _notify_goal_terminal(gid)
     if settled:
         print(
             f"[trial-broker] startup reconcile settled {len(settled)} goal(s): "
@@ -2323,6 +2577,9 @@ def maybe_supervisor_close(job: dict, chain: dict) -> None:
     goal["last_chain_state"] = chain.get("state")
     _write_goal(goal)
     print(f"[trial-broker] supervisor close {ticket} goal_status={gstatus}", flush=True)
+    # The close is a terminal transition when it says done/failed/escalated.
+    if str(gstatus).lower() in ("done", "failed", "escalated", "cancelled", "closeout"):
+        _notify_goal_terminal(str(goal_id))
 
 
 
@@ -3194,6 +3451,78 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
             return ec or 1
 
         status = block.get("status")
+
+        # Change ② — mid-ticket gate HOLD left unresolved P0/P1. A foreman
+        # `done` that neither maps finding_resolutions nor hands off to a fresh
+        # fix ticket must NOT be treated as a clean round: open the findings-first
+        # fix ticket now (真·fresh), or escalate when no round remains. Never PASS.
+        completion = decide_impl_completion(block, goal_obj)
+        if completion["action"] == "open_fix":
+            blocking = completion["findings"]
+            chain["rework_handoff"] = {
+                "at": _iso(),
+                "mode": completion.get("mode") or "fresh",
+                "reason": completion["reason"],
+                "findings": blocking,
+                "impl_summary": str(impl_summary),
+            }
+            round_rec["rework_handoff"] = dict(chain["rework_handoff"])
+            if round_n >= max_rounds:
+                chain["state"] = "escalated"
+                chain["escalate_reason"] = (
+                    "unresolved P0/P1 at max_rounds after rework handoff: "
+                    + completion["reason"]
+                )
+                if goal_obj is not None:
+                    goal_obj = _read_goal(str(goal_id)) or goal_obj
+                    goal_obj.pop("pending_rework_mode", None)
+                    goal_obj.pop("pending_rework_ask_id", None)
+                    goal_obj["last_chain_state"] = "escalated"
+                    goal_obj["status"] = "escalated"
+                    goal_obj["error"] = chain["escalate_reason"]
+                    _write_goal(goal_obj)
+                chain["rounds"][-1] = round_rec
+                _write_chain(chain)
+                print(
+                    f"[trial-broker] chain {slice_id} ESCALATED r{round_n} "
+                    f"unresolved P0/P1 ({completion['reason']})",
+                    flush=True,
+                )
+                out = _terminal_outbox(job, chain, dest, ok=False)
+                if goal_id:
+                    _notify_goal_terminal(str(goal_id))
+                return 1
+            next_round = round_n + 1
+            try:
+                fresh_fix_pack = build_fix_pack(
+                    slice_id=slice_id,
+                    next_round=next_round,
+                    original_pack_name=original_pack,
+                    gate_findings=blocking,
+                    gate_summary_text="",
+                )
+            except ValueError as e:
+                chain["state"] = "failed"
+                chain["error"] = f"fresh fix pack build: {e}"
+                _write_chain(chain)
+                _terminal_outbox(job, chain, dest, ok=False)
+                return 1
+            round_rec["fresh_rework_fix_pack"] = fresh_fix_pack
+            chain["rounds"][-1] = round_rec
+            pack_for_impl = fresh_fix_pack
+            if goal_obj is not None:
+                goal_obj = _read_goal(str(goal_id)) or goal_obj
+                goal_obj.pop("pending_rework_mode", None)
+                goal_obj.pop("pending_rework_ask_id", None)
+                _write_goal(goal_obj)
+            _write_chain(chain)
+            print(
+                f"[trial-broker] chain {slice_id} fresh rework r{round_n} → "
+                f"fix ticket r{next_round} pack={fresh_fix_pack}",
+                flush=True,
+            )
+            continue
+
         # Decision: HOLD never wakes supervisor (handled below via fix pack).
         # Blocked → awaiting without auto-wake. Question → auto supervisor answer
         # (fallback when ask_supervisor mid-ticket timed out / unused).
@@ -3238,6 +3567,9 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
                             round_n=next_round,
                             prior_pack_name=Path(pack_for_impl).name,
                             answer=answer,
+                            gate_findings=list(
+                                (goal_obj or {}).get("last_gate_findings") or []
+                            ),
                         )
                     except ValueError as e:
                         chain["state"] = "failed"
@@ -3566,6 +3898,8 @@ def _execute_goal_slices(
             if dest.exists():
                 shutil.move(str(dest), str(FAILED / dest.name))
             print(f"[trial-broker] FAIL missing pack {pack_abs}", flush=True)
+            # Terminal: wake Hub like the other goal-level failures.
+            _notify_goal_terminal(goal_id)
             return 1
 
         goal_state["slices"] = list(dict.fromkeys(list(goal_state.get("slices") or []) + [slice_id]))
@@ -3875,11 +4209,17 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         prior_pack = last.get("impl_pack") or prior_pack
 
     try:
+        reply_gate_findings: list = []
+        reply_goal_id = str(job.get("goal") or chain.get("goal") or "").strip()
+        if reply_goal_id:
+            reply_goal = _read_goal(reply_goal_id)
+            reply_gate_findings = list((reply_goal or {}).get("last_gate_findings") or [])
         reply_pack = build_reply_addendum_pack(
             slice_id=slice_id,
             round_n=next_round,
             prior_pack_name=prior_pack,
             answer=job["answer"],
+            gate_findings=reply_gate_findings,
         )
     except ValueError as e:
         chain["state"] = "failed"
@@ -4022,8 +4362,25 @@ def _notify_goal_terminal(goal_id: str) -> None:
         return
     if status == "done" and "dsh-trial-goal-complete" not in notified:
         _notify_goal_event(goal, kind="dsh-trial-goal-complete", ok=True)
+    elif status == "closeout" and "dsh-trial-limit" not in notified:
+        # Limit-stop closeout (hard cap / max_steps) without a limit_hit dict.
+        _notify_goal_event(
+            goal,
+            kind="dsh-trial-limit",
+            ok=False,
+            extra={"kind": "limit_closeout", "suggestion": "核对 handoff 后人工收口"},
+            reason=str(goal.get("closeout_note") or goal.get("error") or "limit closeout"),
+            suggested_action="核对 handoff 后人工收口 / 决定是否续投",
+        )
     elif status in ("escalated", "failed", "cancelled") and "dsh-trial-goal-failed" not in notified:
-        _notify_goal_event(goal, kind="dsh-trial-goal-failed", ok=False)
+        _notify_goal_event(
+            goal,
+            kind="dsh-trial-goal-failed",
+            ok=False,
+            reason=str(
+                goal.get("escalate_reason") or goal.get("error") or "goal failed"
+            ),
+        )
 
 
 def _slice_specs_from_plan(goal: dict) -> list[dict]:
@@ -4512,6 +4869,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Fold terminal chains back onto Goals still marked running. Never
     # resumes them and never touches cancelled / in-flight goals.
     reconcile_terminal_goals_at_start()
+    _write_heartbeat(0)
     if not OPEN_SLICE.is_file():
         print(f"missing {OPEN_SLICE}", file=sys.stderr)
         return 2
@@ -4521,17 +4879,25 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if args.once:
         pending = list_pending()
+        _write_heartbeat(len(pending))
         if not pending:
             print("[trial-broker] inbox empty", flush=True)
             return 0
-        return run_job(pending[0])
+        rc = run_job(pending[0])
+        _write_heartbeat(0)
+        return rc
 
     interval = max(5, int(args.poll))
     print(f"[trial-broker] polling every {interval}s inbox={INBOX}", flush=True)
     while True:
         pending = list_pending()
+        # Heartbeat for the independent watchdog. The mailbox watcher also
+        # refreshes it during long impl tickets; subprocess liveness covers the
+        # rest so a healthy long job is not mistaken for a stalled loop.
+        _write_heartbeat(len(pending))
         if pending:
             run_job(pending[0])
+            _write_heartbeat(0)
         else:
             maybe_offload_gc(force=False)
             time.sleep(interval)

@@ -55,7 +55,10 @@ def test_pack_builders_and_byte_cap(tmp_cwd: Path):
     )
     assert (tb.PACKS / fix_name).is_file()
     body = (tb.PACKS / fix_name).read_text()
-    assert "Gate findings only" in body
+    assert "Gate findings (primary task)" in body
+    # Change ①: findings must precede the original pack appendix.
+    assert body.index("Gate findings (primary task)") < body.index("Original pack (appendix")
+    assert "finding_resolutions" in body
 
     reply = tb.build_reply_addendum_pack(
         slice_id=slice_id,
@@ -64,6 +67,21 @@ def test_pack_builders_and_byte_cap(tmp_cwd: Path):
         answer="Add docstring.",
     )
     assert "Supervisor answer" in (tb.PACKS / reply).read_text()
+    assert "Original pack (appendix" not in (tb.PACKS / reply).read_text()
+    assert "Prior pack (appendix" in (tb.PACKS / reply).read_text()
+
+    # Reply with gate findings: findings are primary, supervisor answer appendix.
+    reply_f = tb.build_reply_addendum_pack(
+        slice_id=slice_id,
+        round_n=3,
+        prior_pack_name=orig.name,
+        answer="Also add tests.",
+        gate_findings=[{"tier": "P1", "issue": "no tests"}],
+    )
+    rbody = (tb.PACKS / reply_f).read_text()
+    assert "Gate findings (primary task)" in rbody
+    assert rbody.index("Gate findings (primary task)") < rbody.index("Supervisor answer (appendix")
+    assert "finding_resolutions" in rbody
     print("OK pack builders")
 
 

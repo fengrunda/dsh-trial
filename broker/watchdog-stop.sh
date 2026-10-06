@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Stop only broker-dsh-trial. Never touches broker-khub-prod / product tickets.
+# Stop only the standalone trial watchdog. Never touches broker-khub-prod.
 set -euo pipefail
 
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 STATE_DIR="${TRIAL_BROKER_DIR:-$DSH_HOME/broker-dsh-trial}"
-PIDFILE="$STATE_DIR/trial-broker.pid"
+PIDFILE="$STATE_DIR/trial-watchdog.pid"
 
 if [[ ! -f "$PIDFILE" ]]; then
-  echo "no pidfile at $PIDFILE (already stopped?)"
+  echo "no watchdog pidfile at $PIDFILE (already stopped?)"
   exit 0
 fi
 pid="$(cat "$PIDFILE" 2>/dev/null || true)"
 if [[ -z "${pid}" ]]; then
   rm -f "$PIDFILE"
-  echo "empty pidfile removed"
+  echo "empty watchdog pidfile removed"
   exit 0
 fi
 if kill -0 "$pid" 2>/dev/null; then
@@ -31,14 +31,8 @@ if kill -0 "$pid" 2>/dev/null; then
     echo "refusing SIGKILL by default; pid=$pid still up" >&2
     exit 1
   fi
-  echo "stopped broker-dsh-trial pid=$pid"
+  echo "stopped trial-watchdog pid=$pid"
 else
-  echo "stale pidfile (pid $pid not running)"
+  echo "stale watchdog pidfile (pid $pid not running)"
 fi
 rm -f "$PIDFILE"
-
-# Stop the standalone watchdog too (its own pidfile; never touches prod).
-_root="$(cd "$(dirname "$0")" && pwd)"
-if [[ -x "$_root/watchdog-stop.sh" ]]; then
-  "$_root/watchdog-stop.sh" || echo "warning: watchdog stop failed" >&2
-fi

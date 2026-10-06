@@ -62,12 +62,15 @@ def decide_and_answer_review(
     if mode == "inplace":
         instruction = (
             "HOLD inplace — fix the listed findings in THIS ticket, then call submit_for_review again. "
-            "Do not end the ticket yet."
+            "Record a finding_resolutions entry for each finding in the summary machine block. "
+            "Do not end the ticket with status=done while a P0/P1 is unresolved."
         )
     else:
         instruction = (
-            "HOLD fresh — end THIS ticket now with status=done and notes containing rework_fresh; "
-            "broker will open a new fix ticket with findings-only pack."
+            "HOLD fresh — end THIS ticket now with status=done and notes containing rework_fresh "
+            "(plus finding_resolutions). Broker will immediately open a NEW impl fix ticket with a "
+            "findings-first pack and run the gate again. This is NOT a slice completion; do not treat "
+            "the done as a clean PASS."
         )
     return mode, {
         "ask_id": ask.get("ask_id"),

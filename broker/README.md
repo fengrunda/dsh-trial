@@ -56,6 +56,35 @@ python3 ./trial-broker.py --status
 ./stop.sh
 ```
 
+## Watchdog（broker 死了也能喊）
+
+`trial-watchdog.py` 是**独立进程**（不 import broker 主循环），即使 `trial-broker.py`
+死掉/冻住也能向同一 Hub webhook 报警。`start.sh` 会顺带拉起（`TRIAL_WATCHDOG_ENABLE=0`
+可关），`stop.sh` 会停掉；也可单独启停：
+
+```bash
+./broker/watchdog-start.sh          # nohup，pidfile=$TRIAL_BROKER_DIR/trial-watchdog.pid
+./broker/watchdog-start.sh --once   # 跑一次（前景）
+./broker/watchdog-stop.sh
+python3 ./broker/trial-watchdog.py --once --dry-run   # 只打印 payload，不发
+```
+
+检查项 / 事件：
+
+1. **broker 进程不在**（pidfile 僵死且无 `trial-broker.py`）→ kind=`dsh-trial-stalled`。
+2. **心跳停了**：broker 每轮写
+   `$TRIAL_BROKER_DIR/trial-broker.heartbeat.json`
+   （`TRIAL_BROKER_HEARTBEAT` 可覆盖）；watchdog 超时（`TRIAL_WATCHDOG_HEARTBEAT_SEC`，
+   默认 300s）且无活 `open-slice.sh` / `dsh-acp-ask.py` 进程 → stalled。长票由 watcher
+   持续刷新心跳，不会误报。
+3. **Goal thin-state 仍是 `running`/`planning`/`closeout` 但无活票**（processing+inbox 空、
+   无 work 进程）超过 `TRIAL_WATCHDOG_GOAL_STALL_SEC`（默认 600s）→ stalled。
+4. **冻后恢复**：墙钟 `time.time()` 与单调钟推断偏差 ≥ `DSH_TRIAL_FREEZE_JUMP_SEC`
+   （默认 300s）→ kind=`dsh-trial-resumed-after-freeze`（每次跳变只发一次）。
+
+事件 payload 统一带 `goal` / `status` / `reason` / `suggested_action`；同一 `reason_key`
+在 `TRIAL_WATCHDOG_COOLDOWN_SEC`（默认 900s）内不重复发。
+
 ## 投放任务
 
 ### 单票（原行为）
@@ -86,9 +115,17 @@ python3 ./trial-broker.py --status
 1. 开 `impl-trial-<slice>-r<N>`（role=impl，prompt-mode=foreman）→ 结构化 summary。  
 2. 工头 `done` → broker 写 `packs/<slice>-gate-r<N>.pack.md`（原 pack + acceptance + 工头块 + diff）→ 开 `gate-trial-<slice>-r<N>`。  
 3. Gate 写 `summaries/<slice>-gate-r<N>.md`（verdict PASS|HOLD + findings）。  
-4. HOLD 且 round < max → 写 fix pack（原 pack + findings）→ 下一轮工头；满轮 HOLD → `escalated`。  
-5. 工头 `blocked`/`question` → `awaiting_supervisor`；监理丢 `type: chain-reply`（见 `examples/job-chain-reply.json`）续跑。  
-6. 终态写 `thin-state/chains/<slice>.json` + outbox；`notify: hub` 时 kind=`dsh-trial-chain`。
+4. HOLD 且 round < max → 写 fix pack：**Gate findings 是主任务**（正文最前），
+   Done when 要求逐条 `finding_resolutions`，**原 pack 缩略作附录** → 下一轮工头；满轮 HOLD → `escalated`。  
+5. 工头票中 `submit_for_review` 返回 HOLD：
+   - `rework_mode=inplace`：**同一票内**按 findings 修完再复提（不得提前 `status=done`）。
+   - `rework_mode=fresh`：当前票以 `status=done` + notes `rework_fresh` 结束；broker **立刻**用
+     findings-first `build_fix_pack` 另开一张新 impl 修复票再跑 gate（视作续跑，不是 slice 完成）。
+   若 goal 上仍有 P0/P1 且 summary 写 `done` 却没逐条 `finding_resolutions`/`rework_fresh`，
+   broker 不按干净完成推进：开 fix 票续跑，轮次耗尽则 `escalated`。  
+6. 工头 `blocked`/`question` → `awaiting_supervisor`；监理丢 `type: chain-reply`（见 `examples/job-chain-reply.json`）续跑；
+   若该 goal 上有 `last_gate_findings`，reply pack 同样 findings-first、监理答复仅附录。  
+7. 终态写 `thin-state/chains/<slice>.json` + outbox；`notify: hub` 时 kind=`dsh-trial-chain`。
 
 ### Chain-reply
 

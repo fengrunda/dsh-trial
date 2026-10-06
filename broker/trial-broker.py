@@ -423,6 +423,108 @@ def list_pending() -> list[Path]:
     return files
 
 
+def quarantine_inbox_reject(path: Path, reason: str, *, raw: dict | None = None) -> dict:
+    """Quarantine one bad inbox file so a single reject never kills the broker.
+
+    Best-effort only: moves ``path`` under ``FAILED``, writes a small
+    ``*.error.json`` sidecar (never the full raw body — it may carry secrets),
+    logs, and wakes Hub with ``kind=dsh-trial-inbox-reject``. Never re-raises.
+    """
+    _ensure_dirs()
+    name = path.name
+    dest = FAILED / name
+    if dest.exists():
+        # Collision: stamp-prefix so the rejected file is never lost/overwritten.
+        dest = FAILED / f"{_stamp()}-{name}"
+        n = 1
+        while dest.exists():
+            dest = FAILED / f"{_stamp()}-{n}-{name}"
+            n += 1
+    error_path = FAILED / f"{dest.stem}.error.json"
+
+    payload: dict = {"error": reason, "original_name": name, "at": _iso()}
+    if isinstance(raw, dict):
+        for key in ("goal", "id", "type"):
+            val = raw.get(key)
+            if val is not None:
+                payload[key] = val
+
+    moved = False
+    try:
+        if path.exists():
+            shutil.move(str(path), str(dest))
+            moved = True
+    except OSError as e:
+        print(f"[trial-broker] quarantine move failed file={name} err={e}", flush=True)
+
+    try:
+        error_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError as e:
+        print(f"[trial-broker] quarantine error.json write failed file={name} err={e}", flush=True)
+
+    print(f"[trial-broker] quarantine inbox reject file={name} reason={reason} → failed/", flush=True)
+
+    job = {
+        "id": str((raw or {}).get("id") or path.stem),
+        "goal": (raw or {}).get("goal"),
+        "notify": (raw or {}).get("notify") or "hub",
+        "notify_dry_run": (raw or {}).get("notify_dry_run"),
+    }
+    notify_result: dict | None = None
+    try:
+        notify_result = maybe_notify_hub(
+            job,
+            {"status": "failed"},
+            {"ticket": job["id"]},
+            kind="dsh-trial-inbox-reject",
+            extra_summary=f"inbox reject file={name} reason={reason}",
+            payload_extra={
+                "reason": reason,
+                "original_name": name,
+                "suggested_action": "fix inbox JSON (e.g. add type:goal / ticket+pack) and re-drop",
+            },
+        )
+        if not (isinstance(notify_result, dict) and notify_result.get("sent")):
+            print(
+                f"[trial-broker] quarantine notify not sent kind=dsh-trial-inbox-reject file={name}",
+                flush=True,
+            )
+    except Exception as e:  # noqa: BLE001 - intake guard must never re-raise
+        notify_result = {"sent": False, "error": type(e).__name__}
+        print(
+            f"[trial-broker] quarantine notify failed kind=dsh-trial-inbox-reject "
+            f"file={name} err={type(e).__name__}",
+            flush=True,
+        )
+
+    return {
+        "dest": str(dest) if moved else None,
+        "error_path": str(error_path),
+        "original_name": name,
+        "notify": notify_result,
+    }
+
+
+def _quarantine_unexpected(path: Path, exc: Exception) -> None:
+    """Quarantine after an unexpected ``run_job`` blow-up. Never re-raises."""
+    reason = f"unexpected: {exc}"
+    try:
+        target: Path | None = path
+        if not path.exists() and PROCESSING.is_dir():
+            target = next(iter(sorted(PROCESSING.glob(f"*{path.name}"))), None)
+        if target is None:
+            print(f"[trial-broker] unexpected reject left no file path={path.name}", flush=True)
+            return
+        quarantine_inbox_reject(target, reason)
+    except Exception as e:  # noqa: BLE001 - intake guard must never re-raise
+        print(
+            f"[trial-broker] unexpected reject quarantine failed file={path.name} err={e}",
+            flush=True,
+        )
+
+
 def find_session(ticket: str, role: str | None) -> Path | None:
     candidates: list[Path] = []
     role_homes: list[Path] = []
@@ -4991,7 +5093,20 @@ def _resume_goal_chain(goal: dict) -> int:
 
 def run_job(path: Path) -> int:
     maybe_offload_gc(force=False)
-    job = load_job(path)
+    try:
+        job = load_job(path)
+    except (ValueError, json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        # A single malformed inbox file must never take the broker down.
+        raw = None
+        try:
+            if path.suffix == ".json" and path.is_file():
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    raw = parsed
+        except (OSError, ValueError, UnicodeDecodeError):
+            raw = None
+        quarantine_inbox_reject(path, str(e), raw=raw)
+        return 1
     jtype = job.get("type") or "ticket"
     if jtype == "goal":
         return run_goal_job(path, job)
@@ -5055,7 +5170,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         if not pending:
             print("[trial-broker] inbox empty", flush=True)
             return 0
-        rc = run_job(pending[0])
+        try:
+            rc = run_job(pending[0])
+        except Exception as e:  # noqa: BLE001 - one bad inbox file must not exit the process
+            print(f"[trial-broker] UNEXPECTED run_job error: {e}", flush=True)
+            _quarantine_unexpected(pending[0], e)
+            rc = 1
         _write_heartbeat(0)
         return rc
 
@@ -5068,7 +5188,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         # rest so a healthy long job is not mistaken for a stalled loop.
         _write_heartbeat(len(pending))
         if pending:
-            run_job(pending[0])
+            try:
+                run_job(pending[0])
+            except Exception as e:  # noqa: BLE001 - keep the poll loop alive
+                print(f"[trial-broker] UNEXPECTED run_job error: {e}", flush=True)
+                _quarantine_unexpected(pending[0], e)
             _write_heartbeat(0)
         else:
             maybe_offload_gc(force=False)

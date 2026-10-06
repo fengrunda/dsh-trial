@@ -2638,6 +2638,56 @@ def reconcile_terminal_goals_at_start() -> list[str]:
     return settled
 
 
+def clear_stale_gate_running_acks_at_start() -> list[str]:
+    """At process start, drop interim ``gate_running`` acks orphaned by a crash.
+
+    ``_handle_submit_for_review`` writes ``MAILBOX/answers/<ask_id>.json`` with
+    ``status="gate_running"`` before spawning the gate. If this broker dies or
+    restarts mid-gate, the orphan gate cannot write the final answer, so the
+    interim would keep ``list_pending_asks`` / ``_handle_pending_ask_file``
+    skipping the still-present ``pending/<ask_id>.json`` forever.
+
+    We are at startup, so any such interim ack cannot have been written by this
+    process: rename it aside so the watcher re-dispatches the pending ask (a
+    still-polling client sees the next interim ack with the new gate rev and
+    keeps waiting). Final answers (``verdict`` / ``status=done`` / ``answer``)
+    and unreadable / non-dict files are left untouched.
+    """
+    cleared: list[str] = []
+    answers = MAILBOX / "answers"
+    if not answers.is_dir():
+        return cleared
+    for path in sorted(answers.glob("*.json")):
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(body, dict):
+            continue
+        if str(body.get("status") or "") != "gate_running":
+            continue
+        if body.get("verdict") is not None:
+            continue
+        ask_id = str(body.get("ask_id") or path.stem)
+        ticket = str(body.get("gate_ticket") or "")
+        dest = MAILBOX / "archive" / f"{ask_id}.stale-gate-running.json"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(dest)
+        except OSError:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+        cleared.append(ask_id)
+        print(
+            f"[trial-broker] stale gate_running ack cleared ask={ask_id} "
+            f"ticket={ticket}",
+            flush=True,
+        )
+    return cleared
+
+
 def build_goal_brief_pack(job: dict) -> str:
     goal_id = job["goal"]
     slice_hint = job.get("suggested_slice") or f"{goal_id}-s1"
@@ -5396,6 +5446,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Fold terminal chains back onto Goals still marked running. Never
     # resumes them and never touches cancelled / in-flight goals.
     reconcile_terminal_goals_at_start()
+    # Drop interim gate_running acks orphaned by a previous crash/restart so
+    # their pending asks are re-dispatched instead of being skipped forever.
+    try:
+        clear_stale_gate_running_acks_at_start()
+    except Exception as e:  # never crash startup
+        print(f"[trial-broker] stale gate_running ack sweep failed: {e}", flush=True)
     _write_heartbeat(0)
     if not OPEN_SLICE.is_file():
         print(f"missing {OPEN_SLICE}", file=sys.stderr)

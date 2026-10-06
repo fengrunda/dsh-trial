@@ -202,17 +202,18 @@ def _run_chain(tmp_path, *, max_rounds, round1_block, round2_block=None):
     dest = d["processing"] / "job-fresh.json"
     dest.write_text("x", encoding="utf-8")
 
+    notify_mock = mock.MagicMock()
     with patch, mock.patch.object(tb, "run_open_slice", side_effect=fake_open_slice), \
             mock.patch.object(tb, "write_artifacts", side_effect=fake_artifacts), \
             mock.patch.object(tb, "maybe_notify_hub", return_value={"sent": False}), \
-            mock.patch.object(tb, "_notify_goal_terminal"):
+            mock.patch.object(tb, "_notify_goal_terminal", notify_mock):
         rc = tb.run_chain_rounds(job, chain, dest, start_round=1, start_pack=orig.name)
     state = json.loads((d["chains"] / f"{slice_id}.json").read_text(encoding="utf-8"))
-    return rc, state, modes
+    return rc, state, modes, notify_mock
 
 
 def test_chain_opens_fresh_fix_ticket_on_dirty_done(tmp_path):
-    rc, state, modes = _run_chain(
+    rc, state, modes, _notify = _run_chain(
         tmp_path,
         max_rounds=2,
         round1_block={"status": "done", "changed_files": ["a.py"], "notes": "no handoff"},
@@ -231,7 +232,7 @@ def test_chain_opens_fresh_fix_ticket_on_dirty_done(tmp_path):
 
 
 def test_chain_escalates_dirty_done_at_max_rounds(tmp_path):
-    rc, state, modes = _run_chain(
+    rc, state, modes, notify = _run_chain(
         tmp_path,
         max_rounds=1,
         round1_block={"status": "done", "changed_files": ["a.py"], "notes": "no handoff"},
@@ -240,6 +241,8 @@ def test_chain_escalates_dirty_done_at_max_rounds(tmp_path):
     assert state["state"] == "escalated"
     assert "unresolved P0/P1" in state["escalate_reason"]
     assert modes == ["foreman"], modes
+    # Chain escalate is terminal: Hub must be woken.
+    assert notify.called
 
 
 # --- Change ②: mailbox instruction + foreman prompt -------------------------

@@ -2597,6 +2597,7 @@ def reconcile_running_goal(goal: dict) -> str | None:
     goal["last_chain_state"] = "PASS"
     goal["reconciled_at_start"] = True
     goal["reconcile_reason"] = "all slice chains PASS and close action=goal_done"
+    _sync_slices_completed(goal)
     _write_goal(goal)
     print(
         f"[trial-broker] startup reconcile {goal.get('goal')} running → done "
@@ -2912,8 +2913,63 @@ def auto_supervisor_answer(job: dict, chain: dict, *, round_n: int, block: dict)
     return answer
 
 
+def _resolve_parent_goal_id(job: dict, chain: dict) -> str | None:
+    """Real parent Goal id for a chain job, or None for a standalone chain.
+
+    Chain JSON is the SSOT: Hub may send ``type:chain-reply`` with only
+    ``slice`` + ``answer`` (no ``goal``). Falling back to the slice id would
+    create a pseudo ``goals/<slice>.json``, run ``supervisor-close-<slice>``
+    and skip the parent Goal's Hub notify (engine-obs-llm-empty-groups-v1).
+    """
+    if not isinstance(job, dict):
+        job = {}
+    if not isinstance(chain, dict):
+        chain = {}
+    slice_id = str(chain.get("slice") or job.get("slice") or "")
+    for raw in (chain.get("goal"), job.get("goal")):
+        cand = str(raw or "").strip()
+        if not cand:
+            continue
+        if cand != slice_id:
+            return cand
+        # candidate == slice: only a real Goal (run_goal_job wrote ``brief``)
+        # may be settled; never invent slice-as-goal.
+        existing = _read_goal(cand)
+        if isinstance(existing, dict) and "brief" in existing:
+            return cand
+    return None
+
+
+def _sync_slices_completed(goal: dict, extra_pass: str | None = None) -> int:
+    """Idempotently set ``metrics.slices_completed`` to the PASS-chain count.
+
+    ``extra_pass`` (the slice whose chain-reply just PASSed) counts as PASS
+    even if its chain read fails. Never lowers an already higher count, and
+    never writes the Goal (callers persist).
+    """
+    ids: list[str] = []
+    for sid in _goal_slice_ids(goal):
+        if sid not in ids:
+            ids.append(sid)
+    extra = str(extra_pass or "").strip()
+    n_pass = 0
+    for sid in ids:
+        if extra and sid == extra:
+            n_pass += 1
+        elif str((_read_chain(sid) or {}).get("state") or "") == VERDICT_PASS:
+            n_pass += 1
+    if extra and extra not in ids:
+        n_pass += 1
+    metrics = goal.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = T.empty_metrics()
+        goal["metrics"] = metrics
+    metrics["slices_completed"] = max(int(metrics.get("slices_completed") or 0), n_pass)
+    return int(metrics["slices_completed"])
+
+
 def maybe_supervisor_close(job: dict, chain: dict) -> None:
-    goal_id = job.get("goal") or chain.get("goal")
+    goal_id = _resolve_parent_goal_id(job, chain)
     if not goal_id:
         return
     if not job.get("supervisor_close", True) and not chain.get("from_goal"):
@@ -2959,9 +3015,13 @@ def maybe_supervisor_close(job: dict, chain: dict) -> None:
     gstatus = str(parsed["block"].get("goal_status") or "").strip() or (
         "done" if chain.get("state") == "PASS" else str(chain.get("state") or "failed")
     )
+    # The close ticket (and its metric bump) may have rewritten the parent.
+    goal = _read_goal(goal_id) or goal
     goal["status"] = gstatus
     goal["close_summary"] = str(summary_path)
     goal["last_chain_state"] = chain.get("state")
+    if str(chain.get("state") or "") == VERDICT_PASS:
+        _sync_slices_completed(goal, extra_pass=str(chain.get("slice") or ""))
     _write_goal(goal)
     print(f"[trial-broker] supervisor close {ticket} goal_status={gstatus}", flush=True)
     # The close is a terminal transition when it says done/failed/escalated.
@@ -4323,6 +4383,12 @@ def _execute_goal_slices(
         chain = _new_chain_state(chain_job)
         chain["from_goal"] = True
         chain["goal"] = goal_id
+        # Persist the goal-scoped knobs so a later chain-reply can restore them
+        # when Hub omits them from its reply job.
+        chain["supervisor_profile"] = chain_job.get("supervisor_profile")
+        chain["auto_supervisor_answer"] = chain_job.get("auto_supervisor_answer")
+        chain["max_supervisor_tickets"] = chain_job.get("max_supervisor_tickets")
+        chain["defer_supervisor_close"] = True
         chain["plan_ticket"] = plan_ticket
         _write_chain(chain)
         print(
@@ -4602,11 +4668,13 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         last = chain["rounds"][-1]
         prior_pack = last.get("impl_pack") or prior_pack
 
+    parent_goal_id = _resolve_parent_goal_id(job, chain)
+    parent_goal = _read_goal(parent_goal_id) if parent_goal_id else None
+
     try:
         reply_gate_findings: list = []
-        reply_goal_id = str(job.get("goal") or chain.get("goal") or "").strip()
-        if reply_goal_id:
-            reply_goal = _read_goal(reply_goal_id)
+        if parent_goal_id:
+            reply_goal = _read_goal(parent_goal_id)
             reply_gate_findings = list((reply_goal or {}).get("last_gate_findings") or [])
         reply_pack = build_reply_addendum_pack(
             slice_id=slice_id,
@@ -4642,11 +4710,120 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         "notify": chain.get("notify") or job.get("notify"),
         "notify_dry_run": chain.get("notify_dry_run") if chain.get("notify_dry_run") is not None else job.get("notify_dry_run"),
         "notify_prefix": chain.get("notify_prefix") or job.get("notify_prefix"),
-        "goal": job.get("goal") or slice_id,
+        "goal": parent_goal_id,
     }
-    return run_chain_rounds(
+    if parent_goal_id:
+        resume_job["from_goal"] = True
+        if chain.get("supervisor_profile") is not None:
+            resume_job["supervisor_profile"] = chain.get("supervisor_profile")
+        elif parent_goal and parent_goal.get("supervisor_profile") is not None:
+            resume_job["supervisor_profile"] = parent_goal.get("supervisor_profile")
+        if chain.get("auto_supervisor_answer") is not None:
+            resume_job["auto_supervisor_answer"] = chain.get("auto_supervisor_answer")
+        if chain.get("max_supervisor_tickets") is not None:
+            resume_job["max_supervisor_tickets"] = chain.get("max_supervisor_tickets")
+        elif parent_goal and parent_goal.get("max_supervisor_tickets") is not None:
+            resume_job["max_supervisor_tickets"] = parent_goal.get("max_supervisor_tickets")
+        # Close the parent exactly once, after _settle checks all slices.
+        resume_job["defer_supervisor_close"] = True
+    rc = run_chain_rounds(
         resume_job, chain, dest, start_round=next_round, start_pack=reply_pack
     )
+    if parent_goal_id:
+        return _settle_parent_goal_after_resume(
+            parent_goal_id, resume_job, slice_id, dest, rc
+        )
+    return rc
+
+
+def _settle_parent_goal_after_resume(
+    goal_id: str, job: dict, slice_id: str, dest: Path, rc: int
+) -> int:
+    """Fold a resumed chain's terminal state onto its parent Goal + notify.
+
+    A chain-reply / goal-update resume must never leave the parent stuck at
+    ``awaiting_supervisor`` with zero completed slices and no Hub notify: the
+    Hub only learns about completion from the parent Goal terminal event.
+    """
+    chain = _read_chain(slice_id) or {}
+    state = str(chain.get("state") or "")
+    goal = _read_goal(goal_id)
+    if goal is None:
+        return rc
+
+    if state == VERDICT_PASS:
+        goal["last_chain_state"] = VERDICT_PASS
+        _sync_slices_completed(goal, extra_pass=slice_id)
+        _write_goal(goal)
+        specs = _slice_specs_from_plan(goal)
+        ids = [str(s.get("slice")) for s in specs] if specs else _goal_slice_ids(goal)
+        seen: list[str] = []
+        for sid in ids:
+            if sid and sid not in seen:
+                seen.append(sid)
+        pending = [
+            sid
+            for sid in seen
+            if str((_read_chain(sid) or {}).get("state") or "") != VERDICT_PASS
+        ]
+        if pending:
+            if all(_read_chain(sid) is None for sid in pending):
+                # Planned slices exist but none has started: continue the Goal
+                # without re-running the slice that just PASSed.
+                print(
+                    f"[trial-broker] goal {goal_id} resume PASS {slice_id}; "
+                    f"continuing planned slices {pending}",
+                    flush=True,
+                )
+                return _execute_goal_slices(
+                    goal,
+                    _resume_job_from_goal(goal),
+                    specs,
+                    dest,
+                    on_slice_fail="stop",
+                    plan_ticket=chain.get("plan_ticket"),
+                    skip_passed=True,
+                )
+            print(
+                f"[trial-broker] goal {goal_id} resume PASS {slice_id} but "
+                f"pending slices {pending} already have non-PASS chains; "
+                "not auto re-running",
+                flush=True,
+            )
+            _notify_goal_terminal(goal_id)
+            return rc
+        try:
+            maybe_supervisor_close(job, chain)
+        except Exception as e:  # noqa: BLE001 — close best-effort
+            print(f"[trial-broker] supervisor close error: {e}", flush=True)
+        # Dedupe-safe belt-and-braces: maybe_supervisor_close already notifies
+        # when its close says done/failed/escalated.
+        _notify_goal_terminal(goal_id)
+        return rc
+
+    if state in ("failed", "escalated", "cancelled", "closeout"):
+        goal = _read_goal(goal_id) or goal
+        goal["status"] = state
+        goal["last_chain_state"] = state
+        if state == "failed":
+            goal["error"] = str(chain.get("error") or goal.get("error") or "")
+        if state == "escalated":
+            goal["escalate_reason"] = str(
+                chain.get("escalate_reason") or goal.get("escalate_reason") or ""
+            )
+        if chain.get("handoff_summary"):
+            goal["handoff_summary"] = chain["handoff_summary"]
+        if chain.get("closeout_note"):
+            goal["closeout_note"] = chain["closeout_note"]
+        _write_goal(goal)
+        _notify_goal_terminal(goal_id)
+        return rc
+
+    # awaiting_supervisor again / running: the awaiting-hub notify already
+    # fired inside run_chain_rounds; just keep the parent's chain state fresh.
+    goal["last_chain_state"] = state
+    _write_goal(goal)
+    return rc
 
 
 def _ticket_goal_terminal(goal_id: str | None, status: str, *, reason: str = "") -> None:
@@ -5198,6 +5375,7 @@ def _close_goal_as_done(
     goal["updated_at"] = _iso()
     # Clear residual escalate markers so status/report stay coherent.
     goal.pop("escalate_reason", None)
+    _sync_slices_completed(goal)
     _write_goal(goal)
 
 
@@ -5371,6 +5549,7 @@ def _resume_goal_chain(goal: dict) -> int:
         "goal": goal_id,
         "from_goal": True,
         "auto_supervisor_answer": True,
+        "defer_supervisor_close": True,
     }
     chain["state"] = "running"
     _write_chain(chain)
@@ -5378,7 +5557,10 @@ def _resume_goal_chain(goal: dict) -> int:
         f"[trial-broker] goal {goal_id} resume chain {slice_id} r{start_round} pack={start_pack}",
         flush=True,
     )
-    return run_chain_rounds(resume_job, chain, dest, start_round=start_round, start_pack=start_pack)
+    rc = run_chain_rounds(
+        resume_job, chain, dest, start_round=start_round, start_pack=start_pack
+    )
+    return _settle_parent_goal_after_resume(goal_id, resume_job, slice_id, dest, rc)
 
 
 def run_job(path: Path) -> int:

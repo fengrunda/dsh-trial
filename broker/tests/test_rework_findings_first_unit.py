@@ -245,6 +245,176 @@ def test_chain_escalates_dirty_done_at_max_rounds(tmp_path):
     assert notify.called
 
 
+# --- Change ②: run_ticket_job uses the same guard ---------------------------
+
+def _run_ticket(tmp_path, *, blocks, max_rounds=2, goal_findings=None, goal_extra=None):
+    """Drive run_ticket_job with a goal-mapped single ticket.
+
+    ``blocks`` is one summary JSON block per impl round; the fake
+    ``run_open_slice`` writes the matching summary file.
+    """
+    patch, d = _dirs(tmp_path)
+    slice_id = "ticket-slice"
+    pack_name = f"{slice_id}.pack.md"
+    (d["packs"] / pack_name).write_text(
+        f"---\nslice_id: {slice_id}\n---\n# intent\n", encoding="utf-8"
+    )
+    goal_id = "ticket-goal"
+    goal = {
+        "goal": goal_id,
+        "status": "running",
+        "slices": [slice_id],
+        "profile": "acp-lite",
+        "notify": "hub",
+        "metrics": {},
+        "last_gate_findings": goal_findings if goal_findings is not None else [
+            {"tier": "P1", "file": "a.py", "issue": "missing docstring"}
+        ],
+    }
+    goal.update(goal_extra or {})
+    (d["goals"] / f"{goal_id}.json").write_text(json.dumps(goal), encoding="utf-8")
+
+    job = {
+        "id": "job-ticket-1",
+        "ticket": "impl-trial-ticket-1",
+        "pack": pack_name,
+        "profile": "acp-lite",
+        "cwd": str(tmp_path),
+        "role": "impl",
+        "summary_name": "ticket-slice-impl",
+        "goal": goal_id,
+        "max_rounds": max_rounds,
+        "notify": "hub",
+    }
+    job_path = tmp_path / "job-ticket-1.json"
+    job_path.write_text("{}", encoding="utf-8")
+
+    modes: list[str] = []
+    packs: list[str] = []
+
+    def fake_open_slice(**kwargs):
+        modes.append(kwargs["prompt_mode"])
+        packs.append(kwargs["pack_name"])
+        summary = d["summaries"] / f"{kwargs['summary_name']}.md"
+        kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["log_path"].write_text("log\n", encoding="utf-8")
+        idx = len(modes) - 1
+        block = blocks[idx] if idx < len(blocks) else {"status": "done"}
+        _write_summary(summary, block)
+        return 0
+
+    def fake_artifacts(job, log_path, summary_path, ec, ticket=None):
+        return {"ticket": ticket or job.get("ticket"), "exit_code": ec,
+                "assert_clean": True, "composition": None,
+                "summary_exists": summary_path.is_file()}
+
+    notify_mock = mock.MagicMock()
+    with patch, \
+            mock.patch.object(tb, "run_open_slice", side_effect=fake_open_slice), \
+            mock.patch.object(tb, "write_artifacts", side_effect=fake_artifacts), \
+            mock.patch.object(tb, "maybe_notify_hub", return_value={"sent": False}), \
+            mock.patch.object(tb, "maybe_offload_gc", return_value=None), \
+            mock.patch.object(tb, "_notify_goal_terminal", notify_mock):
+        rc = tb.run_ticket_job(job_path, job)
+    state = json.loads((d["goals"] / f"{goal_id}.json").read_text(encoding="utf-8"))
+    return rc, state, modes, packs, notify_mock
+
+
+def test_ticket_opens_fresh_fix_ticket_on_dirty_done(tmp_path):
+    rc, state, modes, packs, notify = _run_ticket(
+        tmp_path,
+        max_rounds=2,
+        blocks=[
+            {"status": "done", "changed_files": ["a.py"], "notes": "no handoff"},
+            {"status": "done", "changed_files": ["a.py"], "finding_resolutions": [
+                {"finding": "missing docstring", "change": "a.py:1", "status": "fixed"}
+            ]},
+        ],
+    )
+    assert rc == 0, rc
+    # Round 1 dirty done must not be treated as a clean PASS: a findings-first
+    # fix ticket (foreman prompt) is scheduled for round 2.
+    assert modes == ["baseline", "foreman"], modes
+    assert "fix-r2" in packs[1], packs
+    assert state["status"] == "done"
+    assert notify.called
+
+
+def test_ticket_escalates_dirty_done_at_max_rounds(tmp_path):
+    rc, state, modes, _packs, notify = _run_ticket(
+        tmp_path,
+        max_rounds=1,
+        blocks=[{"status": "done", "changed_files": ["a.py"], "notes": "no handoff"}],
+    )
+    assert rc == 1, rc
+    assert modes == ["baseline"], modes
+    assert state["status"] == "escalated"
+    assert "unresolved P0/P1" in state["escalate_reason"]
+    assert "pending_rework_mode" not in state
+    assert notify.called
+
+
+def test_ticket_rework_fresh_handoff_schedules_fix(tmp_path):
+    rc, state, modes, packs, _notify = _run_ticket(
+        tmp_path,
+        max_rounds=2,
+        blocks=[
+            {"status": "done", "notes": "handoff rework_fresh"},
+            {"status": "done", "finding_resolutions": [
+                {"finding": "missing docstring", "change": "a.py:1", "status": "fixed"}
+            ]},
+        ],
+    )
+    assert rc == 0, rc
+    assert modes == ["baseline", "foreman"], modes
+    assert "fix-r2" in packs[1], packs
+    assert state["status"] == "done"
+
+
+def test_ticket_pending_rework_mode_fresh_schedules_fix(tmp_path):
+    rc, state, modes, packs, _notify = _run_ticket(
+        tmp_path,
+        max_rounds=2,
+        goal_extra={"pending_rework_mode": "fresh"},
+        blocks=[
+            {"status": "done", "notes": "inplace"},
+            {"status": "done", "finding_resolutions": [
+                {"finding": "missing docstring", "change": "a.py:1", "status": "fixed"}
+            ]},
+        ],
+    )
+    assert rc == 0, rc
+    assert modes == ["baseline", "foreman"], modes
+    assert "fix-r2" in packs[1], packs
+    assert state["status"] == "done"
+
+
+def test_ticket_clean_done_needs_no_fix(tmp_path):
+    rc, state, modes, _packs, notify = _run_ticket(
+        tmp_path,
+        max_rounds=2,
+        goal_findings=[],
+        blocks=[{"status": "done", "changed_files": ["a.py"]}],
+    )
+    assert rc == 0, rc
+    assert modes == ["baseline"], modes
+    assert state["status"] == "done"
+    assert notify.called
+
+
+def test_ticket_load_job_carries_max_rounds(tmp_path):
+    packs = tmp_path / "packs"
+    packs.mkdir()
+    job_path = tmp_path / "j.json"
+    job_path.write_text(json.dumps({
+        "ticket": "impl-t", "pack": "t.pack.md", "profile": "acp-lite",
+        "cwd": str(tmp_path), "max_rounds": 3,
+    }), encoding="utf-8")
+    job = tb.load_job(job_path)
+    assert job["max_rounds"] == 3
+    assert job["type"] == "ticket"
+
+
 # --- Change ②: mailbox instruction + foreman prompt -------------------------
 
 def test_mailbox_fresh_instruction_matches_new_fix_ticket():

@@ -155,3 +155,110 @@ def test_maybe_supervisor_close_notifies_on_done(tmp_path):
                               side_effect=lambda gid: notified.append(gid)):
         tb.maybe_supervisor_close(job, chain)
     assert notified == ["g1"]
+
+
+# --- run_ticket_job terminal exits ------------------------------------------
+
+def _ticket_job(root: Path) -> tuple[Path, dict]:
+    job = {
+        "id": "job-ticket-1", "ticket": "impl-trial-1", "pack": "g1-s1.pack.md",
+        "profile": "acp-lite", "cwd": str(root), "role": "impl",
+        "summary_name": "g1-s1-impl", "goal": "g1", "notify": "hub",
+    }
+    job_path = root / "job-ticket-1.json"
+    job_path.write_text("{}", encoding="utf-8")
+    return job_path, job
+
+
+def test_run_ticket_job_missing_pack_notifies_goal(tmp_path):
+    patch, d = _dirs(tmp_path)
+    _goal(d["goals"] / "g1.json", status="running")
+    job_path, job = _ticket_job(tmp_path)
+    notified: list[str] = []
+    with patch, \
+            mock.patch.object(tb, "_notify_goal_terminal",
+                              side_effect=lambda gid: notified.append(gid)):
+        rc = tb.run_ticket_job(job_path, job)
+    assert rc == 1
+    assert notified == ["g1"]
+    assert json.loads((d["goals"] / "g1.json").read_text())["status"] == "failed"
+
+
+def test_run_ticket_job_failed_ticket_notifies_goal(tmp_path):
+    patch, d = _dirs(tmp_path)
+    _goal(d["goals"] / "g1.json", status="running")
+    (d["packs"] / "g1-s1.pack.md").write_text(
+        "---\nslice_id: g1-s1\n---\n# intent\n", encoding="utf-8"
+    )
+    job_path, job = _ticket_job(tmp_path)
+    notified: list[str] = []
+    with patch, \
+            mock.patch.object(tb, "run_open_slice", return_value=1), \
+            mock.patch.object(tb, "write_artifacts", return_value={"ticket": "impl-trial-1"}), \
+            mock.patch.object(tb, "maybe_offload_gc", return_value=None), \
+            mock.patch.object(tb, "_notify_goal_terminal",
+                              side_effect=lambda gid: notified.append(gid)):
+        rc = tb.run_ticket_job(job_path, job)
+    assert rc == 1
+    assert notified == ["g1"]
+    goal = json.loads((d["goals"] / "g1.json").read_text())
+    assert goal["status"] == "failed"
+    assert goal["error"]
+
+
+def test_run_ticket_job_clean_done_notifies_goal(tmp_path):
+    patch, d = _dirs(tmp_path)
+    _goal(d["goals"] / "g1.json", status="running")
+    (d["packs"] / "g1-s1.pack.md").write_text(
+        "---\nslice_id: g1-s1\n---\n# intent\n", encoding="utf-8"
+    )
+    job_path, job = _ticket_job(tmp_path)
+
+    def fake_open_slice(**kwargs):
+        sp = d["summaries"] / f"{kwargs['summary_name']}.md"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text('```json\n{"status": "done"}\n```\n', encoding="utf-8")
+        return 0
+
+    notified: list[str] = []
+    with patch, \
+            mock.patch.object(tb, "run_open_slice", side_effect=fake_open_slice), \
+            mock.patch.object(tb, "write_artifacts", return_value={"ticket": "impl-trial-1"}), \
+            mock.patch.object(tb, "maybe_offload_gc", return_value=None), \
+            mock.patch.object(tb, "_notify_goal_terminal",
+                              side_effect=lambda gid: notified.append(gid)):
+        rc = tb.run_ticket_job(job_path, job)
+    assert rc == 0
+    assert notified == ["g1"]
+    assert json.loads((d["goals"] / "g1.json").read_text())["status"] == "done"
+
+
+def test_run_ticket_job_non_goal_keeps_ticket_notify(tmp_path):
+    patch, d = _dirs(tmp_path)
+    (d["packs"] / "x.pack.md").write_text(
+        "---\nslice_id: x\n---\n# intent\n", encoding="utf-8"
+    )
+    job = {"id": "j1", "ticket": "impl-x", "pack": "x.pack.md", "profile": "acp-lite",
+           "cwd": str(tmp_path), "role": "impl", "summary_name": "x-impl",
+           "notify": "hub"}
+    job_path = tmp_path / "j1.json"
+    job_path.write_text("{}", encoding="utf-8")
+
+    def fake_open_slice(**kwargs):
+        sp = d["summaries"] / f"{kwargs['summary_name']}.md"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text('```json\n{"status": "done"}\n```\n', encoding="utf-8")
+        return 0
+
+    sent: list[int] = []
+    with patch, \
+            mock.patch.object(tb, "run_open_slice", side_effect=fake_open_slice), \
+            mock.patch.object(tb, "write_artifacts", return_value={"ticket": "impl-x"}), \
+            mock.patch.object(tb, "maybe_offload_gc", return_value=None), \
+            mock.patch.object(tb, "maybe_notify_hub",
+                              side_effect=lambda *a, **k: sent.append(1) or {"sent": True}), \
+            mock.patch.object(tb, "_notify_goal_terminal") as goal_notify:
+        rc = tb.run_ticket_job(job_path, job)
+    assert rc == 0
+    assert sent == [1]
+    assert not goal_notify.called

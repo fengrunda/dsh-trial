@@ -405,6 +405,8 @@ def load_job(path: Path) -> dict:
         "cwd": _job_cwd(data, path),
         "role": data.get("role"),
         "summary_name": data.get("summary_name") or data.get("summary"),
+        # Single-ticket job owns its own findings-first rework budget.
+        "max_rounds": int(data.get("max_rounds") or 2),
     }
     if job["profile"] not in ("acp", "acp-lite", "acp-trial", "acp-lite-trial"):
         raise ValueError(f"profile must be acp|acp-lite|*-trial, got {job['profile']!r}")
@@ -4255,10 +4257,42 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
     )
 
 
+def _ticket_goal_terminal(goal_id: str | None, status: str, *, reason: str = "") -> None:
+    """Settle a standalone ticket job's mapped Goal and wake Hub exactly once.
+
+    ``run_ticket_job`` is not chain-owned, so a Goal mapped onto a single
+    ticket must update its own status (done / failed / escalated) and notify
+    with the same ``goal`` / ``status`` / ``reason`` / ``suggested_action``
+    payload the chain terminal paths use. ``_notify_goal_terminal`` dedupes and
+    owns the payload, so callers only persist the status transition.
+    """
+    if not goal_id:
+        return
+    goal = _read_goal(goal_id)
+    if goal is not None:
+        goal["status"] = status
+        if status == "done":
+            goal["last_chain_state"] = VERDICT_PASS
+            goal["error"] = ""
+        else:
+            goal["last_chain_state"] = status
+            if status == "escalated":
+                goal["escalate_reason"] = reason or str(goal.get("escalate_reason") or "")
+            else:
+                goal["error"] = reason or str(goal.get("error") or "")
+            goal.pop("pending_rework_mode", None)
+            goal.pop("pending_rework_ask_id", None)
+        _write_goal(goal)
+    _notify_goal_terminal(goal_id)
+
+
 def run_ticket_job(path: Path, job: dict) -> int:
     dest = PROCESSING / f"{_stamp()}-{path.name}"
     shutil.move(str(path), str(dest))
     print(f"[trial-broker] processing {dest.name} ticket={job['ticket']}", flush=True)
+
+    goal_id = str(job.get("goal") or "").strip()
+    goal_obj = _read_goal(goal_id) if goal_id else None
 
     pack_name = Path(job["pack"]).name
     pack_abs = PACKS / pack_name
@@ -4270,9 +4304,10 @@ def run_ticket_job(path: Path, job: dict) -> int:
             json.dumps({"error": err, "job": job, "at": _iso()}, ensure_ascii=False, indent=2)
         )
         shutil.move(str(dest), str(FAILED / dest.name))
+        # Missing pack is terminal for a mapped Goal: never leave Hub blind.
+        _ticket_goal_terminal(goal_id, "failed", reason=err)
         return 1
 
-    log_path = ARTIFACT_ROOT / f"{job['ticket']}.log"
     role = job.get("role")
     if not role:
         t = job["ticket"]
@@ -4280,41 +4315,174 @@ def run_ticket_job(path: Path, job: dict) -> int:
             role = "gate"
         else:
             role = "impl"
-    summary_name = job.get("summary_name") or pack_name.replace(".pack.md", "")
-    ec = run_open_slice(
-        ticket=job["ticket"],
-        pack_name=pack_name,
-        profile=job["profile"],
-        cwd=job["cwd"],
-        role=str(role),
-        summary_name=str(summary_name),
-        prompt_mode="baseline",
-        log_path=log_path,
-    )
+    base_summary = str(job.get("summary_name") or pack_name.replace(".pack.md", ""))
+    slice_id = str(job.get("slice") or Path(pack_name).name.replace(".pack.md", "") or "ticket")
+    original_pack = pack_name
+    max_rounds = int(job.get("max_rounds") or (goal_obj or {}).get("max_rounds") or 2)
+    if max_rounds < 1:
+        max_rounds = 1
 
-    summary_path = SUMMARIES / f"{summary_name}.md"
-    result = write_artifacts({**job, "role": role}, log_path, summary_path, ec)
+    pack_for_impl = pack_name
+    round_n = 1
+    rounds: list[dict] = []
+    status = "failed"
+    reason = ""
+    ec = 1
+    summary_path = SUMMARIES / f"{base_summary}.md"
+    result: dict = {}
+
+    while True:
+        ticket = job["ticket"] if round_n == 1 else f"{job['ticket']}-fix-r{round_n}"
+        summary_name = base_summary if round_n == 1 else f"{slice_id}-impl-r{round_n}"
+        log_path = ARTIFACT_ROOT / f"{ticket}.log"
+        round_summary = SUMMARIES / f"{summary_name}.md"
+        ec = run_open_slice(
+            ticket=ticket,
+            pack_name=pack_for_impl,
+            profile=job["profile"],
+            cwd=job["cwd"],
+            role=str(role),
+            summary_name=str(summary_name),
+            prompt_mode="baseline" if round_n == 1 else "foreman",
+            log_path=log_path,
+            goal=goal_obj,
+        )
+        result = write_artifacts(
+            {**job, "ticket": ticket, "role": role},
+            log_path,
+            round_summary,
+            ec,
+            ticket=ticket,
+        )
+        summary_path = round_summary
+        # The mailbox watcher may have stored fresh gate findings on the Goal
+        # while the ticket was running; reload before judging completion.
+        if goal_id:
+            goal_obj = _read_goal(goal_id) or goal_obj
+        parsed = _parse_foreman_summary(round_summary)
+        block = parsed.get("block") or {}
+        # The guard is about impl completion: gate/review tickets keep their
+        # historical treatment and are never turned into an impl fix ticket.
+        if str(role) == "impl":
+            completion = decide_impl_completion(block, goal_obj)
+        else:
+            completion = {
+                "action": "clean_done",
+                "findings": [],
+                "reason": f"non-impl ticket role={role}",
+                "mode": "",
+            }
+        round_rec = {
+            "round": round_n,
+            "ticket": ticket,
+            "pack": pack_for_impl,
+            "exit": ec,
+            "summary": str(round_summary),
+            "status": block.get("status"),
+            "artifacts": result,
+        }
+        rounds.append(round_rec)
+
+        if completion["action"] != "open_fix":
+            # Clean completion only when the ticket really produced a summary.
+            if ec == 0 and round_summary.is_file():
+                status = "ok"
+                reason = ""
+                _ticket_goal_terminal(goal_id, "done")
+                break
+            status = "failed"
+            reason = str(
+                block.get("error")
+                or f"exit={ec} summary_exists={round_summary.is_file()}"
+            )
+            _ticket_goal_terminal(goal_id, "failed", reason=reason)
+            break
+
+        # Change ② — status=done (or a rework_fresh handoff) with pending P0/P1
+        # and no finding_resolutions must never be a silent PASS. Open the
+        # findings-first fix ticket now, or escalate when no round remains.
+        blocking = completion["findings"]
+        handoff = {
+            "at": _iso(),
+            "mode": completion.get("mode") or "fresh",
+            "reason": completion["reason"],
+            "findings": blocking,
+            "impl_summary": str(round_summary),
+        }
+        round_rec["rework_handoff"] = handoff
+        if round_n >= max_rounds:
+            reason = (
+                "unresolved P0/P1 at max_rounds after rework handoff: "
+                + completion["reason"]
+            )
+            status = "escalated"
+            if goal_obj is not None:
+                goal_obj = _read_goal(goal_id) or goal_obj
+                goal_obj["last_rework_handoff"] = handoff
+                _write_goal(goal_obj)
+            print(
+                f"[trial-broker] ticket {job['ticket']} ESCALATED r{round_n} "
+                f"unresolved P0/P1 ({completion['reason']})",
+                flush=True,
+            )
+            _ticket_goal_terminal(goal_id, "escalated", reason=reason)
+            break
+        try:
+            fresh_fix_pack = build_fix_pack(
+                slice_id=slice_id,
+                next_round=round_n + 1,
+                original_pack_name=original_pack,
+                gate_findings=blocking,
+                gate_summary_text="",
+            )
+        except ValueError as e:
+            reason = f"fresh fix pack build: {e}"
+            status = "failed"
+            _ticket_goal_terminal(goal_id, "failed", reason=reason)
+            break
+        round_rec["fresh_rework_fix_pack"] = fresh_fix_pack
+        pack_for_impl = fresh_fix_pack
+        if goal_obj is not None:
+            goal_obj = _read_goal(goal_id) or goal_obj
+            goal_obj["last_rework_handoff"] = handoff
+            goal_obj.pop("pending_rework_mode", None)
+            goal_obj.pop("pending_rework_ask_id", None)
+            _write_goal(goal_obj)
+        print(
+            f"[trial-broker] ticket {job['ticket']} fresh rework r{round_n} → "
+            f"fix ticket r{round_n + 1} pack={fresh_fix_pack}",
+            flush=True,
+        )
+        round_n += 1
 
     out_name = f"{_stamp()}-{job['id']}.json"
     out_path = OUTBOX / out_name
     out_body = {
-        "status": "ok" if ec == 0 and summary_path.is_file() else "failed",
+        "status": status,
         "exit_code": ec,
         "job": job,
         "summary_path": str(summary_path),
         "summary_exists": summary_path.is_file(),
         "artifacts": result,
+        "rounds": rounds,
+        "rounds_completed": len(rounds),
         "finished_at": _iso(),
         "rooms": False,
         "prod_broker_touched": False,
     }
+    if reason:
+        out_body["reason"] = reason
     notify = str(job.get("notify") or "").strip().lower()
     if notify in ("hub", "khub", "true", "1", "yes"):
-        out_body["notify"] = maybe_notify_hub(job, out_body, result)
+        if goal_id:
+            # Decision D: a mapped Goal terminal is the single Hub wake.
+            out_body["notify_skipped_reason"] = "goal_terminal_notify"
+        else:
+            out_body["notify"] = maybe_notify_hub(job, out_body, result)
     out_path.write_text(json.dumps(out_body, ensure_ascii=False, indent=2) + "\n")
     maybe_offload_gc(force=True)
 
-    if ec == 0 and summary_path.is_file():
+    if status == "ok":
         shutil.move(str(dest), str(OUTBOX / dest.name))
         print(
             f"[trial-broker] OK outbox={out_path.name} summary={summary_path} assert_clean={result.get('assert_clean')}",
@@ -4323,8 +4491,12 @@ def run_ticket_job(path: Path, job: dict) -> int:
         return 0
 
     shutil.move(str(dest), str(FAILED / dest.name))
-    print(f"[trial-broker] FAIL ec={ec} summary_exists={summary_path.is_file()} → failed/", flush=True)
-    return ec or 1
+    print(
+        f"[trial-broker] FAIL status={status} ec={ec} "
+        f"summary_exists={summary_path.is_file()} → failed/",
+        flush=True,
+    )
+    return 1 if status == "escalated" else (ec or 1)
 
 
 def _notify_kinds_since_resume(goal: dict) -> set[str]:

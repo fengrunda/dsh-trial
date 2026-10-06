@@ -36,6 +36,32 @@ def no_route_answer(ask_id: str) -> dict:
     return {"ask_id": ask_id, "ok": False, "error": "no route"}
 
 
+def gate_running_ack(
+    ask_id: str,
+    gate_ticket: str,
+    gate_timeout_sec: int,
+    started_at: str,
+    gate_log: str | None = None,
+) -> dict:
+    """Interim ``answers/<ask_id>.json`` body written before the gate runs.
+
+    Deliberately has NO ``verdict`` / ``ok`` / ``answer`` key: an old plugin that
+    accepts the first answer-shaped body would otherwise treat this as final.
+    The new plugin detects ``status == "gate_running"`` and keeps polling while
+    extending its deadline to the gate's own budget.
+    """
+    body: dict[str, Any] = {
+        "ask_id": ask_id,
+        "status": "gate_running",
+        "gate_ticket": gate_ticket,
+        "gate_timeout_sec": int(gate_timeout_sec),
+        "started_at": started_at,
+        "progress": True,
+    }
+    if gate_log is not None:
+        body["gate_log"] = str(gate_log)
+    return body
+
 
 def decide_and_answer_review(
     *,
@@ -51,6 +77,7 @@ def decide_and_answer_review(
     if verdict == "PASS":
         return "", {
             "ask_id": ask.get("ask_id"),
+            "status": "done",
             "verdict": "PASS",
             "gate_ticket": gate_ticket,
             "findings": findings,
@@ -74,6 +101,7 @@ def decide_and_answer_review(
         )
     return mode, {
         "ask_id": ask.get("ask_id"),
+        "status": "done",
         "verdict": "HOLD",
         "rework_mode": mode,
         "mode": mode,

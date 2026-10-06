@@ -1140,6 +1140,18 @@ def _notify_awaiting_hub(
         return None
 
 
+def _atomic_write_json(path: Path, body: dict) -> None:
+    """Write JSON via tmp file + os.replace so a reader never sees a partial body.
+
+    Used for the interim ``gate_running`` ack and the final gate answer written to
+    the same ``answers/<ask_id>.json`` path.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    tmp.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cwd: str, goal: dict | None) -> None:
     """Open delta gate short-ticket; write PASS/HOLD(+rework_mode) answer for submit_for_review."""
     t0 = time.monotonic()  # 处理耗时 → wait_ms / by_kind.wait_ms_total
@@ -1194,7 +1206,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
         T.write_ask_answer(ask_id, f"[error] gate pack: {e}", supervisor_ticket="(error)")
         # overwrite with structured fail
         (MAILBOX / "answers" / f"{ask_id}.json").write_text(
-            json.dumps({"ask_id": ask_id, "ok": False, "error": str(e), "verdict": "HOLD",
+            json.dumps({"ask_id": ask_id, "status": "done", "ok": False, "error": str(e), "verdict": "HOLD",
                         "rework_mode": "fresh", "instruction": "pack error — end ticket"}, ensure_ascii=False, indent=2) + "\n"
         )
         return
@@ -1202,6 +1214,20 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
     gate_ticket = f"gate-trial-{slice_id}-rev{round_n}"
     gate_summary_name = f"{slice_id}-gate-rev{round_n}"
     gate_log = ARTIFACT_ROOT / f"{gate_ticket}.log"
+    # Interim ack written BEFORE the (possibly multi-minute) gate spawn, so the
+    # plugin learns a gate is running and how long to wait. It carries no
+    # verdict/ok/answer so old clients keep polling. The final verdict below
+    # atomically overwrites this same path.
+    _atomic_write_json(
+        MAILBOX / "answers" / f"{ask_id}.json",
+        TM.gate_running_ack(
+            ask_id,
+            gate_ticket,
+            gate_job_timeout_sec(lim),
+            T.now_iso(),
+            gate_log=gate_log,
+        ),
+    )
     profile = T.map_profile((goal or {}).get("gate_profile") or (goal or {}).get("profile") or default_profile)
     gec = run_open_slice(
         ticket=gate_ticket,
@@ -1227,9 +1253,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
         ask=ask, gate_block=gblock, gate_ticket=gate_ticket, limits=lim,
     )
     (MAILBOX / "answers").mkdir(parents=True, exist_ok=True)
-    (MAILBOX / "answers" / f"{ask_id}.json").write_text(
-        json.dumps(answer, ensure_ascii=False, indent=2) + "\n"
-    )
+    _atomic_write_json(MAILBOX / "answers" / f"{ask_id}.json", answer)
     # archive pending
     try:
         arch = MAILBOX / "archive"
@@ -1341,6 +1365,22 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-gate-rev{round
     return name
 
 
+def gate_job_timeout_sec(lim: dict | None = None) -> int:
+    """Wall-clock budget for one open-slice gate job (seconds).
+
+    ``TRIAL_BROKER_JOB_TIMEOUT`` env override wins if set; otherwise it is
+    ``ask_supervisor_timeout_sec + prompt_timeout_sec + 120`` (defaults
+    600 + 3600 + 120 = 4320). The plugin must wait **at least** this long
+    (``gateTimeoutSec``) before declaring a gate answer missing: the broker only
+    writes the final ``answers/<ask_id>.json`` after the gate short-ticket
+    exits.
+    """
+    lim = lim or {}
+    ask_to = int(lim.get("ask_supervisor_timeout_sec") or 600)
+    hard = int(lim.get("prompt_timeout_sec") or T.DEFAULT_LIMITS["prompt_timeout_sec"])
+    return int(os.environ.get("TRIAL_BROKER_JOB_TIMEOUT") or 0) or (ask_to + hard + 120)
+
+
 def run_open_slice(
     *,
     ticket: str,
@@ -1378,9 +1418,8 @@ def run_open_slice(
     )
     # Job timeout must exceed the prompt hard cap. A fixed 2400s backstop
     # used to cut the slice before a still-working agent finished.
-    ask_to = int(lim.get("ask_supervisor_timeout_sec") or 600)
-    hard = int(lim.get("prompt_timeout_sec") or T.DEFAULT_LIMITS["prompt_timeout_sec"])
-    job_timeout = int(os.environ.get("TRIAL_BROKER_JOB_TIMEOUT") or 0) or (ask_to + hard + 120)
+    # Shared with the gate ack so the plugin's wait matches this budget.
+    job_timeout = gate_job_timeout_sec(lim)
     print(
         f"[trial-broker] spawn open-slice ticket={ticket} pack={pack_name} "
         f"profile={profile} role={role} mode={prompt_mode} job_timeout={job_timeout}",

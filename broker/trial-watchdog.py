@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -75,6 +76,13 @@ HOMES_ROOT = Path(
     os.environ.get("DSH_HOMES_ROOT") or (Path.home() / ".dsh-homes")
 )
 SESSION_PROJCACHE_SESSIONS = Path("storages") / "session_projcache" / "sessions"
+
+# open-slice logs carry a small header (``=== run ===``, ``DSH_HOME=``,
+# ``sessionId=``) written once at start; the rest of the file stays static until
+# the ACP prompt ends, so only the header needs sniffing.
+_LOG_SNIFF_BYTES = 64 * 1024
+_SESSION_ID_RE = re.compile(r"^sessionId=([0-9A-Za-z-]+)\s*$", re.MULTILINE)
+_DSH_HOME_RE = re.compile(r"^DSH_HOME=(\S+)", re.MULTILINE)
 
 RUNNING_GOAL_STATES = ("running", "planning", "closeout")
 STALLED_KIND = "dsh-trial-stalled"
@@ -265,12 +273,64 @@ def _newest_session_json() -> Path | None:
     return best
 
 
+def _session_json_from_log(log_path: Path) -> list[Path]:
+    """ACP session json path(s) an open-slice log header points at.
+
+    Reads at most the first ~64 KiB (any OS error → ``[]``). ``sessionId=``
+    lines are collected distinct with the newest last (an ask may run several
+    sessions); ``DSH_HOME=`` selects the role home, otherwise every
+    ``HOMES_ROOT/{impl,gate,supervisor}`` candidate that exists is kept. A log
+    without a ``sessionId=`` line (or without a readable header) yields ``[]``.
+    """
+    try:
+        with open(log_path, "rb") as fh:
+            raw = fh.read(_LOG_SNIFF_BYTES)
+        text = raw.decode("utf-8", "replace")
+    except OSError:
+        return []
+
+    ids: list[str] = []
+    for match in _SESSION_ID_RE.finditer(text):
+        sid = match.group(1)
+        if sid in ids:
+            ids.remove(sid)  # re-seen => newer occurrence, move to the end
+        ids.append(sid)
+    if not ids:
+        return []
+
+    home_match = _DSH_HOME_RE.search(text)
+    if home_match:
+        base = Path(home_match.group(1))
+        candidates = [
+            base / SESSION_PROJCACHE_SESSIONS / f"{sid}.json" for sid in ids
+        ]
+    else:
+        candidates = []
+        for sid in ids:
+            for role in ("impl", "gate", "supervisor"):
+                path = HOMES_ROOT / role / SESSION_PROJCACHE_SESSIONS / f"{sid}.json"
+                if _path_exists(path):
+                    candidates.append(path)
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        if str(cand) not in seen:
+            seen.add(str(cand))
+            out.append(cand)
+    return out
+
+
 def discover_session_outputs(work_pids: list[int]) -> dict[str, list[Path]]:
     """Best-effort map of live ticket -> candidate session/output files.
 
     Priority: cmdline ``--log`` / ``--ticket`` (open-slice default log), then
+    the ACP session json each log header points at (a static log is normal for
+    a long prompt, the session json is rewritten while the agent works), then
     open fds of the pid and its descendants (``*/sessions/*.json`` / ``*.log``),
-    then the newest session json under ``HOMES_ROOT`` when nothing exists yet.
+    then the newest session json under ``HOMES_ROOT`` as a per-key fallback
+    (only for a key that has a log but no resolvable session json) or as the
+    global fallback when nothing exists yet.
     All OS errors are swallowed; a vanished pid contributes nothing.
     """
     per_pid: list[tuple[str, list[Path]]] = []
@@ -295,6 +355,23 @@ def discover_session_outputs(work_pids: list[int]) -> dict[str, list[Path]]:
             if str(cand) not in seen:
                 seen.add(str(cand))
                 uniq.append(cand)
+        # Follow the session json the log header names (dedup, order kept).
+        for log in [c for c in list(uniq) if str(c).endswith(".log")]:
+            for sess in _session_json_from_log(log):
+                if str(sess) not in seen:
+                    seen.add(str(sess))
+                    uniq.append(sess)
+        # Per-key fallback: a blank/unreadable log header (no resolved session
+        # json) still tracks the newest HOMES_ROOT session while it is written.
+        has_json = any(str(c).endswith(".json") for c in uniq)
+        log_exists = any(
+            str(c).endswith(".log") and _path_exists(c) for c in uniq
+        )
+        if not has_json and log_exists:
+            newest = _newest_session_json()
+            if newest is not None and str(newest) not in seen:
+                seen.add(str(newest))
+                uniq.append(newest)
         per_pid.append((key, uniq))
 
     if not any(_path_exists(p) for _, cands in per_pid for p in cands):

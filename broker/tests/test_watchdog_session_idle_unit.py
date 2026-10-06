@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -292,3 +293,123 @@ def test_discover_fallback_newest_session(tmp_path):
 
 def test_output_signature_none_when_missing(tmp_path):
     assert wd.output_signature([tmp_path / "nope.log"]) is None
+
+
+# --- Fix 1-4: session-idle signature follows the ACP session json -------------
+#
+# dsh-acp-ask.py prints agent chunks only when the prompt ends, so an
+# open-slice log is written once and then stays static while a healthy long
+# ticket runs. The ACP session json is rewritten continuously, so the idle
+# signature must include it (no false `session_idle` on long tickets) while a
+# genuinely static session still trips the stall.
+
+def _proc_for(log: Path, ticket: str = "impl-x"):
+    argv = ["open-slice.sh", "--ticket", ticket, "--log", str(log)]
+    return mock.patch.multiple(
+        wd,
+        _read_proc_cmdline=mock.Mock(return_value=argv),
+        _descendant_pids=mock.Mock(return_value=[]),
+        _fd_targets=mock.Mock(return_value=[]),
+    )
+
+
+def _write_header(log: Path, dsh_home: Path | None, session_id: str | None) -> None:
+    lines = ["=== run ==="]
+    if dsh_home is not None:
+        lines.append(f"DSH_HOME={dsh_home}")
+    if session_id is not None:
+        lines.append(f"sessionId={session_id}")
+    lines.append("role=impl")
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_session_id_resolves_session_json_via_dsh_home(tmp_path):
+    patch, _ = _patch_state(tmp_path)
+    with patch:
+        home = wd.HOMES_ROOT / "impl"
+        log = wd.OPEN_SLICE_LOG_DIR / "impl-x.log"
+        _write_header(log, home, "abc")
+        expected = home / wd.SESSION_PROJCACHE_SESSIONS / "abc.json"
+        with _proc_for(log):
+            out = wd.discover_session_outputs([123])
+    assert list(out) == ["impl-x"]
+    assert expected in out["impl-x"]
+
+
+def test_session_id_session_json_rewrite_prevents_false_idle(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRIAL_WATCHDOG_SESSION_IDLE_SEC", "60")
+    patch, _ = _patch_state(tmp_path)
+    with patch:
+        home = wd.HOMES_ROOT / "impl"
+        sess = home / wd.SESSION_PROJCACHE_SESSIONS / "abc.json"
+        sess.parent.mkdir(parents=True, exist_ok=True)
+        sess.write_text("{}", encoding="utf-8")
+        os.utime(sess, ns=(1_000_000_000, 1_000_000_000))
+        log = wd.OPEN_SLICE_LOG_DIR / "impl-x.log"
+        _write_header(log, home, "abc")
+        os.utime(log, ns=(1, 1))
+        log_mtime = log.stat().st_mtime_ns
+        with _proc_for(log):
+            events, state = wd.collect_session_idle_events([123], 0.0, {})
+            assert events == []
+            # Healthy long ticket: the log stays static, the session json is
+            # rewritten while the agent works.
+            os.utime(sess, ns=(2_000_000_000, 2_000_000_000))
+            events, state = wd.collect_session_idle_events([123], 100.0, state)
+            assert log.stat().st_mtime_ns == log_mtime
+    assert events == []
+    assert state["impl-x"]["since_mono"] == 100.0
+
+
+def test_session_id_static_session_json_still_reports_idle(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRIAL_WATCHDOG_SESSION_IDLE_SEC", "60")
+    patch, _ = _patch_state(tmp_path)
+    with patch:
+        home = wd.HOMES_ROOT / "impl"
+        sess = home / wd.SESSION_PROJCACHE_SESSIONS / "abc.json"
+        sess.parent.mkdir(parents=True, exist_ok=True)
+        sess.write_text("{}", encoding="utf-8")
+        os.utime(sess, ns=(1_000_000_000, 1_000_000_000))
+        log = wd.OPEN_SLICE_LOG_DIR / "impl-x.log"
+        _write_header(log, home, "abc")
+        os.utime(log, ns=(1, 1))
+        with _proc_for(log):
+            events, state = wd.collect_session_idle_events([123], 0.0, {})
+            assert events == []
+            events, state = wd.collect_session_idle_events([123], 61.0, state)
+    assert len(events) == 1
+    assert events[0]["reason_key"] == "session_idle:impl-x"
+    assert events[0]["goal"] == "impl-x"
+
+
+def test_log_without_session_id_falls_back_to_newest(tmp_path):
+    patch, _ = _patch_state(tmp_path)
+    with patch:
+        newest = wd.HOMES_ROOT / "impl" / wd.SESSION_PROJCACHE_SESSIONS / "new.json"
+        newest.parent.mkdir(parents=True, exist_ok=True)
+        newest.write_text("{}", encoding="utf-8")
+        log = wd.OPEN_SLICE_LOG_DIR / "impl-x.log"
+        _write_header(log, wd.HOMES_ROOT / "impl", None)
+        assert wd._session_json_from_log(log) == []
+        with _proc_for(log), \
+                mock.patch.object(wd, "_newest_session_json", return_value=newest):
+            out = wd.discover_session_outputs([123])
+    assert out["impl-x"] == [log, newest]
+
+
+def test_no_dsh_home_resolves_via_homes_root_roles(tmp_path):
+    patch, _ = _patch_state(tmp_path)
+    with patch:
+        sess = wd.HOMES_ROOT / "gate" / wd.SESSION_PROJCACHE_SESSIONS / "abc.json"
+        sess.parent.mkdir(parents=True, exist_ok=True)
+        sess.write_text("{}", encoding="utf-8")
+        log = wd.OPEN_SLICE_LOG_DIR / "impl-x.log"
+        _write_header(log, None, "abc")
+        with _proc_for(log):
+            out = wd.discover_session_outputs([123])
+        assert sess in out["impl-x"]
+        assert wd._session_json_from_log(log) == [sess]
+
+
+def test_session_json_from_log_missing_file_is_empty(tmp_path):
+    assert wd._session_json_from_log(tmp_path / "nope.log") == []

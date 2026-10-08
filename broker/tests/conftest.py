@@ -63,6 +63,9 @@ _GUARDED_ATTRS = frozenset(
         "LIMITS_PATH",
         "ROUTES_PATH",
         "HOMES_ROOT",
+        # T1 slot-isolated role homes: default is <HOMES_ROOT>/trial-slots, so
+        # an unpatched constant pointing at the real ~/.dsh-homes is a bug.
+        "SLOT_HOMES_ROOT",
     }
 )
 

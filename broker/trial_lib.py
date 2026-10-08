@@ -42,6 +42,9 @@ DEFAULT_LIMITS = {
     # Soft reference for impl/foreman prompt discipline (default 30).
     # NOT a hard kill: no reliable mid-ticket hook yet; do not bare-kill.
     "impl_max_steps": 30,
+    # How many Goal jobs the broker may run at once. T1 only publishes the
+    # resolution helper (heartbeat + tests); the T2 scheduler consumes it.
+    "max_concurrent_goals": 2,
 }
 
 # Product profiles → trial profiles (ask_supervisor installed only here)
@@ -113,6 +116,29 @@ def save_global_limits(limits: dict) -> Path:
     LIMITS_PATH.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
     return LIMITS_PATH
 
+
+# T2 scheduler knob: how many Goal jobs may run concurrently. Env wins over
+# limits.json so an operator can widen/narrow a running box without editing it.
+MAX_CONCURRENT_GOALS_ENV = "TRIAL_BROKER_MAX_CONCURRENT_GOALS"
+
+
+def max_concurrent_goals(limits: dict | None = None) -> int:
+    """Resolve the concurrency cap: env > limits.json > DEFAULT_LIMITS (2).
+
+    Anything unparsable or non-positive falls back to the default, so a typo can
+    never wedge the broker into "run nothing".
+    """
+    default = int(DEFAULT_LIMITS["max_concurrent_goals"])
+    raw = os.environ.get(MAX_CONCURRENT_GOALS_ENV)
+    if raw is None or str(raw).strip() == "":
+        if limits is None:
+            limits = load_global_limits()
+        raw = (limits or {}).get("max_concurrent_goals")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 
 # Box limits.json written before idle timeouts pinned this whole-prompt wall.

@@ -92,11 +92,14 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 from zoneinfo import ZoneInfo
 import threading
 import trial_lib as T
@@ -137,6 +140,10 @@ HEARTBEAT = Path(
 )
 OFFLOAD_GC = DSH_HOME / "bin" / "dsh-offload-gc.py"
 _LAST_OFFLOAD_GC_TS = 0.0
+# T1: several threads (main loop + one mailbox watcher per running slice) touch
+# the heartbeat file and the offload-GC timestamp concurrently.
+_HEARTBEAT_LOCK = threading.Lock()
+_OFFLOAD_GC_LOCK = threading.Lock()
 
 # Pack / diff caps (align with dsh-design-pack default 12288)
 MAX_PACK_BYTES = int(os.environ.get("TRIAL_MAX_PACK_BYTES", "12288"))
@@ -164,6 +171,407 @@ def _stamp() -> str:
     return _now().strftime("%Y%m%d-%H%M%S")
 
 
+# ---------------------------------------------------------------------------
+# T1 concurrency prerequisites: per-thread Goal/slot context, the active-Goal
+# registry, slot-isolated role homes and goal-tagged logging.
+#
+# T2 (scheduler: dispatch / queue / restart-resume / drain) builds on these.
+# ---------------------------------------------------------------------------
+SLOT_HOMES_ENV = "DSH_TRIAL_SLOT_HOMES_ROOT"
+# Default ~/.dsh-homes/trial-slots, derived from HOMES_ROOT so a test that
+# points DSH_HOMES_ROOT at a tmp tree stays fully isolated.
+SLOT_HOMES_ROOT = Path(os.environ.get(SLOT_HOMES_ENV) or (HOMES_ROOT / "trial-slots"))
+SLOT_ROLES = ("impl", "gate", "supervisor")
+
+_CTX = threading.local()
+
+# --- T2 drain ---------------------------------------------------------------
+# SIGTERM flips the broker into drain: no new job is dispatched and no new
+# open-slice is spawned, in-flight tickets keep running to their boundary, and
+# the process exits 0 once every worker is gone. That removes the "catch the
+# window between tickets" dance from stop.sh.
+DRAIN_POLL_SEC = 0.1
+
+
+class BrokerDraining(Exception):
+    """Raised when a ticket would be spawned while the broker is draining.
+
+    Callers must let it propagate: the Goal stays non-terminal, its processing
+    job is not moved and no terminal notification is sent, so the next broker
+    start resumes exactly here.
+    """
+
+
+_DRAIN_LOCK = threading.Lock()
+_DRAIN = threading.Event()
+
+
+def draining() -> bool:
+    """True once SIGTERM (or a test) asked the broker to drain."""
+    return _DRAIN.is_set()
+
+
+def request_drain() -> bool:
+    """Enter drain mode. Returns True on the first call, False afterwards."""
+    with _DRAIN_LOCK:
+        if _DRAIN.is_set():
+            return False
+        _DRAIN.set()
+        return True
+
+
+def clear_drain() -> None:
+    """Forget drain mode (``--once`` and unit tests; never used by a live run)."""
+    with _DRAIN_LOCK:
+        _DRAIN.clear()
+
+
+def _install_signal_handlers() -> None:
+    """SIGTERM → drain; a second SIGTERM or any SIGINT → exit immediately."""
+
+    def _on_term(signum, _frame):  # noqa: ANN001 - signal handler
+        if request_drain():
+            print(
+                f"[trial-broker] SIGTERM({signum}): draining — no new jobs or "
+                "open-slices; in-flight tickets finish (send TERM again to exit now)",
+                flush=True,
+            )
+            return
+        print("[trial-broker] second SIGTERM: exiting immediately", flush=True)
+        os._exit(0)
+
+    def _on_int(signum, _frame):  # noqa: ANN001 - signal handler
+        print(f"[trial-broker] SIGINT({signum}): exiting immediately", flush=True)
+        os._exit(130)
+
+    for signum, handler in ((signal.SIGTERM, _on_term), (signal.SIGINT, _on_int)):
+        try:
+            signal.signal(signum, handler)
+        except (ValueError, OSError):  # non-main thread / unsupported platform
+            pass
+
+
+def current_goal_id() -> str | None:
+    """Goal id bound to the calling thread (None in legacy single-ticket mode)."""
+    gid = getattr(_CTX, "goal", None)
+    return str(gid) if gid else None
+
+
+def current_slot() -> int | None:
+    """Slot number bound to the calling thread (None = legacy shared homes)."""
+    slot = getattr(_CTX, "slot", None)
+    if slot is None:
+        return None
+    try:
+        return int(slot)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_slot(slot: int | None = None, job: dict | None = None) -> int | None:
+    """Explicit slot > ``job["slot"]`` > thread context > None (legacy behaviour).
+
+    ``None`` means "do not set DSH_HOMES_ROOT": the old single-Goal layout.
+    """
+    if slot is None and isinstance(job, dict):
+        slot = job.get("slot")
+    if slot is None:
+        return current_slot()
+    try:
+        return int(slot)
+    except (TypeError, ValueError):
+        return None
+
+
+@contextmanager
+def goal_context(goal_id: str | None = None, slot: int | None = None) -> Iterator[None]:
+    """Bind ``(goal, slot)`` to the current thread; nested scopes inherit.
+
+    A child thread does *not* inherit thread-local state automatically, so
+    callers that start helper threads (mailbox watcher) re-enter this context
+    from the captured parent values.
+    """
+    prev = (getattr(_CTX, "goal", None), getattr(_CTX, "slot", None))
+    _CTX.goal = str(goal_id) if goal_id else None
+    if slot is not None:
+        _CTX.slot = resolve_slot(slot)
+    try:
+        yield
+    finally:
+        _CTX.goal, _CTX.slot = prev
+
+
+# goal_id -> {slot, cwd, ticket, started_at, phase, slices, current_slice}
+_ACTIVE_GOALS_LOCK = threading.RLock()
+ACTIVE_GOALS: dict[str, dict] = {}
+
+
+def register_active_goal(
+    goal_id: str,
+    *,
+    slot: int | None = None,
+    cwd: str | None = None,
+    ticket: str | None = None,
+    phase: str = "running",
+    slices: list[str] | None = None,
+    current_slice: str | None = None,
+) -> dict:
+    """Mark a Goal as live (idempotent; keeps the original ``started_at``)."""
+    gid = str(goal_id or "")
+    if not gid:
+        return {}
+    rec = {
+        "slot": resolve_slot(slot),
+        "cwd": str(cwd or ""),
+        "ticket": str(ticket or ""),
+        "started_at": _iso(),
+        "phase": str(phase or "running"),
+        "slices": [str(s) for s in (slices or [])],
+        "current_slice": str(current_slice or ""),
+    }
+    with _ACTIVE_GOALS_LOCK:
+        prev = ACTIVE_GOALS.get(gid) or {}
+        if prev.get("started_at"):
+            rec["started_at"] = prev["started_at"]
+        ACTIVE_GOALS[gid] = rec
+    print(
+        f"[trial-broker] active goal registered goal={gid} slot={rec['slot']} phase={rec['phase']}",
+        flush=True,
+    )
+    return dict(rec)
+
+
+def unregister_active_goal(goal_id: str) -> None:
+    gid = str(goal_id or "")
+    with _ACTIVE_GOALS_LOCK:
+        ACTIVE_GOALS.pop(gid, None)
+
+
+def update_active_goal(goal_id: str, **fields) -> dict | None:
+    """Patch a live Goal record (no-op + None when it is not registered)."""
+    gid = str(goal_id or "")
+    with _ACTIVE_GOALS_LOCK:
+        rec = ACTIVE_GOALS.get(gid)
+        if rec is None:
+            return None
+        rec.update(fields)
+        return dict(rec)
+
+
+def active_goals_snapshot() -> list[dict]:
+    """Copy of the registry, shaped for the heartbeat (per-Goal slot rows)."""
+    with _ACTIVE_GOALS_LOCK:
+        items = sorted(ACTIVE_GOALS.items())
+        return [
+            {
+                "slot": rec.get("slot"),
+                "goal": gid,
+                "cwd": rec.get("cwd"),
+                "ticket": rec.get("ticket"),
+                "phase": rec.get("phase"),
+                "started_at": rec.get("started_at"),
+                "slices": list(rec.get("slices") or []),
+                "current_slice": rec.get("current_slice") or "",
+            }
+            for gid, rec in items
+        ]
+
+
+def active_goal_count() -> int:
+    with _ACTIVE_GOALS_LOCK:
+        return len(ACTIVE_GOALS)
+
+
+@contextmanager
+def active_goal_scope(
+    goal_id: str,
+    *,
+    slot: int | None = None,
+    cwd: str | None = None,
+    ticket: str | None = None,
+    phase: str = "running",
+) -> Iterator[None]:
+    """Register the Goal for this job and unregister it only if we registered it.
+
+    Keeps a nested/overlapping goal-update job from dropping a Goal that its own
+    plan job still owns.
+    """
+    gid = str(goal_id or "")
+    owner = False
+    if gid:
+        with _ACTIVE_GOALS_LOCK:
+            owner = gid not in ACTIVE_GOALS
+        if owner:
+            register_active_goal(gid, slot=slot, cwd=cwd, ticket=ticket, phase=phase)
+    try:
+        yield
+    finally:
+        if owner:
+            unregister_active_goal(gid)
+
+
+_orig_print = print
+
+
+def goal_log_prefix() -> str:
+    """``[trial-broker][goal=<id|->][slot=<n|->]`` for the active thread context."""
+    slot = current_slot()
+    return f"[trial-broker][goal={current_goal_id() or '-'}][slot={slot if slot is not None else '-'}]"
+
+
+def print(*args, **kwargs):  # noqa: A001 - module-scoped logging wrapper (T1)
+    """Every broker log line carries ``goal=<id|->`` and ``slot=<n|->``.
+
+    ``print(..., file=...)`` (stderr / pid-file style output) bypasses the
+    wrapper untouched, so machine-readable or goal-less output is never
+    rewritten. Lines already starting with ``[trial-broker]`` get the context
+    inserted right after that prefix; any other line is prefixed wholesale.
+    """
+    if kwargs.get("file") is not None:
+        return _orig_print(*args, **kwargs)
+    prefix = goal_log_prefix()
+    if args and isinstance(args[0], str) and args[0].startswith("[trial-broker]"):
+        args = (prefix + args[0][len("[trial-broker]"):],) + tuple(args[1:])
+    else:
+        args = (prefix,) + tuple(args)
+    return _orig_print(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Slot-isolated role homes
+# ---------------------------------------------------------------------------
+def slot_homes_root(slot: int | None = None) -> Path:
+    """``$DSH_TRIAL_SLOT_HOMES_ROOT`` (default ``~/.dsh-homes/trial-slots``).
+
+    With ``slot`` given the per-slot root ``<root>/slot-<n>`` is returned. The
+    env var is read per call so tests can monkeypatch the root to a tmp dir.
+    """
+    base = Path(os.environ.get(SLOT_HOMES_ENV) or SLOT_HOMES_ROOT)
+    if slot is None:
+        return base
+    return base / f"slot-{int(slot)}"
+
+
+def slot_role_home(slot: int, role: str) -> Path:
+    return slot_homes_root(slot) / str(role)
+
+
+def slot_home_dirs() -> list[Path]:
+    """Existing ``slot-<n>`` roots, ordered by slot number (best effort)."""
+    base = slot_homes_root()
+    try:
+        if not base.is_dir():
+            return []
+    except OSError:
+        return []
+    found: list[tuple[int, Path]] = []
+    for p in base.glob("slot-*"):
+        try:
+            if not p.is_dir():
+                continue
+        except OSError:
+            continue
+        try:
+            num = int(p.name.split("-", 1)[1])
+        except (IndexError, ValueError):
+            num = 0
+        found.append((num, p))
+    found.sort(key=lambda t: (t[0], t[1].name))
+    return [p for _, p in found]
+
+
+def _ensure_symlink(link: Path, target: Path) -> bool:
+    """Idempotently point ``link`` at ``target``; never clobber real content.
+
+    An existing *correct* symlink is left untouched, an existing real
+    file/directory is never deleted or rewritten, and a stale symlink (wrong
+    target, no real content of its own) is re-pointed.
+    """
+    try:
+        if link.is_symlink():
+            try:
+                if link.resolve() == target.resolve():
+                    return True
+            except OSError:
+                pass
+            link.unlink()
+        elif link.exists():
+            return False  # real file/dir: keep it
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        return True
+    except OSError as e:
+        print(f"[trial-broker] WARN slot home symlink failed link={link} err={e}", flush=True)
+        return False
+
+
+def _role_profile_template(role: str) -> Path | None:
+    """Template ``profiles/`` for a slot role home.
+
+    The legacy role home ``HOMES_ROOT/<role>/profiles`` when it exists (it
+    carries ``node_modules`` plus the box's profile links), else the canonical
+    ``$DSH_HOME/profiles``.
+    """
+    for cand in (HOMES_ROOT / role / "profiles", DSH_HOME / "profiles"):
+        try:
+            if cand.is_dir():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def ensure_slot_homes(slot: int) -> Path:
+    """Idempotently materialise ``<slot root>/{impl,gate,supervisor}``.
+
+    Mirrors the legacy role-home layout while keeping the state that must not be
+    shared per slot: ``settings.yaml``/``.env``/``load-env.sh`` symlink to
+    ``$DSH_HOME``, ``profiles/*`` symlink to the template role home (real
+    directories such as ``node_modules`` are linked as-is),
+    ``supervisor/thin-state/{packs,summaries,chains,goals,index.json}`` symlink
+    to the canonical thin-state when present, and
+    ``sessions/``/``storages/``/``acp-tickets/``/``offload/`` stay real per-slot
+    directories — that is the isolation this buys.
+    """
+    root = slot_homes_root(int(slot))
+    canonical_ts = DSH_HOME / "supervisor" / "thin-state"
+    for role in SLOT_ROLES:
+        home = root / role
+        for name in ("sessions", "storages", "acp-tickets", "offload"):
+            (home / name).mkdir(parents=True, exist_ok=True)
+        for name in ("settings.yaml", ".env", "load-env.sh"):
+            src = DSH_HOME / name
+            try:
+                if src.exists():
+                    _ensure_symlink(home / name, src)
+            except OSError:
+                continue
+        template = _role_profile_template(role)
+        if template is not None:
+            profiles = home / "profiles"
+            profiles.mkdir(parents=True, exist_ok=True)
+            try:
+                entries = sorted(template.iterdir())
+            except OSError:
+                entries = []
+            for entry in entries:
+                try:
+                    target = entry.resolve()
+                except OSError:
+                    continue
+                _ensure_symlink(profiles / entry.name, target)
+        for name in ("packs", "summaries", "chains", "goals", "index.json"):
+            src = canonical_ts / name
+            try:
+                exists = src.exists()
+            except OSError:
+                exists = False
+            if exists:
+                (home / "supervisor" / "thin-state").mkdir(parents=True, exist_ok=True)
+                _ensure_symlink(home / "supervisor" / "thin-state" / name, src)
+    return root
+
+
 def _ensure_dirs() -> None:
     for d in (INBOX, OUTBOX, PROCESSING, FAILED, STATE_DIR, ARTIFACT_ROOT, CHAINS, PACKS, SUMMARIES, GOALS, MAILBOX):
         d.mkdir(parents=True, exist_ok=True)
@@ -174,6 +582,10 @@ def _write_heartbeat(pending: int = 0, *, extra: dict | None = None) -> None:
 
     Path: ``$TRIAL_BROKER_DIR/trial-broker.heartbeat.json`` (or
     ``$TRIAL_BROKER_HEARTBEAT``). Never raises.
+
+    T1: written under a lock via tmp+rename (several watcher threads write the
+    same file), and every beat carries the live ``slots`` snapshot plus
+    ``max_concurrent_goals`` so the T2 scheduler/watchdog can see who is running.
     """
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -186,10 +598,12 @@ def _write_heartbeat(pending: int = 0, *, extra: dict | None = None) -> None:
         }
         if extra:
             payload.update(extra)
-        HEARTBEAT.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-    except OSError:
+        # After `extra`: a watcher beat must never lose the slots it publishes.
+        payload["slots"] = active_goals_snapshot()
+        payload["max_concurrent_goals"] = T.max_concurrent_goals()
+        with _HEARTBEAT_LOCK:
+            _atomic_write_json(HEARTBEAT, payload)
+    except Exception:  # noqa: BLE001 - liveness must never take the broker down
         pass
 
 
@@ -479,13 +893,26 @@ def load_job(path: Path) -> dict:
 
 
 def list_pending() -> list[Path]:
+    """Inbox jobs in enqueue order: mtime first, file name as the tie-break.
+
+    Hub drops files without a timestamp in the name, so a plain name sort is
+    not FIFO once two jobs land in the same second. ``list_pending`` is the
+    scheduler's ordering contract (T2): first in, first dispatched.
+    """
     files = []
-    for p in sorted(INBOX.iterdir()):
+    for p in INBOX.iterdir():
         if p.name.startswith(".") or p.name == "README.md":
             continue
         if p.suffix in (".json", ".md") and p.is_file():
             files.append(p)
-    return files
+
+    def _order(p: Path) -> tuple[float, str]:
+        try:
+            return (p.stat().st_mtime, p.name)
+        except OSError:
+            return (0.0, p.name)
+
+    return sorted(files, key=_order)
 
 
 def quarantine_inbox_reject(path: Path, reason: str, *, raw: dict | None = None) -> dict:
@@ -590,16 +1017,33 @@ def _quarantine_unexpected(path: Path, exc: Exception) -> None:
         )
 
 
+def all_role_homes(role: str | None = None) -> list[Path]:
+    """Every role home a ticket's session may live in.
+
+    Legacy ``$DSH_HOMES_ROOT/<role>`` homes first (unchanged precedence), then
+    each slot home ``<slot root>/slot-<n>/<role>``, then ``$DSH_HOME`` itself.
+    With slot isolation a ticket's session/ACP records are written under its
+    slot home, so every ticket→session lookup must search them all.
+    """
+    out: list[Path] = []
+    if role:
+        out.append(HOMES_ROOT / role)
+    for r in SLOT_ROLES:
+        h = HOMES_ROOT / r
+        if h not in out:
+            out.append(h)
+    for slot_root in slot_home_dirs():
+        for r in SLOT_ROLES:
+            h = slot_root / r
+            if h not in out:
+                out.append(h)
+    out.append(DSH_HOME)
+    return out
+
+
 def find_session(ticket: str, role: str | None) -> Path | None:
     candidates: list[Path] = []
-    role_homes: list[Path] = []
-    if role:
-        role_homes.append(HOMES_ROOT / role)
-    for r in ("impl", "gate", "supervisor"):
-        h = HOMES_ROOT / r
-        if h not in role_homes:
-            role_homes.append(h)
-    role_homes.append(DSH_HOME)
+    role_homes: list[Path] = all_role_homes(role)
 
     for home in role_homes:
         meta = home / "acp-tickets" / f"{ticket}.json"
@@ -669,7 +1113,7 @@ def find_session_from_log(log_path: Path) -> Path | None:
     if not m:
         return None
     sid = m.group(1)
-    for home in (HOMES_ROOT / "impl", HOMES_ROOT / "gate", HOMES_ROOT / "supervisor", DSH_HOME):
+    for home in all_role_homes():
         sessions = home / "sessions"
         if not sessions.is_dir():
             continue
@@ -765,6 +1209,8 @@ def _spawn_env(
     ticket: str | None = None,
     prompt_timeout_sec: int | None = None,
     prompt_idle_timeout_sec: int | None = None,
+    slot: int | None = None,
+    goal: str | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     if role:
@@ -800,9 +1246,123 @@ def _spawn_env(
         env["DSH_ACP_ASK"] = str(ask)
     if ticket:
         env["DSH_TICKET"] = str(ticket)
+    # Per-slot role home: open-slice.sh and dsh-acp-ask both select
+    # ``$DSH_HOMES_ROOT/<role>``, so one env var isolates sessions/ACP state.
+    # No slot (legacy single-Goal mode) leaves DSH_HOMES_ROOT untouched.
+    eff_slot = resolve_slot(slot)
+    if eff_slot is not None:
+        env["DSH_HOMES_ROOT"] = str(slot_homes_root(eff_slot))
+        env["DSH_TRIAL_SLOT"] = str(eff_slot)
+    gid = str(goal or current_goal_id() or "")
+    if gid:
+        env["DSH_TRIAL_GOAL"] = gid
     env.pop("NEW_API_KEY", None)
     _ = _redact_env(env)
     return env
+
+
+def goal_slice_ids(goal: dict | None) -> list[str]:
+    """Slice ids a Goal owns: ``current_slice`` plus planned/executed ``slices``."""
+    if not isinstance(goal, dict):
+        return []
+    out: list[str] = []
+
+    def _add(value) -> None:
+        sid = str(value or "").strip()
+        if sid and sid not in out:
+            out.append(sid)
+
+    _add(goal.get("current_slice"))
+    raw = goal.get("slices")
+    if isinstance(raw, dict):
+        raw = list(raw.keys())
+    if isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            if isinstance(item, dict):
+                _add(item.get("slice") or item.get("id"))
+            else:
+                _add(item)
+    return out
+
+
+def _slice_mentioned(slice_id: str, text: str) -> bool:
+    """Whole-token containment so slice ``s1`` does not match ``s10``."""
+    if not slice_id or not text:
+        return False
+    try:
+        return re.search(rf"(?<![0-9A-Za-z]){re.escape(slice_id)}(?![0-9A-Za-z])", text) is not None
+    except re.error:  # pragma: no cover - re.escape output is always valid
+        return slice_id in text
+
+
+def ask_belongs_to(ask: dict, *, ticket: str | None, goal: dict | None) -> bool:
+    """Pure ownership test: does this mailbox ask belong to ``(ticket, goal)``?
+
+    True when the ask names our ticket, when ``ask.slice`` is one of the goal's
+    slices (or its ``current_slice``), or when the ask ticket mentions one of
+    the goal's slice ids (``impl-trial-<slice>-r1``,
+    ``gate-trial-<slice>-rev2``, ``supervisor-answer-<slice>-ask1``).
+    """
+    if not isinstance(ask, dict):
+        return False
+    ask_ticket = str(ask.get("ticket") or "").strip()
+    ask_slice = str(ask.get("slice") or "").strip()
+    own_ticket = str(ticket or "").strip()
+    if own_ticket and ask_ticket and ask_ticket == own_ticket:
+        return True
+    goal_id = str((goal or {}).get("goal") or "").strip() if isinstance(goal, dict) else ""
+    slices = goal_slice_ids(goal)
+    if not slices and not goal_id:
+        return False
+    if ask_slice and ask_slice in slices:
+        return True
+    for sid in slices:
+        if _slice_mentioned(sid, ask_ticket) or _slice_mentioned(sid, ask_slice):
+            return True
+    return bool(goal_id and _slice_mentioned(goal_id, ask_ticket))
+
+
+def _ask_owned_by_other_active_goal(ask: dict, *, goal_id: str | None) -> bool:
+    mine = str(goal_id or "")
+    for rec in active_goals_snapshot():
+        gid = str(rec.get("goal") or "")
+        if not gid or gid == mine:
+            continue
+        other = {
+            "goal": gid,
+            "slices": list(rec.get("slices") or []),
+            "current_slice": rec.get("current_slice") or "",
+        }
+        if ask_belongs_to(ask, ticket=str(rec.get("ticket") or ""), goal=other):
+            return True
+    return False
+
+
+def ask_disposition(ask: dict, *, ticket: str | None, goal: dict | None) -> str:
+    """``"mine"`` | ``"other"`` | ``"orphan"`` for one pending ask (T1 routing)."""
+    if ask_belongs_to(ask, ticket=ticket, goal=goal):
+        return "mine"
+    gid = str((goal or {}).get("goal") or "") if isinstance(goal, dict) else ""
+    if _ask_owned_by_other_active_goal(ask, goal_id=gid):
+        return "other"
+    return "orphan"
+
+
+def watch_should_handle_ask(ask: dict, *, ticket: str | None, goal: dict | None) -> bool:
+    """Watcher-side ownership gate for :func:`_handle_pending_ask_file`.
+
+    Our own asks are always handled. An ask claimed by *another* active Goal is
+    left for its owner (concurrent Goals must not steal each other's
+    supervisor/gate asks). An orphan ask — one no active Goal claims — keeps the
+    old "handle everything" behaviour only while a single Goal (or a legacy
+    no-Goal ticket) is in flight.
+    """
+    disposition = ask_disposition(ask, ticket=ticket, goal=goal)
+    if disposition == "mine":
+        return True
+    if disposition == "other":
+        return False
+    return active_goal_count() <= 1
 
 
 def _handle_pending_ask_file(path: Path, *, default_profile: str, cwd: str, goal: dict | None) -> None:
@@ -1393,8 +1953,22 @@ def run_open_slice(
     log_path: Path,
     goal: dict | None = None,
     watch_mailbox: bool | None = None,
+    slot: int | None = None,
 ) -> int:
     profile = T.map_profile(profile)
+    if draining():
+        # T2 drain: never start a new ticket. The exception is deliberately not
+        # swallowed anywhere below, so the Goal stays non-terminal and the
+        # processing job stays in PROCESSING for the next broker start.
+        raise BrokerDraining(
+            f"draining: not spawning ticket={ticket} role={role} mode={prompt_mode}"
+        )
+    # Slot: explicit arg > goal["slot"] > this thread's goal_context > None
+    # (legacy shared role homes, i.e. DSH_HOMES_ROOT is left alone).
+    goal_slot = (goal or {}).get("slot") if isinstance(goal, dict) else None
+    eff_slot = resolve_slot(slot if slot is not None else goal_slot)
+    if eff_slot is not None:
+        ensure_slot_homes(eff_slot)
     cmd = [
         str(OPEN_SLICE),
         "--ticket", ticket,
@@ -1415,6 +1989,8 @@ def run_open_slice(
         prompt_idle_timeout_sec=int(
             lim.get("prompt_idle_timeout_sec") or T.DEFAULT_LIMITS["prompt_idle_timeout_sec"]
         ),
+        slot=eff_slot,
+        goal=str((goal or {}).get("goal") or current_goal_id() or ""),
     )
     # Job timeout must exceed the prompt hard cap. A fixed 2400s backstop
     # used to cut the slice before a still-working agent finished.
@@ -1422,7 +1998,8 @@ def run_open_slice(
     job_timeout = gate_job_timeout_sec(lim)
     print(
         f"[trial-broker] spawn open-slice ticket={ticket} pack={pack_name} "
-        f"profile={profile} role={role} mode={prompt_mode} job_timeout={job_timeout}",
+        f"profile={profile} role={role} mode={prompt_mode} "
+        f"slot={eff_slot if eff_slot is not None else '-'} job_timeout={job_timeout}",
         flush=True,
     )
     if watch_mailbox is None:
@@ -1434,20 +2011,37 @@ def run_open_slice(
         # 插件侧同步等待超时须 ≥ 工具 timeoutSec ≤ ask_supervisor_timeout_sec；
         # ACP prompt：空闲 DSH_ACP_PROMPT_IDLE_TIMEOUT（默认 900，须 > ask 等待）有进展就重置；
         # 硬上限 DSH_ACP_PROMPT_TIMEOUT / prompt_timeout_sec（默认 3600）到点仍收口。
+        # A new thread does not inherit thread-local state: capture the parent
+        # (goal, slot) here and re-enter it inside the watcher, otherwise the
+        # logs and the ask-ownership filter would lose the Goal.
+        watch_goal = str((goal or {}).get("goal") or current_goal_id() or "") or None
+        watch_slot = eff_slot if eff_slot is not None else current_slot()
+
         def _watch():
-            while not stop.is_set():
-                _write_heartbeat(1)
-                for ap in T.list_pending_asks(MAILBOX):
-                    try:
-                        _handle_pending_ask_file(
-                            ap,
-                            default_profile=str((goal or {}).get("supervisor_profile") or "acp-lite"),
-                            cwd=cwd,
-                            goal=goal,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[trial-broker] mailbox watch error: {e}", flush=True)
-                stop.wait(2.0)
+            with goal_context(watch_goal, watch_slot):
+                while not stop.is_set():
+                    _write_heartbeat(1)
+                    for ap in T.list_pending_asks(MAILBOX):
+                        try:
+                            ask = T.load_ask(ap)
+                        except (OSError, json.JSONDecodeError) as e:
+                            print(f"[trial-broker] bad ask file {ap}: {e}", flush=True)
+                            continue
+                        # Ownership gate: with concurrent Goals each watcher only
+                        # serves its own asks; orphans keep the legacy behaviour.
+                        if not watch_should_handle_ask(ask, ticket=ticket, goal=goal):
+                            continue
+                        try:
+                            _handle_pending_ask_file(
+                                ap,
+                                default_profile=str((goal or {}).get("supervisor_profile") or "acp-lite"),
+                                cwd=cwd,
+                                goal=goal,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[trial-broker] mailbox watch error: {e}", flush=True)
+                    stop.wait(2.0)
+
         watcher = threading.Thread(target=_watch, name="mailbox-watch", daemon=True)
         watcher.start()
     try:
@@ -1535,7 +2129,8 @@ def _write_chain(state: dict) -> Path:
     slice_id = state["slice"]
     p = CHAINS / f"{slice_id}.json"
     state["updated_at"] = _iso()
-    p.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+    # tmp+rename: concurrent readers (and a second Goal) never see a half file.
+    _atomic_write_json(p, state)
     return p
 
 
@@ -2101,10 +2696,15 @@ def maybe_offload_gc(*, force: bool = False) -> dict | None:
     """Run offload GC at most once per hour (or force after a job)."""
     global _LAST_OFFLOAD_GC_TS
     now = time.time()
-    if not force and (now - _LAST_OFFLOAD_GC_TS) < 3600:
-        return None
+    # Check-and-claim under the lock: with concurrent Goals two threads must not
+    # both decide the hour is up (nor double-run the GC).
+    with _OFFLOAD_GC_LOCK:
+        if not force and (now - _LAST_OFFLOAD_GC_TS) < 3600:
+            return None
     if not OFFLOAD_GC.is_file():
         return {"skipped": True, "reason": "missing gc script"}
+    with _OFFLOAD_GC_LOCK:
+        _LAST_OFFLOAD_GC_TS = now
     try:
         cp = subprocess.run(
             [sys.executable, str(OFFLOAD_GC), "--days", os.environ.get("DSH_OFFLOAD_GC_DAYS", "3")],
@@ -2112,7 +2712,6 @@ def maybe_offload_gc(*, force: bool = False) -> dict | None:
             text=True,
             timeout=60,
         )
-        _LAST_OFFLOAD_GC_TS = now
         return {
             "rc": cp.returncode,
             "detail": (cp.stdout or cp.stderr or "")[-400:],
@@ -2214,7 +2813,8 @@ def _write_goal(state: dict) -> Path:
     goal_id = state["goal"]
     path = GOALS / f"{goal_id}.json"
     state["updated_at"] = _iso()
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+    # tmp+rename: the watcher threads and the main loop both read Goal state.
+    _atomic_write_json(path, state)
     return path
 
 
@@ -2828,6 +3428,7 @@ def run_supervisor_ticket(
     summary_name: str,
     prompt_mode: str,
     goal: dict | None = None,
+    slot: int | None = None,
 ) -> tuple[int, dict, Path]:
     """Open one supervisor short ticket; return (exit, artifacts, summary_path)."""
     log_path = ARTIFACT_ROOT / f"{ticket}.log"
@@ -2842,6 +3443,7 @@ def run_supervisor_ticket(
         log_path=log_path,
         goal=goal,
         watch_mailbox=False,
+        slot=slot,
     )
     summary_path = SUMMARIES / f"{summary_name}.md"
     art = write_artifacts(
@@ -3682,8 +4284,21 @@ def limit_stop_closeout(
     return {"action": "fail", "error": err, "note": "", **record}
 
 
-def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, start_pack: str) -> int:
-    """Run foreman→gate from start_round using start_pack for first foreman."""
+def run_chain_rounds(
+    job: dict,
+    chain: dict,
+    dest: Path,
+    *,
+    start_round: int,
+    start_pack: str,
+    resume: bool = False,
+) -> int:
+    """Run foreman→gate from start_round using start_pack for first foreman.
+
+    ``resume=True`` (T2 restart) makes every ticket boundary idempotent: an
+    impl or gate summary already on disk is adopted instead of re-opened, so no
+    ticket is paid for twice and no metric is recorded twice.
+    """
     cwd = Path(job["cwd"])
     slice_id = job["slice"]
     max_rounds = int(job["max_rounds"])
@@ -3713,62 +4328,107 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
             )
             _write_goal(goal_obj)
 
-        ec = run_open_slice(
-            ticket=impl_ticket,
-            pack_name=Path(pack_for_impl).name,
-            profile=job["profile"],
-            cwd=str(cwd),
-            role="impl",
-            summary_name=impl_summary_name,
-            prompt_mode="foreman",
-            log_path=impl_log,
-            goal=goal_obj,
-            watch_mailbox=True,
+        # T2 resume: an existing impl summary (or an already-recorded round) is
+        # a finished ticket. Adopt it — never open a second ACP session for it
+        # and never record its metric twice.
+        resumed_rec = _chain_round_record(chain, round_n) if resume else None
+        reuse_impl = bool(resume) and (
+            resumed_rec is not None or impl_summary.is_file()
         )
-        # Agents sometimes write the summary under ~/.dsh-supervisor/...
-        # (glued path). Adopt into canonical SUMMARIES before missing-check.
-        _adopt_misplaced_summary(impl_summary)
-        impl_art = write_artifacts(
-            {**job, "ticket": impl_ticket, "role": "impl"},
-            impl_log, impl_summary, ec, ticket=impl_ticket,
-        )
-        peak, steps = _peak_prompt(impl_art.get("composition"))
-        if goal_obj is not None:
-            # chain 路径记账（prompt_token_total 默认 peak×steps）→ dsh-trial report 非 0
-            T.record_ticket_metric(goal_obj, {
-                "role": "impl",
-                "ticket": impl_ticket,
-                "slice": slice_id,
-                "exit": ec,
-                "peak_prompt": peak,
-                "steps": steps,
-                "tool_res": _tool_res_from_art(impl_art),
-                "assert_clean": impl_art.get("assert_clean"),
-                "kind": "impl",
-            })
-            _write_goal(goal_obj)
-        parsed = _parse_foreman_summary(impl_summary)
-        block = parsed["block"]
+        append_round = True
+        if reuse_impl:
+            _adopt_misplaced_summary(impl_summary)
+            parsed = _parse_foreman_summary(impl_summary)
+            if resumed_rec is not None:
+                round_rec = dict(resumed_rec)
+                ec = int(round_rec.get("impl_exit") or 0)
+                impl_art = dict(round_rec.get("impl_artifacts") or {})
+                peak = round_rec.get("impl_peak")
+                steps = round_rec.get("impl_steps")
+                block = dict(round_rec.get("foreman_block") or parsed["block"] or {})
+                append_round = False
+            else:
+                ec = 0
+                impl_art = {
+                    "ticket": impl_ticket,
+                    "exit_code": 0,
+                    "log": str(impl_log),
+                    "summary": str(impl_summary),
+                    "summary_exists": True,
+                    "session": None,
+                    "resumed": True,
+                    "at": _iso(),
+                }
+                peak, steps = _peak_prompt(impl_art.get("composition"))
+                block = parsed["block"]
+            print(
+                f"[trial-broker] chain {slice_id} resume r{round_n}: impl summary "
+                f"on disk ({impl_summary.name}); impl ticket not re-opened",
+                flush=True,
+            )
+        else:
+            ec = run_open_slice(
+                ticket=impl_ticket,
+                pack_name=Path(pack_for_impl).name,
+                profile=job["profile"],
+                cwd=str(cwd),
+                role="impl",
+                summary_name=impl_summary_name,
+                prompt_mode="foreman",
+                log_path=impl_log,
+                goal=goal_obj,
+                watch_mailbox=True,
+                slot=resolve_slot(job=job),
+            )
+            # Agents sometimes write the summary under ~/.dsh-supervisor/...
+            # (glued path). Adopt into canonical SUMMARIES before missing-check.
+            _adopt_misplaced_summary(impl_summary)
+            impl_art = write_artifacts(
+                {**job, "ticket": impl_ticket, "role": "impl"},
+                impl_log, impl_summary, ec, ticket=impl_ticket,
+            )
+            peak, steps = _peak_prompt(impl_art.get("composition"))
+            if goal_obj is not None:
+                # chain 路径记账（prompt_token_total 默认 peak×steps）→ dsh-trial report 非 0
+                T.record_ticket_metric(goal_obj, {
+                    "role": "impl",
+                    "ticket": impl_ticket,
+                    "slice": slice_id,
+                    "exit": ec,
+                    "peak_prompt": peak,
+                    "steps": steps,
+                    "tool_res": _tool_res_from_art(impl_art),
+                    "assert_clean": impl_art.get("assert_clean"),
+                    "kind": "impl",
+                })
+                _write_goal(goal_obj)
+            parsed = _parse_foreman_summary(impl_summary)
+            block = parsed["block"]
         # Fill base if agent omitted
         if not block.get("base"):
             block["base"] = base_before
         if not block.get("commit"):
             block["commit"] = _git_rev(cwd)
 
-        round_rec = {
-            "round": round_n,
-            "impl_ticket": impl_ticket,
-            "impl_pack": Path(pack_for_impl).name,
-            "impl_exit": ec,
-            "impl_summary": str(impl_summary),
-            "impl_assert_clean": impl_art.get("assert_clean"),
-            "impl_peak": peak,
-            "impl_steps": steps,
-            "impl_artifacts": impl_art,
-            "foreman_status": block.get("status"),
-            "foreman_block": block,
-        }
-        chain["rounds"].append(round_rec)
+        if append_round:
+            round_rec = {
+                "round": round_n,
+                "impl_ticket": impl_ticket,
+                "impl_pack": Path(pack_for_impl).name,
+                "impl_exit": ec,
+                "impl_summary": str(impl_summary),
+                "impl_assert_clean": impl_art.get("assert_clean"),
+                "impl_peak": peak,
+                "impl_steps": steps,
+                "impl_artifacts": impl_art,
+                "foreman_status": block.get("status"),
+                "foreman_block": block,
+            }
+            chain["rounds"].append(round_rec)
+        else:
+            round_rec["foreman_status"] = block.get("status")
+            round_rec["foreman_block"] = block
+            chain["rounds"][-1] = round_rec
         _write_chain(chain)
 
         if not impl_summary.is_file():
@@ -4043,6 +4703,7 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
                         job, chain, dest,
                         start_round=next_round,
                         start_pack=reply_pack,
+                        resume=resume,
                     )
             # Fix 1: question parked (auto-answer off / failed) — wake the Hub
             # too. The auto-answered path above resumes and never reaches here.
@@ -4078,53 +4739,72 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
             return 1
 
         round_rec["gate_pack"] = gate_pack
-        gec = run_open_slice(
-            ticket=gate_ticket,
-            pack_name=gate_pack,
-            profile=job.get("gate_profile") or job["profile"],
-            cwd=str(cwd),
-            role="gate",
-            summary_name=gate_summary_name,
-            prompt_mode="gate",
-            log_path=gate_log,
-            goal=goal_obj,
-            watch_mailbox=False,
-        )
-        _adopt_misplaced_summary(gate_summary)
-        gate_art = write_artifacts(
-            {**job, "ticket": gate_ticket, "role": "gate"},
-            gate_log, gate_summary, gec, ticket=gate_ticket,
-        )
-        gpeak, gsteps = _peak_prompt(gate_art.get("composition"))
-        gparsed = _parse_gate_verdict(gate_summary)
-        gblock = enforce_gate_verdict(gparsed["block"])
-        gparsed["block"] = gblock
-        if goal_obj is not None:
-            T.record_ticket_metric(goal_obj, {
-                "role": "gate",
-                "ticket": gate_ticket,
-                "slice": slice_id,
-                "exit": gec,
-                "peak_prompt": gpeak,
-                "steps": gsteps,
-                "tool_res": _tool_res_from_art(gate_art),
-                "assert_clean": gate_art.get("assert_clean"),
-                "kind": "gate",
-                "verdict": gblock.get("verdict"),
-            })
-            _write_goal(goal_obj)
-        # rewrite summary note if overridden (append; do not wipe agent prose)
-        if gblock.get("verdict_overridden") and gate_summary.is_file():
-            try:
-                note = (
-                    f"\n\n<!-- broker enforce_gate_verdict: HOLD "
-                    f"({gblock.get('verdict_override_reason')}) "
-                    f"original={gblock.get('verdict_original')} -->\n"
-                )
-                with gate_summary.open("a", encoding="utf-8") as fh:
-                    fh.write(note)
-            except OSError:
-                pass
+        # T2 resume: a gate summary already on disk is this round's verdict.
+        # Re-opening the gate ticket would overwrite evidence and double-count.
+        reuse_gate = bool(resume) and gate_summary.is_file()
+        if reuse_gate:
+            _adopt_misplaced_summary(gate_summary)
+            gec = int(round_rec.get("gate_exit") or 0)
+            gate_art = dict(round_rec.get("gate_artifacts") or {})
+            gpeak = round_rec.get("gate_peak")
+            gsteps = round_rec.get("gate_steps")
+            gparsed = _parse_gate_verdict(gate_summary)
+            gblock = enforce_gate_verdict(gparsed["block"])
+            gparsed["block"] = gblock
+            print(
+                f"[trial-broker] chain {slice_id} resume r{round_n}: gate summary "
+                f"on disk ({gate_summary.name}); gate ticket not re-opened",
+                flush=True,
+            )
+        else:
+            gec = run_open_slice(
+                ticket=gate_ticket,
+                pack_name=gate_pack,
+                profile=job.get("gate_profile") or job["profile"],
+                cwd=str(cwd),
+                role="gate",
+                summary_name=gate_summary_name,
+                prompt_mode="gate",
+                log_path=gate_log,
+                goal=goal_obj,
+                watch_mailbox=False,
+                slot=resolve_slot(job=job),
+            )
+            _adopt_misplaced_summary(gate_summary)
+            gate_art = write_artifacts(
+                {**job, "ticket": gate_ticket, "role": "gate"},
+                gate_log, gate_summary, gec, ticket=gate_ticket,
+            )
+            gpeak, gsteps = _peak_prompt(gate_art.get("composition"))
+            gparsed = _parse_gate_verdict(gate_summary)
+            gblock = enforce_gate_verdict(gparsed["block"])
+            gparsed["block"] = gblock
+            if goal_obj is not None:
+                T.record_ticket_metric(goal_obj, {
+                    "role": "gate",
+                    "ticket": gate_ticket,
+                    "slice": slice_id,
+                    "exit": gec,
+                    "peak_prompt": gpeak,
+                    "steps": gsteps,
+                    "tool_res": _tool_res_from_art(gate_art),
+                    "assert_clean": gate_art.get("assert_clean"),
+                    "kind": "gate",
+                    "verdict": gblock.get("verdict"),
+                })
+                _write_goal(goal_obj)
+            # rewrite summary note if overridden (append; do not wipe agent prose)
+            if gblock.get("verdict_overridden") and gate_summary.is_file():
+                try:
+                    note = (
+                        f"\n\n<!-- broker enforce_gate_verdict: HOLD "
+                        f"({gblock.get('verdict_override_reason')}) "
+                        f"original={gblock.get('verdict_original')} -->\n"
+                    )
+                    with gate_summary.open("a", encoding="utf-8") as fh:
+                        fh.write(note)
+                except OSError:
+                    pass
         verdict = gblock.get("verdict")
         round_rec.update({
             "gate_ticket": gate_ticket,
@@ -4240,13 +4920,65 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
 
 
 
-def _normalize_goal_slices(block: dict, job: dict, goal_id: str) -> list[dict]:
+def _slice_owned_by_other_goal(slice_id: str, goal_id: str) -> bool:
+    """True when *another* Goal already owns this slice id.
+
+    Collision sources (T1): an existing ``chains/<slice>.json`` whose ``goal``
+    field is not ours, or a live registry entry of another Goal listing the id
+    in its slices / current_slice. Slice ids are picked by the supervisor plan,
+    so two concurrent Goals can and do choose the same name.
+    """
+    sid = str(slice_id or "")
+    if not sid:
+        return False
+    mine = str(goal_id or "")
+    chain = _read_chain(sid)
+    if isinstance(chain, dict) and str(chain.get("goal") or "") != mine:
+        return True
+    for rec in active_goals_snapshot():
+        gid = str(rec.get("goal") or "")
+        if not gid or gid == mine:
+            continue
+        owned = [str(s) for s in (rec.get("slices") or [])]
+        if rec.get("current_slice"):
+            owned.append(str(rec["current_slice"]))
+        if sid in owned:
+            return True
+    return False
+
+
+def _rename_slice_pack(old_slice: str, old_pack: str, new_slice: str) -> str:
+    """Copy the slice pack to ``<new_slice>.pack.md`` and return that new name.
+
+    The original pack file is left in place (other Goals/slices may still use it).
+    """
+    new_name = f"{new_slice}.pack.md"
+    src = PACKS / Path(str(old_pack or "")).name if old_pack else None
+    if src is None or not src.is_file():
+        src = PACKS / f"{old_slice}.pack.md"
+    try:
+        if src.is_file():
+            PACKS.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, PACKS / new_name)
+    except OSError as e:
+        print(f"[trial-broker] WARN renamed-slice pack copy failed {src}: {e}", flush=True)
+    return new_name
+
+
+def _normalize_goal_slices(
+    block: dict, job: dict, goal_id: str, goal_state: dict | None = None
+) -> list[dict]:
     """Plan machine block → ordered slice specs (new emit_chains + legacy emit_chain).
 
     New: ``action=emit_chains`` with a non-empty ``slices`` list of
     ``{slice, pack, acceptance}`` objects. Legacy: ``action=emit_chain`` with
     top-level slice/pack/acceptance (wrapped as a one-element list). Job hints
     are the final fallback so a malformed plan still yields a runnable slice.
+
+    T1 collision guard: a planned slice id already owned by another Goal is
+    renamed to ``<goal_id>--<slice>`` (and its pack copied to
+    ``<new>.pack.md``), recorded on ``goal_state["slice_renames"]``. With no
+    collision the result is byte-for-byte the old one.
     """
     raw = block.get("slices")
     specs: list[dict] = []
@@ -4284,7 +5016,117 @@ def _normalize_goal_slices(block: dict, job: dict, goal_id: str) -> list[dict]:
             continue
         seen.add(spec["slice"])
         out.append(spec)
+    renames: list[dict] = []
+    taken: set[str] = set()
+    for spec in out:
+        old_slice = str(spec["slice"])
+        if old_slice in taken or not _slice_owned_by_other_goal(old_slice, goal_id):
+            taken.add(old_slice)
+            continue
+        new_slice = f"{goal_id}--{old_slice}" if goal_id else old_slice
+        if new_slice == old_slice:
+            taken.add(old_slice)
+            continue
+        spec["pack"] = _rename_slice_pack(old_slice, str(spec.get("pack") or ""), new_slice)
+        spec["slice"] = new_slice
+        taken.add(new_slice)
+        renames.append({"from": old_slice, "to": new_slice, "pack": spec["pack"], "at": _iso()})
+        print(
+            f"[trial-broker] slice id collision: {old_slice} -> {new_slice} (owned by another goal)",
+            flush=True,
+        )
+    if renames and isinstance(goal_state, dict):
+        existing = [e for e in (goal_state.get("slice_renames") or []) if isinstance(e, dict)]
+        known = {str(e.get("from") or "") for e in existing}
+        existing.extend(r for r in renames if str(r.get("from") or "") not in known)
+        goal_state["slice_renames"] = existing
     return out
+
+
+def _chain_job_from_chain(
+    job: dict, chain: dict, slice_id: str, spec: dict, goal_id: str
+) -> dict:
+    """Rebuild the chain job for an existing chain state (no fresh ticket)."""
+    return {
+        "id": job.get("id") or f"goal-chain-{slice_id}",
+        "type": "chain",
+        "slice": slice_id,
+        "pack": Path(str(spec.get("pack") or chain.get("pack") or f"{slice_id}.pack.md")).name,
+        "acceptance": spec.get("acceptance") or chain.get("acceptance") or [],
+        "profile": job.get("profile") or chain.get("profile") or "acp",
+        "gate_profile": job.get("gate_profile") or job.get("profile") or chain.get("gate_profile") or "acp",
+        "supervisor_profile": job.get("supervisor_profile") or chain.get("supervisor_profile") or "acp-lite",
+        "cwd": job.get("cwd") or chain.get("cwd") or "/workspace",
+        "max_rounds": int(job.get("max_rounds") or chain.get("max_rounds") or 2),
+        "notify": job.get("notify"),
+        "notify_dry_run": job.get("notify_dry_run"),
+        "notify_prefix": job.get("notify_prefix"),
+        "goal": goal_id,
+        "from_goal": True,
+        "auto_supervisor_answer": job.get("auto_supervisor_answer", True),
+        "max_supervisor_tickets": job.get("max_supervisor_tickets") or 8,
+        "defer_supervisor_close": True,
+    }
+
+
+def _chain_round_record(chain: dict, round_n: int) -> dict | None:
+    """The chain's recorded round ``round_n`` (None when it never completed)."""
+    for rec in chain.get("rounds") or []:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            if int(rec.get("round") or 0) == int(round_n):
+                return rec
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _chain_resume_point(chain: dict, default_pack: str) -> tuple[int, str]:
+    """First ``(round, pack)`` a restarted chain must run, at ticket boundaries.
+
+    The chain file is checkpointed right after every impl round and gate, so a
+    restart resumes at the first ticket without a summary:
+
+    * last recorded round has no gate evidence → re-enter that round (the impl
+      ticket is skipped because its summary/record exists) and run its gate;
+    * last recorded round already has a gate verdict → the next round, with the
+      fix pack when the verdict was a HOLD.
+    """
+    last_round = 0
+    last_rec: dict = {}
+    for rec in chain.get("rounds") or []:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            round_n = int(rec.get("round") or 0)
+        except (TypeError, ValueError):
+            continue
+        if round_n >= last_round:
+            last_round, last_rec = round_n, rec
+    max_rounds = max(1, int(chain.get("max_rounds") or 1))
+    if not last_round:
+        pack = str(
+            chain.get("pending_impl_pack")
+            or chain.get("reply_pack")
+            or chain.get("pack")
+            or default_pack
+        )
+        return 1, pack
+    slice_id = str(chain.get("slice") or "")
+    gate_done = bool(str(last_rec.get("gate_ticket") or "")) or (
+        SUMMARIES / f"{slice_id}-gate-r{last_round}.md"
+    ).is_file()
+    if gate_done:
+        pack = str(
+            last_rec.get("fix_pack_next")
+            or last_rec.get("fresh_rework_fix_pack")
+            or chain.get("pack")
+            or default_pack
+        )
+        return min(last_round + 1, max_rounds), pack
+    pack = str(last_rec.get("impl_pack") or chain.get("pack") or default_pack)
+    return last_round, pack
 
 
 def _execute_goal_slices(
@@ -4296,6 +5138,7 @@ def _execute_goal_slices(
     on_slice_fail: str,
     plan_ticket: str | None,
     skip_passed: bool = False,
+    resume: bool = False,
 ) -> int:
     """Run planned slices in order and close the goal when every slice PASSes.
 
@@ -4303,6 +5146,11 @@ def _execute_goal_slices(
     ``skip_passed=True`` is the resume path after a salvageable false failure:
     a chain already in PASS is not re-opened, so a salvaged s1 is not rewritten
     and the next slice still runs.
+
+    ``resume=True`` (T2 restart) additionally reuses an in-flight chain file
+    instead of resetting it, so the slice continues at its first unfinished
+    ticket (impl summary present → straight to the gate, gate summary present
+    → straight to the verdict).
     """
     goal_id = str(job.get("goal") or goal_state.get("goal") or "")
     if on_slice_fail not in ("continue", "stop"):
@@ -4314,35 +5162,43 @@ def _execute_goal_slices(
     last_chain_job: dict | None = None
     for spec in slice_specs:
         slice_id = str(spec["slice"])
-        if skip_passed:
-            existing = _read_chain(slice_id)
-            if isinstance(existing, dict) and str(existing.get("state") or "") == VERDICT_PASS:
-                last_chain = existing
-                last_chain_job = {
-                    "id": job.get("id") or f"goal-chain-{slice_id}",
-                    "type": "chain",
-                    "slice": slice_id,
-                    "pack": Path(str(spec.get("pack") or existing.get("pack") or f"{slice_id}.pack.md")).name,
-                    "acceptance": spec.get("acceptance") or existing.get("acceptance") or [],
-                    "profile": job.get("profile") or existing.get("profile") or "acp",
-                    "gate_profile": job.get("gate_profile") or job.get("profile") or existing.get("gate_profile") or "acp",
-                    "supervisor_profile": job.get("supervisor_profile") or "acp-lite",
-                    "cwd": job.get("cwd") or existing.get("cwd") or "/workspace",
-                    "max_rounds": int(job.get("max_rounds") or existing.get("max_rounds") or 2),
-                    "notify": job.get("notify"),
-                    "notify_dry_run": job.get("notify_dry_run"),
-                    "notify_prefix": job.get("notify_prefix"),
-                    "goal": goal_id,
-                    "from_goal": True,
-                    "auto_supervisor_answer": job.get("auto_supervisor_answer", True),
-                    "max_supervisor_tickets": job.get("max_supervisor_tickets") or 8,
-                    "defer_supervisor_close": True,
-                }
-                print(
-                    f"[trial-broker] goal {goal_id} skip already-PASS slice={slice_id}",
-                    flush=True,
-                )
-                continue
+        existing = _read_chain(slice_id) if (skip_passed or resume) else None
+        if not isinstance(existing, dict):
+            existing = None
+        existing_state = str((existing or {}).get("state") or "")
+        if existing_state == VERDICT_PASS:
+            last_chain = existing
+            last_chain_job = _chain_job_from_chain(job, existing, slice_id, spec, goal_id)
+            print(
+                f"[trial-broker] goal {goal_id} skip already-PASS slice={slice_id}",
+                flush=True,
+            )
+            continue
+        if resume and existing_state == "awaiting_supervisor":
+            # Parked on a Hub answer: the chain-reply job resumes it, a broker
+            # restart must not re-open the impl ticket (or double the ask).
+            last_chain = existing
+            last_chain_job = _chain_job_from_chain(job, existing, slice_id, spec, goal_id)
+            all_pass = False
+            print(
+                f"[trial-broker] goal {goal_id} slice={slice_id} awaiting Hub reply; "
+                "left parked",
+                flush=True,
+            )
+            continue
+        if resume and existing_state in ("failed", "escalated", "cancelled"):
+            all_pass = False
+            goal_state["last_chain_state"] = existing_state
+            goal_state["status"] = existing_state
+            _write_goal(goal_state)
+            print(
+                f"[trial-broker] goal {goal_id} slice={slice_id} is {existing_state}; "
+                "resume stops here",
+                flush=True,
+            )
+            if on_slice_fail != "continue":
+                break
+            continue
         pack_name = Path(spec["pack"]).name
         pack_abs = PACKS / pack_name
         if not pack_abs.is_file():
@@ -4380,22 +5236,48 @@ def _execute_goal_slices(
             # close the Goal once, after every slice is PASS (never per slice)
             "defer_supervisor_close": True,
         }
-        chain = _new_chain_state(chain_job)
-        chain["from_goal"] = True
-        chain["goal"] = goal_id
+        resuming_chain = resume and existing_state == "running"
+        if resuming_chain:
+            chain_job["pack"] = str(existing.get("pack") or pack_name)
+            chain_job["max_rounds"] = int(existing.get("max_rounds") or chain_job["max_rounds"])
+            chain = existing
+            start_round, start_pack = _chain_resume_point(existing, chain_job["pack"])
+            chain["state"] = "running"
+            chain["from_goal"] = True
+            chain["goal"] = goal_id
+            chain["max_rounds"] = chain_job["max_rounds"]
+        else:
+            chain = _new_chain_state(chain_job)
+            chain["from_goal"] = True
+            chain["goal"] = goal_id
+            start_round, start_pack = 1, pack_name
         # Persist the goal-scoped knobs so a later chain-reply can restore them
         # when Hub omits them from its reply job.
-        chain["supervisor_profile"] = chain_job.get("supervisor_profile")
+        chain["supervisor_profile"] = chain.get("supervisor_profile") or chain_job.get("supervisor_profile")
         chain["auto_supervisor_answer"] = chain_job.get("auto_supervisor_answer")
         chain["max_supervisor_tickets"] = chain_job.get("max_supervisor_tickets")
         chain["defer_supervisor_close"] = True
-        chain["plan_ticket"] = plan_ticket
+        chain["plan_ticket"] = plan_ticket or chain.get("plan_ticket")
         _write_chain(chain)
-        print(
-            f"[trial-broker] goal {goal_id} → chain slice={slice_id} pack={pack_name}",
-            flush=True,
+        if resuming_chain:
+            print(
+                f"[trial-broker] goal {goal_id} resume chain slice={slice_id} "
+                f"r{start_round} pack={start_pack}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[trial-broker] goal {goal_id} → chain slice={slice_id} pack={pack_name}",
+                flush=True,
+            )
+        rc = run_chain_rounds(
+            chain_job,
+            chain,
+            dest,
+            start_round=start_round,
+            start_pack=start_pack,
+            resume=resuming_chain,
         )
-        rc = run_chain_rounds(chain_job, chain, dest, start_round=1, start_pack=pack_name)
         final_chain = _read_chain(slice_id) or chain
         last_chain = final_chain
         last_chain_job = chain_job
@@ -4485,13 +5367,86 @@ def _execute_goal_slices(
 
 
 def run_goal_job(path: Path, job: dict) -> int:
-    """Hub drops Goal → dsh supervisor plans pack → inline chain (+ auto answer/close)."""
-    dest = PROCESSING / f"{_stamp()}-{path.name}"
-    shutil.move(str(path), str(dest))
-    goal_id = job["goal"]
-    print(f"[trial-broker] processing GOAL {dest.name} goal={goal_id}", flush=True)
+    """Goal entry point: register the live Goal + bind its (goal, slot) context.
 
-    goal_state = {
+    T1 prerequisite for concurrency — the registry drives the ask-ownership
+    filter, the heartbeat ``slots`` list and (T2) the scheduler. The Goal is
+    unregistered on every exit path, including exceptions.
+    """
+    goal_id = str(job.get("goal") or "")
+    slot = resolve_slot(job=job)
+    with active_goal_scope(
+        goal_id,
+        slot=slot,
+        cwd=str(job.get("cwd") or ""),
+        ticket=str(job.get("ticket") or ""),
+        phase="planning",
+    ):
+        with goal_context(goal_id, slot):
+            return _run_goal_job_body(path, job)
+
+
+def resume_goal_job(path: Path, job: dict) -> int:
+    """Continue a Goal left non-terminal by a previous broker run (T2 restart).
+
+    Same body as a fresh Goal job, with ticket-boundary idempotency: a ticket
+    whose summary already exists on disk is never re-opened (its metrics are
+    not re-recorded either); a ticket without one starts a fresh ACP session.
+    """
+    goal_id = str(job.get("goal") or "")
+    slot = resolve_slot(job=job)
+    with active_goal_scope(
+        goal_id,
+        slot=slot,
+        cwd=str(job.get("cwd") or ""),
+        ticket=str(job.get("ticket") or ""),
+        phase="resume",
+    ):
+        with goal_context(goal_id, slot):
+            return _run_goal_job_body(path, job, resume=True)
+
+
+def _run_goal_job_body(path: Path, job: dict, *, resume: bool = False) -> int:
+    """Hub drops Goal → dsh supervisor plans pack → inline chain (+ auto answer/close).
+
+    ``resume=True`` restarts a Goal from the processing job a previous broker
+    run left behind: the plan ticket is skipped when its summary exists, and
+    the slices continue at their first unfinished ticket.
+    """
+    goal_id = job["goal"]
+    if resume:
+        dest = path if path.parent == PROCESSING else PROCESSING / f"{_stamp()}-{path.name}"
+        if dest != path:
+            shutil.move(str(path), str(dest))
+        goal_state = _read_goal(goal_id)
+        if goal_state is None:
+            print(f"[trial-broker] resume: no goal state for goal={goal_id}", flush=True)
+            return 1
+        # Record the owner processing job so the next restart can find it even
+        # without the PROCESSING content scan (legacy states have no field).
+        goal_state["processing_job"] = str(dest)
+        _write_goal(goal_state)
+        print(
+            f"[trial-broker] resuming GOAL {dest.name} goal={goal_id} "
+            f"status={goal_state.get('status')}",
+            flush=True,
+        )
+        if str(goal_state.get("status") or "") in ("running", "closeout"):
+            # The plan ticket already ran: do not plan again.
+            return _resume_goal_after_plan(goal_state, job, dest)
+    else:
+        dest = PROCESSING / f"{_stamp()}-{path.name}"
+        shutil.move(str(path), str(dest))
+        print(f"[trial-broker] processing GOAL {dest.name} goal={goal_id}", flush=True)
+        goal_state = _new_goal_state(goal_id, job, dest)
+        _write_goal(goal_state)
+
+    return _continue_goal_from_plan(goal_state, job, dest, resume=resume)
+
+
+def _new_goal_state(goal_id: str, job: dict, dest: Path) -> dict:
+    """Fresh goal state for a new Goal job (plan not run yet)."""
+    return {
         "goal": goal_id,
         "status": "planning",
         "brief": job["brief"][:4000],
@@ -4509,50 +5464,78 @@ def run_goal_job(path: Path, job: dict) -> int:
         "notify": job.get("notify"),
         "notify_dry_run": job.get("notify_dry_run"),
         "notify_prefix": job.get("notify_prefix"),
+        # T2: the PROCESSING job that owns this Goal; a restart uses it to
+        # resume without scanning the whole processing dir.
+        "processing_job": str(dest),
     }
-    _write_goal(goal_state)
 
-    try:
-        brief_pack = build_goal_brief_pack(job)
-    except ValueError as e:
-        goal_state["status"] = "failed"
-        goal_state["error"] = f"brief pack: {e}"
-        _write_goal(goal_state)
-        shutil.move(str(dest), str(FAILED / dest.name))
-        _notify_goal_terminal(goal_id)
-        return 1
+
+def _continue_goal_from_plan(goal_state: dict, job: dict, dest: Path, *, resume: bool) -> int:
+    """Plan segment + slice execution, shared by fresh and resumed Goal jobs."""
+    goal_id = str(goal_state.get("goal") or job.get("goal") or "")
 
     plan_ticket = f"supervisor-plan-{goal_id}"
-    ec, art, summary_path = run_supervisor_ticket(
-        ticket=plan_ticket,
-        pack_name=brief_pack,
-        profile=str(job.get("supervisor_profile") or "acp-lite"),
-        cwd=str(job["cwd"]),
-        summary_name=f"goal-{goal_id}-plan",
-        prompt_mode="supervisor-plan",
-        goal=goal_state,
-    )
-    goal_state = _read_goal(goal_id) or goal_state
+    plan_summary_name = f"goal-{goal_id}-plan"
+    summary_path = Path(str(goal_state.get("plan_summary") or ""))
+    art = goal_state.get("plan_artifacts") or {}
+    if resume and summary_path.is_file():
+        # Ticket-boundary idempotency: the plan ticket already produced its
+        # summary, so do not open a new ACP session (and do not re-record it).
+        print(
+            f"[trial-broker] resume goal {goal_id}: plan summary already on disk "
+            f"({summary_path.name}); skipping plan ticket",
+            flush=True,
+        )
+    else:
+        try:
+            brief_pack = build_goal_brief_pack(job)
+        except ValueError as e:
+            goal_state["status"] = "failed"
+            goal_state["error"] = f"brief pack: {e}"
+            _write_goal(goal_state)
+            shutil.move(str(dest), str(FAILED / dest.name))
+            _notify_goal_terminal(goal_id)
+            return 1
+
+        ec, art, summary_path = run_supervisor_ticket(
+            ticket=plan_ticket,
+            pack_name=brief_pack,
+            profile=str(job.get("supervisor_profile") or "acp-lite"),
+            cwd=str(job["cwd"]),
+            summary_name=plan_summary_name,
+            prompt_mode="supervisor-plan",
+            goal=goal_state,
+        )
+        goal_state = _read_goal(goal_id) or goal_state
+        goal_state["processing_job"] = str(dest)
+        if ec != 0 and not summary_path.is_file():
+            goal_state["status"] = "failed"
+            goal_state["error"] = f"plan ticket exit {ec}"
+            _write_goal(goal_state)
+            (FAILED / f"{dest.stem}.error.json").write_text(
+                json.dumps({"error": goal_state["error"], "job": job, "at": _iso()}, ensure_ascii=False, indent=2)
+            )
+            shutil.move(str(dest), str(FAILED / dest.name))
+            # Plan-ticket failure is terminal too: wake Hub like slice failures do.
+            _notify_goal_terminal(goal_id)
+            return ec or 1
+        goal_state["plan_summary"] = str(summary_path)
+    _write_goal(goal_state)
+
     parsed = _parse_supervisor_summary(summary_path)
     block = parsed["block"]
-    if ec != 0 and not summary_path.is_file():
-        goal_state["status"] = "failed"
-        goal_state["error"] = f"plan ticket exit {ec}"
-        _write_goal(goal_state)
-        (FAILED / f"{dest.stem}.error.json").write_text(
-            json.dumps({"error": goal_state["error"], "job": job, "at": _iso()}, ensure_ascii=False, indent=2)
-        )
-        shutil.move(str(dest), str(FAILED / dest.name))
-        # Plan-ticket failure is terminal too: wake Hub like slice failures do.
-        _notify_goal_terminal(goal_id)
-        return ec or 1
-
     action = str(block.get("action") or "")
     if action not in ("emit_chain", "emit_chains"):
         # soft: try to recover fields anyway
         print(f"[trial-broker] WARN plan action={action!r}, trying field recovery", flush=True)
 
-    slice_specs = _normalize_goal_slices(block, job, goal_id)
+    slice_specs = _normalize_goal_slices(block, job, goal_id, goal_state)
+    if goal_state.get("slice_renames"):
+        # Persist the rename map before any slice runs so a resume/other Goal
+        # sees which ids this Goal actually took.
+        _write_goal(goal_state)
+    plan_slice_ids = [str(s.get("slice") or "") for s in slice_specs]
+    update_active_goal(goal_id, slices=plan_slice_ids, phase="running")
 
     # Enforce max_slices (goal-update overrides > job > global default).
     limits = T.resolve_limits(job=job, goal=goal_state)
@@ -4588,10 +5571,18 @@ def run_goal_job(path: Path, job: dict) -> int:
         )
         return 1
 
-    goal_state["status"] = "running"
-    goal_state["plan_summary"] = str(summary_path)
-    goal_state["plan_artifacts"] = art
-    goal_state.setdefault("metrics", T.empty_metrics())["slices_planned"] = len(slice_specs)
+    if resume:
+        # Restarted goal: plan metrics were recorded by the previous run.
+        goal_state["status"] = "running"
+        goal_state["plan_summary"] = str(summary_path)
+        if not goal_state.get("plan_artifacts") and art:
+            goal_state["plan_artifacts"] = art
+        goal_state.setdefault("metrics", T.empty_metrics())["slices_planned"] = len(slice_specs)
+    else:
+        goal_state["status"] = "running"
+        goal_state["plan_summary"] = str(summary_path)
+        goal_state["plan_artifacts"] = art
+        goal_state.setdefault("metrics", T.empty_metrics())["slices_planned"] = len(slice_specs)
     _write_goal(goal_state)
 
     on_slice_fail = str(block.get("on_slice_fail") or job.get("on_slice_fail") or "stop").strip().lower()
@@ -4602,8 +5593,68 @@ def run_goal_job(path: Path, job: dict) -> int:
         dest,
         on_slice_fail=on_slice_fail,
         plan_ticket=plan_ticket,
-        skip_passed=False,
+        skip_passed=bool(resume),
+        resume=bool(resume),
     )
+
+
+def _resume_goal_after_plan(goal_state: dict, job: dict, dest: Path) -> int:
+    """Continue a Goal whose plan already ran (status running / closeout)."""
+    goal_id = str(goal_state.get("goal") or job.get("goal") or "")
+    status = str(goal_state.get("status") or "")
+    slice_specs = _slice_specs_from_plan(goal_state)
+    if not slice_specs:
+        slice_specs = _slice_specs_from_goal_state(goal_state)
+    if not slice_specs:
+        print(
+            f"[trial-broker] resume goal {goal_id}: status={status} but no slice "
+            "specs; left alone",
+            flush=True,
+        )
+        return 1
+    slice_ids = [str(spec.get("slice") or "") for spec in slice_specs]
+    update_active_goal(goal_id, slices=slice_ids, phase=status or "running")
+    print(
+        f"[trial-broker] resume goal {goal_id} status={status} slices={slice_ids}",
+        flush=True,
+    )
+    on_slice_fail = str(
+        job.get("on_slice_fail") or goal_state.get("on_slice_fail") or "stop"
+    ).strip().lower()
+    return _execute_goal_slices(
+        goal_state,
+        job,
+        slice_specs,
+        dest,
+        on_slice_fail=on_slice_fail,
+        plan_ticket=f"supervisor-plan-{goal_id}",
+        skip_passed=True,
+        resume=True,
+    )
+
+
+def _slice_specs_from_goal_state(goal: dict) -> list[dict]:
+    """Fallback slice specs rebuilt from ``goal["slices"]`` + chain files.
+
+    Used when the plan summary is gone but the goal already recorded which
+    slices it owns; the chain holds the pack/acceptance the slice runs with.
+    """
+    specs: list[dict] = []
+    for slice_id in goal.get("slices") or []:
+        sid = str(slice_id or "")
+        if not sid:
+            continue
+        chain = _read_chain(sid)
+        if not isinstance(chain, dict):
+            continue
+        specs.append(
+            {
+                "slice": sid,
+                "pack": str(chain.get("pack") or f"{sid}.pack.md"),
+                "acceptance": chain.get("acceptance") or [],
+            }
+        )
+    return specs
 
 
 def run_chain_job(path: Path, job: dict) -> int:
@@ -4915,6 +5966,7 @@ def run_ticket_job(path: Path, job: dict) -> int:
             prompt_mode="baseline" if round_n == 1 else "foreman",
             log_path=log_path,
             goal=goal_obj,
+            slot=resolve_slot(job=job),
         )
         result = write_artifacts(
             {**job, "ticket": ticket, "role": role},
@@ -5149,7 +6201,7 @@ def _slice_specs_from_plan(goal: dict) -> list[dict]:
     has_one = bool(str(block.get("slice") or "").strip())
     if not has_list and not has_one:
         return []
-    return _normalize_goal_slices(block, {}, str(goal.get("goal") or ""))
+    return _normalize_goal_slices(block, {}, str(goal.get("goal") or ""), goal)
 
 
 def _classify_failed_goal_resume(goal: dict) -> dict:
@@ -5385,7 +6437,25 @@ def run_goal_update_job(path: Path, job: dict) -> int:
     A failed goal resumes only when the failure is a salvageable missing
     summary with gate PASS. That slice is not re-run; the next planned
     slice is. Other failed goals are rejected.
+
+    T1: binds the same (goal, slot) context as the plan job, registering the
+    Goal only when nobody else owns it so an update against a live Goal cannot
+    unregister that Goal's record on exit.
     """
+    goal_id = str(job.get("goal") or job.get("id") or "")
+    slot = resolve_slot(job=job)
+    with active_goal_scope(
+        goal_id,
+        slot=slot,
+        cwd=str(job.get("cwd") or ""),
+        ticket=str(job.get("ticket") or ""),
+        phase="updated",
+    ):
+        with goal_context(goal_id, slot):
+            return _run_goal_update_job_body(path, job)
+
+
+def _run_goal_update_job_body(path: Path, job: dict) -> int:
     dest = PROCESSING / f"{_stamp()}-{path.name}"
     shutil.move(str(path), str(dest))
     goal_id = str(job.get("goal") or job.get("id"))
@@ -5591,6 +6661,391 @@ def run_job(path: Path) -> int:
     return run_ticket_job(path, job)
 
 
+# ---------------------------------------------------------------------------
+# T2 scheduler: FIFO dispatch under ``max_concurrent_goals``, cwd conflict
+# keys, per-Goal ownership, restart resume and graceful drain.
+#
+# The main thread only schedules: every round it re-reads the concurrency cap
+# (so editing limits.json takes effect without a restart), walks the pending
+# jobs in enqueue order, and hands each runnable job to a slot thread. A job
+# that conflicts with a running one stays queued (and keeps its queue position)
+# without blocking later non-conflicting jobs from taking free slots.
+# ---------------------------------------------------------------------------
+
+# A brief that mentions a worktree under one of these prefixes pins the job to
+# that worktree: only ``<prefix>/<first-segment>`` matters, the rest of the path
+# (a file, a nested repo) is not a conflict key. Other /workspace paths in a
+# brief are read-only references (Hub briefs cite sibling repos) and never
+# conflict.
+WORKTREE_PREFIXES_ENV = "DSH_TRIAL_WORKTREE_PREFIXES"
+DEFAULT_WORKTREE_PREFIXES = "/workspace/dsh-wt/"
+# Explicit extra working dirs a job may declare (string or list).
+EXTRA_CWD_FIELDS = ("extra_cwds", "worktrees", "worktree", "engine_worktree")
+# Scheduler tick while work is outstanding (dispatch/reap latency, not polling).
+LOOP_TICK_SEC = 0.05
+RESUMABLE_GOAL_STATUSES = ("planning", "running", "closeout")
+
+
+def _canonical_dir(raw) -> str:  # noqa: ANN001 - str/Path-like
+    """realpath of a directory reference; '' when it cannot be resolved."""
+    try:
+        text = str(raw or "").strip()
+    except (TypeError, ValueError):
+        return ""
+    if not text:
+        return ""
+    try:
+        return os.path.realpath(os.path.expanduser(text))
+    except (OSError, ValueError):
+        return ""
+
+
+def worktree_prefixes() -> list[str]:
+    """Configured worktree prefixes (env > default), without the trailing '/'."""
+    raw = os.environ.get(WORKTREE_PREFIXES_ENV)
+    if raw is None or not str(raw).strip():
+        raw = DEFAULT_WORKTREE_PREFIXES
+    out: list[str] = []
+    for part in str(raw).split(","):
+        part = part.strip().rstrip("/")
+        if part:
+            out.append(part)
+    return out
+
+
+def _brief_worktree_dirs(brief: str) -> list[str]:
+    """``<prefix>/<first-segment>`` paths mentioned in a brief text."""
+    text = str(brief or "")
+    if not text:
+        return []
+    out: list[str] = []
+    for prefix in worktree_prefixes():
+        pattern = re.compile(re.escape(prefix) + r"/([A-Za-z0-9._@+-]+)")
+        for match in pattern.finditer(text):
+            segment = match.group(1)
+            if segment in ("", ".", ".."):
+                continue
+            out.append(f"{prefix}/{segment}")
+    return out
+
+
+def job_conflict_dirs(job: dict) -> set[str]:
+    """Working-directory conflict keys of one job (canonical, deduped)."""
+    dirs: set[str] = set()
+    cwd = _canonical_dir(job.get("cwd"))
+    if cwd:
+        dirs.add(cwd)
+    for field in EXTRA_CWD_FIELDS:
+        value = job.get(field)
+        if isinstance(value, str):
+            items: list = [value]
+        elif isinstance(value, (list, tuple)):
+            items = [v for v in value if isinstance(v, str)]
+        else:
+            items = []
+        for item in items:
+            canon = _canonical_dir(item)
+            if canon:
+                dirs.add(canon)
+    for item in _brief_worktree_dirs(str(job.get("brief") or "")):
+        canon = _canonical_dir(item)
+        if canon:
+            dirs.add(canon)
+    return dirs
+
+
+def _dirs_conflict(left: str, right: str) -> bool:
+    """Same directory, or one is an ancestor of the other."""
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    return left.startswith(right + os.sep) or right.startswith(left + os.sep)
+
+
+def conflict_dirs_conflict(left: set[str], right: set[str]) -> bool:
+    return any(_dirs_conflict(a, b) for a in left for b in right)
+
+
+def job_goal_ids(job: dict) -> set[str]:
+    """Goals a job touches: explicit fields plus the chain's Goal for a slice."""
+    ids: set[str] = set()
+    for key in ("goal", "goal_id", "parent_goal"):
+        value = job.get(key)
+        if isinstance(value, str) and value.strip():
+            ids.add(value.strip())
+    slice_id = job.get("slice")
+    if isinstance(slice_id, str) and slice_id.strip() and not ids:
+        chain = _read_chain(slice_id.strip())
+        if isinstance(chain, dict):
+            goal = chain.get("goal")
+            if isinstance(goal, str) and goal.strip():
+                ids.add(goal.strip())
+    return ids
+
+
+def _job_for_dispatch(path: Path) -> dict:
+    """Best-effort job load for conflict keys; run_job reloads and quarantines.
+
+    A malformed file must still be dispatched (so run_job can reject it in the
+    worker) — it just cannot contribute conflict keys.
+    """
+    try:
+        return load_job(path)
+    except Exception:  # noqa: BLE001 - run_job owns the rejection path
+        return {}
+
+
+def _goal_processing_file(goal: dict, goal_id: str) -> Path | None:
+    """The processing job that owns a non-terminal Goal, if it can be found."""
+    raw = str(goal.get("processing_job") or "").strip()
+    if raw:
+        cand = Path(raw)
+        if not cand.is_absolute():
+            cand = PROCESSING / cand
+        if cand.is_file():
+            return cand
+    # Legacy state written before T2 has no ``processing_job``: find the goal
+    # job by content instead.
+    if not PROCESSING.is_dir():
+        return None
+    fallback: Path | None = None
+    for cand in sorted(PROCESSING.glob("*.json")):
+        if cand.name.endswith(".error.json"):
+            continue
+        try:
+            data = json.loads(cand.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if str(data.get("goal") or "") != goal_id:
+            continue
+        if str(data.get("type") or "ticket") == "goal":
+            return cand
+        if fallback is None and data.get("brief"):
+            fallback = cand
+    return fallback
+
+
+def collect_resume_items() -> list[dict]:
+    """Non-terminal Goals left by a previous run, oldest first (T2 resume).
+
+    A Goal is resumable when its status is planning/running/closeout and its
+    processing job is still on disk. A running Goal whose processing job is
+    gone is only logged: guessing would risk a double-run.
+    """
+    items: list[dict] = []
+    if not GOALS.is_dir():
+        return items
+    for path in sorted(GOALS.glob("*.json")):
+        try:
+            goal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(goal, dict):
+            continue
+        status = str(goal.get("status") or "")
+        if status not in RESUMABLE_GOAL_STATUSES:
+            continue
+        goal_id = str(goal.get("goal") or path.stem)
+        dest = _goal_processing_file(goal, goal_id)
+        if dest is None:
+            print(
+                f"[trial-broker] resume: goal {goal_id} status={status} has no "
+                "processing job; left alone",
+                flush=True,
+            )
+            continue
+        try:
+            job = json.loads(dest.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            print(
+                f"[trial-broker] resume: goal {goal_id} job unreadable {dest.name}",
+                flush=True,
+            )
+            continue
+        if not isinstance(job, dict):
+            continue
+        job.setdefault("goal", goal_id)
+        items.append(
+            {
+                "goal": goal_id,
+                "label": f"resume-{goal_id}",
+                "path": dest,
+                "job": job,
+                "dirs": job_conflict_dirs(job),
+                "goal_ids": {goal_id},
+                "runner": resume_goal_job,
+                "_created_at": str(goal.get("created_at") or ""),
+            }
+        )
+    items.sort(key=lambda it: (it["_created_at"], it["goal"]))
+    if items:
+        print(
+            "[trial-broker] resume candidates: "
+            + ", ".join(it["goal"] for it in items),
+            flush=True,
+        )
+    return items
+
+
+def _free_slot(running: dict, limit: int) -> int | None:
+    """Lowest free slot number in 1..limit (None when the cap is reached)."""
+    for slot in range(1, limit + 1):
+        if slot not in running:
+            return slot
+    return None
+
+
+def _block_reason(dirs: set[str], goal_ids: set[str], running: dict) -> str | None:
+    """Why this job cannot start right now ('' / None = runnable)."""
+    if goal_ids:
+        for rec in running.values():
+            overlap = goal_ids & (rec.get("goal_ids") or set())
+            if overlap:
+                # A goal-update / chain-reply must wait for the Goal thread to
+                # end: nobody may rewrite a live Goal's state concurrently.
+                return "goal-busy:" + ",".join(sorted(overlap))
+    for rec in running.values():
+        if conflict_dirs_conflict(dirs, rec.get("dirs") or set()):
+            return f"cwd-conflict:{rec.get('label')}"
+    return None
+
+
+def _start_job(running: dict, slot: int, *, label, path, job, dirs, goal_ids, runner) -> dict:
+    """Reserve ``slot``, then run the job in its own thread."""
+    rec = {
+        "slot": slot,
+        "label": label,
+        "path": path,
+        "job": job,
+        "dirs": set(dirs or ()),
+        "goal_ids": set(goal_ids or ()),
+        "started": time.time(),
+        "done": threading.Event(),
+    }
+    goal_id = next(iter(rec["goal_ids"]), None)
+    running[slot] = rec
+
+    def _work() -> None:
+        try:
+            with goal_context(goal_id, slot):
+                runner(path)
+        except BrokerDraining as e:
+            # Drain, not failure: no goal rewrite, no processing move, no notify.
+            print(f"[trial-broker] drain: {label} stopped before its next ticket ({e})", flush=True)
+        except Exception as e:  # noqa: BLE001 - one job must not take the loop down
+            print(f"[trial-broker] UNEXPECTED run_job error ({label}): {e}", flush=True)
+            try:
+                _quarantine_unexpected(path, e)
+            except Exception:  # noqa: BLE001 - intake guard must never re-raise
+                pass
+        finally:
+            rec["done"].set()
+
+    thread = threading.Thread(target=_work, name=f"trial-job-slot{slot}-{label}", daemon=True)
+    rec["thread"] = thread
+    thread.start()
+    return rec
+
+
+def scheduler_loop(
+    interval: int,
+    resume_items: list[dict] | None = None,
+    *,
+    stop_event: threading.Event | None = None,
+) -> int:
+    """Dispatch loop: slot threads for runnable jobs, queue for the rest."""
+    running: dict[int, dict] = {}
+    in_flight: dict[str, dict] = {}
+    pending_resume = list(resume_items or [])
+    started_resume: set[str] = set()
+
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return 0
+        # Reap: workers only ever set their own `done` event, so the main
+        # thread stays the single owner of `running` / `in_flight`.
+        for slot, rec in list(running.items()):
+            if rec["done"].is_set():
+                running.pop(slot, None)
+                in_flight.pop(rec["path"].name, None)
+
+        pending = list_pending()
+        if draining():
+            _write_heartbeat(len(pending), extra={"queued": [], "drain": True})
+            if not running:
+                print(
+                    "[trial-broker] drain complete: all in-flight tickets finished",
+                    flush=True,
+                )
+                return 0
+            time.sleep(DRAIN_POLL_SEC)
+            continue
+
+        # Re-read every round: limits.json can drop the cap without a restart.
+        limit = max(1, int(T.max_concurrent_goals()))
+        queued: list[dict] = []
+        dispatched = False
+
+        def _try(item: dict) -> bool:
+            nonlocal dispatched
+            if len(running) >= limit:
+                queued.append({"job": item["label"], "reason": "max_concurrent_goals"})
+                return False
+            reason = _block_reason(item["dirs"], item["goal_ids"], running)
+            if reason:
+                queued.append({"job": item["label"], "reason": reason})
+                return False
+            slot = _free_slot(running, limit)
+            if slot is None:
+                queued.append({"job": item["label"], "reason": "max_concurrent_goals"})
+                return False
+            rec = _start_job(
+                running,
+                slot,
+                label=item["label"],
+                path=item["path"],
+                job=item["job"],
+                dirs=item["dirs"],
+                goal_ids=item["goal_ids"],
+                runner=item["runner"],
+            )
+            in_flight[item["path"].name] = rec
+            dispatched = True
+            return True
+
+        # Resume work first (oldest Goal), then the inbox in enqueue order.
+        for item in pending_resume:
+            if item["goal"] in started_resume:
+                continue
+            if _try(item):
+                started_resume.add(item["goal"])
+
+        for path in pending:
+            if path.name in in_flight:
+                continue
+            job = _job_for_dispatch(path)
+            _try(
+                {
+                    "label": path.name,
+                    "path": path,
+                    "job": job,
+                    "dirs": job_conflict_dirs(job),
+                    "goal_ids": job_goal_ids(job),
+                    "runner": run_job,
+                }
+            )
+
+        _write_heartbeat(len(pending), extra={"queued": queued, "drain": False})
+        if not dispatched and not running:
+            maybe_offload_gc(force=False)
+            time.sleep(interval)
+        else:
+            time.sleep(LOOP_TICK_SEC)
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     _ensure_dirs()
     pending = [p.name for p in list_pending()]
@@ -5659,22 +7114,18 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     interval = max(5, int(args.poll))
     print(f"[trial-broker] polling every {interval}s inbox={INBOX}", flush=True)
-    while True:
-        pending = list_pending()
-        # Heartbeat for the independent watchdog. The mailbox watcher also
-        # refreshes it during long impl tickets; subprocess liveness covers the
-        # rest so a healthy long job is not mistaken for a stalled loop.
-        _write_heartbeat(len(pending))
-        if pending:
-            try:
-                run_job(pending[0])
-            except Exception as e:  # noqa: BLE001 - keep the poll loop alive
-                print(f"[trial-broker] UNEXPECTED run_job error: {e}", flush=True)
-                _quarantine_unexpected(pending[0], e)
-            _write_heartbeat(0)
-        else:
-            maybe_offload_gc(force=False)
-            time.sleep(interval)
+    # T2: SIGTERM drains instead of killing a ticket mid-flight.
+    _install_signal_handlers()
+    try:
+        resume_items = collect_resume_items()
+    except Exception as e:  # noqa: BLE001 - resume scan must not block startup
+        print(f"[trial-broker] resume scan failed: {e}", flush=True)
+        resume_items = []
+    try:
+        return scheduler_loop(interval, resume_items)
+    except KeyboardInterrupt:
+        print("[trial-broker] interrupted; exiting", flush=True)
+        return 130
 
 
 def main() -> int:

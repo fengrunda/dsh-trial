@@ -1349,6 +1349,18 @@ def ask_disposition(ask: dict, *, ticket: str | None, goal: dict | None) -> str:
     return "orphan"
 
 
+def _ask_goal_id(ask: dict) -> str:
+    """Goal id an ask declares (``ask.goal``, else ``ask.from.goal``); ``""`` if none."""
+    if not isinstance(ask, dict):
+        return ""
+    gid = ask.get("goal")
+    if not (isinstance(gid, str) and gid.strip()):
+        frm = ask.get("from")
+        if isinstance(frm, dict):
+            gid = frm.get("goal")
+    return gid.strip() if isinstance(gid, str) else ""
+
+
 def watch_should_handle_ask(ask: dict, *, ticket: str | None, goal: dict | None) -> bool:
     """Watcher-side ownership gate for :func:`_handle_pending_ask_file`.
 
@@ -1356,14 +1368,68 @@ def watch_should_handle_ask(ask: dict, *, ticket: str | None, goal: dict | None)
     left for its owner (concurrent Goals must not steal each other's
     supervisor/gate asks). An orphan ask — one no active Goal claims — keeps the
     old "handle everything" behaviour only while a single Goal (or a legacy
-    no-Goal ticket) is in flight.
+    no-Goal ticket) is in flight, and never when the ask declares a *different*
+    Goal: handling it here would bill another Goal's ask to our state and cwd.
     """
     disposition = ask_disposition(ask, ticket=ticket, goal=goal)
     if disposition == "mine":
         return True
     if disposition == "other":
         return False
+    ask_gid = _ask_goal_id(ask)
+    own_gid = str((goal or {}).get("goal") or "") if isinstance(goal, dict) else ""
+    if ask_gid and ask_gid != own_gid:
+        return False
     return active_goal_count() <= 1
+
+
+_ASK_ERROR_REPORTED: set[str] = set()
+_ASK_ERROR_REPORTED_LOCK = threading.Lock()
+
+
+def _fail_ask_after_error(path: Path, ask: dict, exc: BaseException) -> None:
+    """Terminate a crashed ask instead of retrying it on every watcher tick.
+
+    Writes a structured ``ok=False`` / ``HOLD`` answer when none exists yet and
+    archives the pending file, so a handler crash cannot leave the ask pending
+    forever. Logs at most one line per ask.
+    """
+    ask_id = str((ask or {}).get("ask_id") or "").strip()
+    if not ask_id and path is not None:
+        ask_id = path.stem
+    answers = MAILBOX / "answers"
+    ans_path = answers / f"{ask_id}.json" if ask_id else None
+    try:
+        if ans_path is not None and not ans_path.exists():
+            answers.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(
+                ans_path,
+                {
+                    "ask_id": ask_id,
+                    "status": "done",
+                    "ok": False,
+                    "verdict": "HOLD",
+                    "rework_mode": "fresh",
+                    "error": str(exc),
+                    "instruction": "broker error handling ask — end ticket",
+                },
+            )
+    except OSError:
+        pass
+    try:
+        arch = MAILBOX / "archive"
+        arch.mkdir(parents=True, exist_ok=True)
+        if path is not None and path.is_file():
+            path.rename(arch / f"{ask_id}.pending.json")
+    except OSError:
+        pass
+    first = False
+    with _ASK_ERROR_REPORTED_LOCK:
+        if ask_id not in _ASK_ERROR_REPORTED:
+            _ASK_ERROR_REPORTED.add(ask_id)
+            first = True
+    if first:
+        print(f"[trial-broker] mailbox watch error: {exc}", flush=True)
 
 
 def _handle_pending_ask_file(path: Path, *, default_profile: str, cwd: str, goal: dict | None) -> None:
@@ -2365,7 +2431,7 @@ def run_open_slice(
                                 goal=goal,
                             )
                         except Exception as e:  # noqa: BLE001
-                            print(f"[trial-broker] mailbox watch error: {e}", flush=True)
+                            _fail_ask_after_error(ap, ask, e)
                     stop.wait(2.0)
 
         watcher = threading.Thread(target=_watch, name="mailbox-watch", daemon=True)

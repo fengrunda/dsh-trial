@@ -172,6 +172,147 @@ def test_ask_handler_timeout_accounting(tmp_path: Path):
     print("OK ask handler timeout accounting")
 
 
+# --------------------------------------------------------------------------
+# T2b: orphan ask belonging to another Goal must not be handled by our watcher
+# --------------------------------------------------------------------------
+class _MailboxEnv:
+    """Point tb.MAILBOX / T.MAILBOX at a throwaway mailbox for one test."""
+
+    def __init__(self, root: Path):
+        self.root = root
+
+    def __enter__(self) -> Path:
+        self.old = (tb.MAILBOX, T.MAILBOX)
+        tb.MAILBOX = self.root
+        T.MAILBOX = self.root
+        return self.root
+
+    def __exit__(self, *exc) -> bool:
+        tb.MAILBOX, T.MAILBOX = self.old
+        return False
+
+
+class _OnlyActiveGoal:
+    """Exactly one active Goal (``gid``) for the duration of the block."""
+
+    def __init__(self, gid: str):
+        self.gid = gid
+
+    def __enter__(self) -> str:
+        with tb._ACTIVE_GOALS_LOCK:
+            self.prev = dict(tb.ACTIVE_GOALS)
+            tb.ACTIVE_GOALS.clear()
+        tb.register_active_goal(self.gid, ticket="t-g1", slices=["unit-watch"])
+        return self.gid
+
+    def __exit__(self, *exc) -> bool:
+        tb.unregister_active_goal(self.gid)
+        with tb._ACTIVE_GOALS_LOCK:
+            tb.ACTIVE_GOALS.clear()
+            tb.ACTIVE_GOALS.update(self.prev)
+        return False
+
+
+def _goal(gid: str = "G1") -> dict:
+    return {
+        "goal": gid,
+        "status": "active",
+        "ticket": "t-g1",
+        "slices": ["unit-watch"],
+        "current_slice": "unit-watch",
+    }
+
+
+def test_ask_goal_id_reads_goal_and_from_goal():
+    assert tb._ask_goal_id({"goal": " G2 "}) == "G2"
+    assert tb._ask_goal_id({"from": {"goal": "G2"}}) == "G2"
+    assert tb._ask_goal_id({"from": {"role": "impl"}}) == ""
+    assert tb._ask_goal_id({}) == ""
+    assert tb._ask_goal_id("not-a-dict") == ""
+
+
+def test_watch_should_handle_ask_orphan_owned_by_other_goal():
+    with _OnlyActiveGoal("G1"):
+        goal = _goal("G1")
+        orphan_g2 = {
+            "ask_id": "t3c-gate-1",
+            "to_role": "supervisor",
+            "kind": "ask_supervisor",
+            "questions": ["q"],
+            "goal": "G2",  # 非活跃 Goal：本 watcher 不得接手
+        }
+        assert tb.ask_disposition(orphan_g2, ticket="t-g1", goal=goal) == "orphan"
+        assert tb.watch_should_handle_ask(orphan_g2, ticket="t-g1", goal=goal) is False
+        # from.goal 同样识别
+        nested = dict(orphan_g2, goal=None, **{"from": {"goal": "G2"}})
+        nested.pop("goal")
+        assert tb._ask_goal_id(nested) == "G2"
+        assert tb.watch_should_handle_ask(nested, ticket="t-g1", goal=goal) is False
+
+        # 未声明 goal 的 orphan 保持旧行为（单活跃 Goal → 处理）
+        anon = {k: v for k, v in orphan_g2.items() if k != "goal"}
+        assert tb.watch_should_handle_ask(anon, ticket="t-g1", goal=goal) is True
+
+        # 本 Goal 自己的 ask → 处理
+        mine = dict(orphan_g2, goal="G1", ticket="t-g1")
+        assert tb.ask_disposition(mine, ticket="t-g1", goal=goal) == "mine"
+        assert tb.watch_should_handle_ask(mine, ticket="t-g1", goal=goal) is True
+        # 无 ticket/slice 但声明 goal=G1 的 ask 仍走 orphan 旧行为
+        own_gid_only = dict(orphan_g2, goal="G1")
+        assert tb.watch_should_handle_ask(own_gid_only, ticket="t-g1", goal=goal) is True
+
+
+def test_fail_ask_after_error_writes_answer_and_archives(tmp_path: Path):
+    root = tmp_path / "mailbox"
+    (root / "pending").mkdir(parents=True)
+    (root / "answers").mkdir()
+    ask = {"ask_id": "boom1", "to_role": "supervisor", "kind": "ask_supervisor"}
+    p = root / "pending" / "boom1.json"
+    p.write_text(json.dumps(ask), encoding="utf-8")
+
+    with _MailboxEnv(root):
+        with mock.patch.object(tb, "print") as mp:
+            tb._fail_ask_after_error(p, ask, RuntimeError("handler blew up"))
+            # 第二次调用：答复已存在 → 不覆盖，日志也只打一条
+            tb._fail_ask_after_error(p, ask, RuntimeError("handler blew up"))
+        lines = [
+            ca.args[0]
+            for ca in mp.call_args_list
+            if ca.args and "mailbox watch error" in str(ca.args[0])
+        ]
+        assert len(lines) == 1
+
+        ans = json.loads((root / "answers" / "boom1.json").read_text(encoding="utf-8"))
+        assert ans["ask_id"] == "boom1"
+        assert ans["ok"] is False
+        assert ans["status"] == "done"
+        assert ans["verdict"] == "HOLD"
+        assert ans["rework_mode"] == "fresh"
+        assert "handler blew up" in ans["error"]
+        assert "end ticket" in ans["instruction"]
+        assert not p.exists()
+        assert (root / "archive" / "boom1.pending.json").is_file()
+
+        # 已有答复不被覆盖
+        (root / "answers" / "boom1.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+        tb._fail_ask_after_error(p, ask, RuntimeError("again"))
+        assert json.loads((root / "answers" / "boom1.json").read_text(encoding="utf-8")) == {"ok": True}
+
+
+def test_watch_except_calls_fail_ask_after_error():
+    """`_watch` 的 except 必须把异常交给 _fail_ask_after_error（不再无限重试）。"""
+    import re
+
+    src = (ROOT / "trial-broker.py").read_text(encoding="utf-8")
+    m = re.search(r"\n        def _watch\(\):(.*?)\n        watcher = threading\.Thread", src, re.S)
+    assert m, "watcher loop not found"
+    body = m.group(1)
+    assert "_fail_ask_after_error(ap, ask, e)" in body
+    assert "except Exception as e:" in body
+    # except 分支里 _handle_pending_ask_file 的裸 print 重试已被替换
+    assert 'mailbox watch error: {e}", flush=True)' not in body
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -181,4 +322,8 @@ if __name__ == "__main__":
         test_pending_ask_watch_and_answer(base / "watch")
         test_record_ticket_metric_peak_times_steps()
         test_ask_handler_timeout_accounting(base / "askto")
+        test_ask_goal_id_reads_goal_and_from_goal()
+        test_watch_should_handle_ask_orphan_owned_by_other_goal()
+        test_fail_ask_after_error_writes_answer_and_archives(base / "fail-ask")
+        test_watch_except_calls_fail_ask_after_error()
     print("ALL OK")

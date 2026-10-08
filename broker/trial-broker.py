@@ -1739,6 +1739,10 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
         "questions": [],
     }
     cwd_path = Path(cwd)
+    # F1: the review gets its own label and never reuses a name whose verdict
+    # already exists — a mid-ticket rev1 used to rewrite the chain round 1
+    # pack/summary (`-gate-r1.*`) and lose that round's conclusion.
+    rev_label = _unique_review_tag(slice_id, f"rev{round_n}", delta=bool(prior_findings))
     try:
         if prior_findings:
             # delta-only re-review pack
@@ -1751,6 +1755,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                 foreman_block=foreman_block,
                 foreman_summary_text=str(ask.get("summary") or ""),
                 cwd=cwd_path,
+                label=rev_label,
             )
         else:
             gate_pack = build_gate_pack(
@@ -1761,6 +1766,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                 foreman_block=foreman_block,
                 foreman_summary_text=str(ask.get("summary") or ""),
                 cwd=cwd_path,
+                label=rev_label,
             )
     except ValueError as e:
         T.write_ask_answer(ask_id, f"[error] gate pack: {e}", supervisor_ticket="(error)")
@@ -1772,7 +1778,9 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
         return
 
     gate_ticket = f"gate-trial-{slice_id}-rev{round_n}"
-    gate_summary_name = f"{slice_id}-gate-rev{round_n}"
+    # derived from the pack we actually wrote, so summary_out and summary_name
+    # can never point at different files
+    gate_summary_name = _gate_summary_name_for_pack(gate_pack)
     gate_log = ARTIFACT_ROOT / f"{gate_ticket}.log"
     # Interim ack written BEFORE the (possibly multi-minute) gate spawn, so the
     # plugin learns a gate is running and how long to wait. It carries no
@@ -1866,6 +1874,100 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
     )
 
 
+# ---------------------------------------------------------------------------
+# gate review naming: one review must never overwrite an earlier verdict
+#
+# A mid-ticket ``submit_for_review`` used to reuse the chain round name
+# (``-gate-r1.pack.md`` / ``-gate-r1.md``) even when that round already had a
+# verdict on disk, so the gate agent rewrote round 1's conclusion and
+# ``rounds[0].gate_summary`` pointed at the second review. Reviews now carry
+# their own label (``rev<N>``) and any label whose verdict already exists is
+# suffixed ``-2``, ``-3`` … instead of being reused.
+# ---------------------------------------------------------------------------
+def _gate_names(slice_id: str, label: str, *, delta: bool = False) -> tuple[str, str]:
+    """(pack basename, summary basename) for one gate review label.
+
+    ``label`` is the round tag: chain rounds use ``r<N>``, a mid-ticket
+    ``submit_for_review`` uses ``rev<N>`` (``rev<N>-2`` … after a bump).
+    """
+    kind = "gate-delta" if delta else "gate"
+    return f"{slice_id}-{kind}-{label}.pack.md", f"{slice_id}-gate-{label}"
+
+
+def _gate_summary_name_for_pack(pack_name: str) -> str:
+    """Summary basename a gate pack basename maps to.
+
+    Keeps a pack's ``summary_out`` and the ``summary_name`` the caller passes to
+    ``run_open_slice`` from ever disagreeing.
+    """
+    name = Path(pack_name).name
+    if name.endswith(".pack.md"):
+        name = name[: -len(".pack.md")]
+    return name.replace("-gate-delta-", "-gate-")
+
+
+def _gate_review_tag(slice_id: str, summary_name: str) -> str:
+    """Inverse of ``_gate_names``: summary basename → label tag (``rev1-2``)."""
+    name = Path(summary_name).name
+    if name.endswith(".md"):
+        name = name[:-3]
+    prefix = f"{slice_id}-gate-"
+    return name[len(prefix):] if name.startswith(prefix) else name
+
+
+def _gate_summary_has_verdict(summary_name: str) -> bool:
+    """True when ``SUMMARIES/<summary_name>.md`` exists and is not empty."""
+    name = Path(summary_name).name
+    if name.endswith(".md"):
+        name = name[:-3]
+    path = SUMMARIES / f"{name}.md"
+    try:
+        return path.is_file() and bool(path.read_text(encoding="utf-8").strip())
+    except OSError:
+        return False
+
+
+def _pack_declared_summary(pack_name: str) -> str:
+    """``summary_out`` basename declared by an already written pack ('' if none)."""
+    path = PACKS / Path(pack_name).name
+    try:
+        head = path.read_text(encoding="utf-8")[:2048]
+    except OSError:
+        return ""
+    m = re.search(r"^summary_out:\s*(.+?)\s*$", head, re.M)
+    return Path(m.group(1)).name if m else ""
+
+
+def _gate_review_taken(pack_name: str, summary_name: str) -> bool:
+    """A name pair is taken as soon as a verdict exists for it."""
+    if _gate_summary_has_verdict(summary_name):
+        return True
+    declared = _pack_declared_summary(pack_name)
+    return bool(declared) and _gate_summary_has_verdict(declared)
+
+
+def _unique_review_names(slice_id: str, label: str, *, delta: bool = False) -> tuple[str, str]:
+    """Names for this review that never overwrite an existing gate verdict.
+
+    Candidate ``label`` first; while its summary already carries a verdict the
+    label is suffixed ``-2``, ``-3`` … until both pack and summary are free.
+    Returns ``(pack basename, summary basename)``.
+    """
+    tag = label
+    for n in range(2, 1000):
+        pack_name, summary_name = _gate_names(slice_id, tag, delta=delta)
+        if not _gate_review_taken(pack_name, summary_name):
+            return pack_name, summary_name
+        tag = f"{label}-{n}"
+    return _gate_names(slice_id, f"{label}-{int(time.time())}", delta=delta)
+
+
+def _unique_review_tag(slice_id: str, label: str, *, delta: bool = False) -> str:
+    """The (possibly ``-2``/``-3`` suffixed) tag ``_unique_review_names`` picked."""
+    _pack_name, summary_name = _unique_review_names(slice_id, label, delta=delta)
+    return _gate_review_tag(slice_id, summary_name)
+
+
 def build_delta_gate_pack(
     *,
     slice_id: str,
@@ -1876,6 +1978,7 @@ def build_delta_gate_pack(
     foreman_block: dict,
     foreman_summary_text: str,
     cwd: Path,
+    label: str | None = None,
 ) -> str:
     """Delta-only gate pack: prior findings + new diff + acceptance. No full original pack body."""
     base = (foreman_block or {}).get("base") or ""
@@ -1886,7 +1989,9 @@ def build_delta_gate_pack(
     diff, _ = _truncate_bytes(diff, MAX_DIFF_BYTES)
     findings_json = json.dumps(prior_findings or [], ensure_ascii=False, indent=2)
     acc_txt, _acc_stripped = _gate_acceptance_text(acceptance)
-    name = f"{slice_id}-gate-delta-r{round_n}.pack.md"
+    # label=None keeps the chain round name (r<N>); a rev ticket passes rev<N>.
+    tag = label or f"r{round_n}"
+    name = f"{slice_id}-gate-delta-{tag}.pack.md"
     path = PACKS / name
     body = f"""---
 slice_id: {slice_id}
@@ -1894,10 +1999,10 @@ kind: gate-delta
 round: {round_n}
 role: gate
 original_pack: {Path(original_pack_name).name}
-summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-gate-rev{round_n}.md
+summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_pack(name)}.md
 ---
 
-# Delta gate · {slice_id} · rev{round_n}
+# Delta gate · {slice_id} · {tag}
 
 ## Acceptance (still apply)
 {acc_txt}
@@ -2165,8 +2270,14 @@ def build_gate_pack(
     foreman_block: dict,
     foreman_summary_text: str,
     cwd: Path,
+    label: str | None = None,
 ) -> str:
-    """Write packs/<slice>-gate-r<N>.pack.md; return basename."""
+    """Write packs/<slice>-gate-<tag>.pack.md; return basename.
+
+    ``label`` defaults to ``r<round_n>`` (chain round, resume depends on that
+    name); a mid-ticket ``submit_for_review`` passes ``rev<round_n>`` so it can
+    never overwrite the chain round's verdict.
+    """
     orig_path = PACKS / Path(original_pack_name).name
     orig_body = orig_path.read_text(encoding="utf-8") if orig_path.is_file() else "(missing original pack)"
     # Prefer machine base/commit for diff
@@ -2182,7 +2293,8 @@ def build_gate_pack(
     orig_cap = max(1024, MAX_PACK_BYTES // 3)
     orig_trunc, orig_was_trunc = _truncate_bytes(orig_body, orig_cap)
     fm_json = json.dumps(foreman_block or {}, ensure_ascii=False, indent=2)
-    name = f"{slice_id}-gate-r{round_n}.pack.md"
+    tag = label or f"r{round_n}"
+    name = f"{slice_id}-gate-{tag}.pack.md"
     path = PACKS / name
     body = f"""---
 slice_id: {slice_id}
@@ -2190,11 +2302,11 @@ kind: gate-pack
 round: {round_n}
 role: gate
 original_pack: {Path(original_pack_name).name}
-summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-gate-r{round_n}.md
+summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_pack(name)}.md
 max_bytes_hint: {MAX_PACK_BYTES}
 ---
 
-# Gate pack · {slice_id} · round {round_n}
+# Gate pack · {slice_id} · round {round_n} ({tag})
 
 ## Original pack reference
 - name: `{Path(original_pack_name).name}`
@@ -4719,8 +4831,23 @@ def run_chain_rounds(
         # Gate
         gate_ticket = f"gate-trial-{slice_id}-r{round_n}"
         gate_summary_name = f"{slice_id}-gate-r{round_n}"
+        if resume:
+            # Resume reuses the exact file the previous attempt used, which may
+            # already be a `-2` bump; it never bumps to a fresh name.
+            prev = Path(str(round_rec.get("gate_summary") or "")).name
+            if prev.endswith(".md"):
+                gate_summary_name = prev[:-3]
         gate_summary = SUMMARIES / f"{gate_summary_name}.md"
         gate_log = ARTIFACT_ROOT / f"{gate_ticket}.log"
+        # T2 resume: a gate summary already on disk is this round's verdict.
+        # Re-opening the gate ticket would overwrite evidence and double-count.
+        reuse_gate = bool(resume) and gate_summary.is_file()
+        if not resume:
+            # F1: never overwrite a verdict already on disk — r<N> becomes
+            # r<N>-2, r<N>-3 … instead (resume keeps the original name).
+            gate_summary_name = _unique_review_names(slice_id, f"r{round_n}")[1]
+            gate_summary = SUMMARIES / f"{gate_summary_name}.md"
+        gate_label = _gate_review_tag(slice_id, gate_summary_name)
         try:
             gate_pack = build_gate_pack(
                 slice_id=slice_id,
@@ -4730,6 +4857,7 @@ def run_chain_rounds(
                 foreman_block=block,
                 foreman_summary_text=parsed["text"],
                 cwd=cwd,
+                label=gate_label,
             )
         except ValueError as e:
             chain["state"] = "failed"
@@ -4739,9 +4867,6 @@ def run_chain_rounds(
             return 1
 
         round_rec["gate_pack"] = gate_pack
-        # T2 resume: a gate summary already on disk is this round's verdict.
-        # Re-opening the gate ticket would overwrite evidence and double-count.
-        reuse_gate = bool(resume) and gate_summary.is_file()
         if reuse_gate:
             _adopt_misplaced_summary(gate_summary)
             gec = int(round_rec.get("gate_exit") or 0)

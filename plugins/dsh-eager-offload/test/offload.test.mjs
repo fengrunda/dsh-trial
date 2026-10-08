@@ -20,6 +20,7 @@ import {
   saveOffloadFile,
   sessionDirName,
 } from '../lib/offload.js'
+import { apply } from '../lib/index.js'
 
 test('normalizeConfig defaults', () => {
   const cfg = normalizeConfig({}, { dshHome: '/tmp/fake-dsh' })
@@ -34,6 +35,122 @@ test('normalizeConfig defaults', () => {
 test('normalizeConfig rejects bad inlineMaxBytes', () => {
   assert.throws(() => normalizeConfig({ inlineMaxBytes: -1 }), /inlineMaxBytes/)
   assert.throws(() => normalizeConfig({ inlineMaxBytes: 1.5 }), /inlineMaxBytes/)
+})
+
+test('normalizeConfig contextClear defaults: disabled and deeply frozen', () => {
+  const cc = normalizeConfig({}, { dshHome: '/tmp/x' }).contextClear
+  assert.deepEqual(cc, {
+    enabled: false,
+    mode: 'compaction-coupled',
+    keepRecentResults: 8,
+    minResultBytes: 1200,
+    placeholder: { headBytes: 160, tailBytes: 240, failTailBytes: 600 },
+    collapseWriteSteps: { enabled: true, tools: ['write', 'edit'], minArgChars: 1200 },
+  })
+  assert.ok(Object.isFrozen(cc))
+  assert.ok(Object.isFrozen(cc.placeholder))
+  assert.ok(Object.isFrozen(cc.collapseWriteSteps))
+  assert.ok(Object.isFrozen(cc.collapseWriteSteps.tools))
+})
+
+test('normalizeConfig contextClear merges partial input over defaults', () => {
+  const cc = normalizeConfig(
+    {
+      contextClear: {
+        enabled: true,
+        mode: 'off',
+        keepRecentResults: 2,
+        placeholder: { tailBytes: 10 },
+        collapseWriteSteps: { tools: ['write'] },
+      },
+    },
+    { dshHome: '/tmp/x' },
+  ).contextClear
+  assert.equal(cc.enabled, true)
+  assert.equal(cc.mode, 'off')
+  assert.equal(cc.keepRecentResults, 2)
+  assert.equal(cc.minResultBytes, 1200) // untouched default survives
+  assert.deepEqual(cc.placeholder, { headBytes: 160, tailBytes: 10, failTailBytes: 600 })
+  assert.deepEqual(cc.collapseWriteSteps, { enabled: true, tools: ['write'], minArgChars: 1200 })
+})
+
+test('normalizeConfig contextClear null/undefined yield full defaults', () => {
+  const base = normalizeConfig({}, { dshHome: '/tmp/x' }).contextClear
+  assert.deepEqual(normalizeConfig({ contextClear: null }, { dshHome: '/tmp/x' }).contextClear, base)
+  assert.deepEqual(normalizeConfig({ contextClear: undefined }, { dshHome: '/tmp/x' }).contextClear, base)
+})
+
+test('normalizeConfig contextClear rejects unknown keys, bad enums and bad values', () => {
+  assert.throws(() => normalizeConfig({ contextClear: { nope: 1 } }), /contextClear\.nope/)
+  assert.throws(() => normalizeConfig({ contextClear: { placeholder: { nope: 1 } } }), /placeholder\.nope/)
+  assert.throws(
+    () => normalizeConfig({ contextClear: { collapseWriteSteps: { nope: 1 } } }),
+    /collapseWriteSteps\.nope/,
+  )
+  assert.throws(() => normalizeConfig({ contextClear: { mode: 'sometimes' } }), /contextClear\.mode/)
+  assert.throws(() => normalizeConfig({ contextClear: { enabled: 'yes' } }), /contextClear\.enabled/)
+  assert.throws(() => normalizeConfig({ contextClear: { keepRecentResults: -1 } }), /keepRecentResults/)
+  assert.throws(() => normalizeConfig({ contextClear: { keepRecentResults: 1.5 } }), /keepRecentResults/)
+  assert.throws(() => normalizeConfig({ contextClear: { minResultBytes: -1 } }), /minResultBytes/)
+  assert.throws(() => normalizeConfig({ contextClear: { placeholder: { headBytes: -1 } } }), /headBytes/)
+  assert.throws(
+    () => normalizeConfig({ contextClear: { collapseWriteSteps: { minArgChars: -1 } } }),
+    /minArgChars/,
+  )
+  assert.throws(
+    () =>
+      normalizeConfig({
+        contextClear: { collapseWriteSteps: { enabled: 'yes' } },
+      }),
+    /collapseWriteSteps\.enabled/,
+  )
+  assert.throws(
+    () => normalizeConfig({ contextClear: { collapseWriteSteps: { tools: 'write' } } }),
+    /tools must be an array/,
+  )
+  assert.throws(
+    () => normalizeConfig({ contextClear: { collapseWriteSteps: { tools: [''] } } }),
+    /non-empty strings/,
+  )
+  assert.throws(() => normalizeConfig({ contextClear: 'on' }), /contextClear must be an object/)
+  assert.throws(() => normalizeConfig({ contextClear: { placeholder: [] } }), /placeholder must be an object/)
+})
+
+test('normalizeConfig still loads legacy ageMaskEnabled:true (deprecated, retained)', () => {
+  const cfg = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 3 }, { dshHome: '/tmp/x' })
+  assert.equal(cfg.ageMaskEnabled, true)
+  assert.equal(cfg.ageMaskKeepRecentN, 3)
+  assert.equal(cfg.contextClear.enabled, false)
+})
+
+test('apply never registers agent/pre-step and warns once when ageMaskEnabled', () => {
+  const events = []
+  const warns = []
+  const infos = []
+  apply(
+    {
+      on: (event, handler, opts) => events.push({ event, handler, opts }),
+      logger: { warn: (m) => warns.push(m), info: (m) => infos.push(m) },
+    },
+    { ageMaskEnabled: true, contextClear: { enabled: true } },
+  )
+
+  assert.deepEqual(events.map((e) => e.event), ['tools/post-execute'])
+  assert.equal(warns.filter((w) => /ageMaskEnabled is deprecated/.test(w)).length, 1)
+  assert.ok(warns[0].includes('use contextClear'))
+  assert.ok(infos.some((m) => m.includes('contextClear=on(compaction-coupled,keep=8)')))
+
+  const warnsOff = []
+  const infosOff = []
+  apply(
+    {
+      on: () => {},
+      logger: { warn: (m) => warnsOff.push(m), info: (m) => infosOff.push(m) },
+    },
+    { contextClear: {} },
+  )
+  assert.equal(warnsOff.length, 0)
+  assert.ok(infosOff.some((m) => m.includes('contextClear=off')))
 })
 
 test('flattenPlainText requires all-text blocks', () => {

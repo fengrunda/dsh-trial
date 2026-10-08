@@ -27,14 +27,43 @@ export const DEFAULT_PREVIEW_TAIL_BYTES = 1024
  */
 export const DEFAULT_OFFLOAD_READ_MAX_INLINE_BYTES = 16384
 
-/** Age-based clearing is opt-in: product profiles keep every tool_result in full. */
+/**
+ * Age-based clearing is opt-in: product profiles keep every tool_result in full.
+ * @deprecated ageMask is a no-op on dsh 0.1.5-rc.2 / 0.2.x — `agent/pre-step`
+ * never sees the full history. Kept only so existing profiles still load.
+ */
 export const DEFAULT_AGE_MASK_ENABLED = false
 
-/** Newest N tool_result messages kept verbatim once age-mask is enabled. */
+/**
+ * Newest N tool_result messages kept verbatim once age-mask is enabled.
+ * @deprecated Kept only so existing profiles still load; see `maskOldToolResults`.
+ */
 export const DEFAULT_AGE_MASK_KEEP_RECENT_N = 8
 
 /** Marker embedded in every replacement notice (loop / composition detection). */
 export const OFFLOAD_MARK = 'dsh-eager-offload:'
+
+/**
+ * `contextClear` defaults (T1 skeleton; wiring lands in T2/T3). Compaction-coupled
+ * clearing only: right after `compaction-basic` summarises, the old tool results
+ * kept in its retained tail are cleared via a persistent surfaceOp `replace`.
+ * Opt-in per profile: acp / acp-lite leave it unconfigured, i.e. disabled.
+ */
+export const DEFAULT_CONTEXT_CLEAR = Object.freeze({
+  enabled: false,
+  mode: 'compaction-coupled',
+  keepRecentResults: 8,
+  minResultBytes: 1200,
+  placeholder: Object.freeze({ headBytes: 160, tailBytes: 240, failTailBytes: 600 }),
+  collapseWriteSteps: Object.freeze({
+    enabled: true,
+    tools: Object.freeze(['write', 'edit']),
+    minArgChars: 1200,
+  }),
+})
+
+/** Allowed `contextClear.mode` values; anything else is rejected at mount. */
+export const CONTEXT_CLEAR_MODES = Object.freeze(['off', 'compaction-coupled'])
 
 /** Official spill-policy notice fragment — already-bounded results may still be shrunk. */
 export const SPILL_LOCATION_MARK = ' Full formatted result stored at: '
@@ -77,6 +106,155 @@ function requireNonNegInt(n, label, fallback) {
 }
 
 /**
+ * @param {unknown} value
+ * @param {string} label
+ * @param {boolean} fallback
+ * @returns {boolean}
+ */
+function requireBoolean(value, label, fallback) {
+  if (value === undefined || value === null) return fallback
+  if (value !== true && value !== false) {
+    throw new TypeError(`dsh-eager-offload: ${label} must be a boolean`)
+  }
+  return value
+}
+
+/**
+ * Reject unknown keys so typos surface at mount instead of being silently ignored.
+ * @param {Record<string, unknown>} object
+ * @param {ReadonlySet<string>} allowed
+ * @param {string} label
+ */
+function rejectUnknownKeys(object, allowed, label) {
+  for (const key of Object.keys(object)) {
+    if (!allowed.has(key)) {
+      throw new TypeError(`dsh-eager-offload: ${label}.${key} is not a known option`)
+    }
+  }
+}
+
+/**
+ * Coerce an optional plain object; `undefined` / `null` become `{}`.
+ * @param {unknown} value
+ * @param {string} label
+ * @returns {Record<string, unknown>}
+ */
+function optionalObject(value, label) {
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`dsh-eager-offload: ${label} must be an object`)
+  }
+  return /** @type {Record<string, unknown>} */ (value)
+}
+
+const CONTEXT_CLEAR_KEYS = new Set([
+  'enabled',
+  'mode',
+  'keepRecentResults',
+  'minResultBytes',
+  'placeholder',
+  'collapseWriteSteps',
+])
+const CONTEXT_CLEAR_PLACEHOLDER_KEYS = new Set(['headBytes', 'tailBytes', 'failTailBytes'])
+const CONTEXT_CLEAR_COLLAPSE_KEYS = new Set(['enabled', 'tools', 'minArgChars'])
+
+/**
+ * Validate and normalise the `contextClear` block, merging partial input over
+ * `DEFAULT_CONTEXT_CLEAR`. Unknown keys, non-objects, bad enum values and bad
+ * integers throw at mount. The returned object is deeply frozen.
+ *
+ * @param {unknown} raw
+ * @returns {{
+ *   enabled: boolean,
+ *   mode: 'off' | 'compaction-coupled',
+ *   keepRecentResults: number,
+ *   minResultBytes: number,
+ *   placeholder: { headBytes: number, tailBytes: number, failTailBytes: number },
+ *   collapseWriteSteps: { enabled: boolean, tools: readonly string[], minArgChars: number },
+ * }}
+ */
+export function normalizeContextClear(raw) {
+  const source = optionalObject(raw, 'contextClear')
+  rejectUnknownKeys(source, CONTEXT_CLEAR_KEYS, 'contextClear')
+
+  const enabled = requireBoolean(source.enabled, 'contextClear.enabled', DEFAULT_CONTEXT_CLEAR.enabled)
+
+  let mode = DEFAULT_CONTEXT_CLEAR.mode
+  if (source.mode !== undefined && source.mode !== null) {
+    if (!CONTEXT_CLEAR_MODES.includes(/** @type {string} */ (source.mode))) {
+      throw new TypeError(
+        `dsh-eager-offload: contextClear.mode must be one of ${CONTEXT_CLEAR_MODES.join(' | ')} ` +
+          `(got ${String(source.mode)})`,
+      )
+    }
+    mode = /** @type {'off' | 'compaction-coupled'} */ (source.mode)
+  }
+
+  const keepRecentResults = requireNonNegInt(
+    source.keepRecentResults,
+    'contextClear.keepRecentResults',
+    DEFAULT_CONTEXT_CLEAR.keepRecentResults,
+  )
+  const minResultBytes = requireNonNegInt(
+    source.minResultBytes,
+    'contextClear.minResultBytes',
+    DEFAULT_CONTEXT_CLEAR.minResultBytes,
+  )
+
+  const placeholderSource = optionalObject(source.placeholder, 'contextClear.placeholder')
+  rejectUnknownKeys(placeholderSource, CONTEXT_CLEAR_PLACEHOLDER_KEYS, 'contextClear.placeholder')
+  const placeholder = Object.freeze({
+    headBytes: requireNonNegInt(
+      placeholderSource.headBytes,
+      'contextClear.placeholder.headBytes',
+      DEFAULT_CONTEXT_CLEAR.placeholder.headBytes,
+    ),
+    tailBytes: requireNonNegInt(
+      placeholderSource.tailBytes,
+      'contextClear.placeholder.tailBytes',
+      DEFAULT_CONTEXT_CLEAR.placeholder.tailBytes,
+    ),
+    failTailBytes: requireNonNegInt(
+      placeholderSource.failTailBytes,
+      'contextClear.placeholder.failTailBytes',
+      DEFAULT_CONTEXT_CLEAR.placeholder.failTailBytes,
+    ),
+  })
+
+  const collapseSource = optionalObject(source.collapseWriteSteps, 'contextClear.collapseWriteSteps')
+  rejectUnknownKeys(collapseSource, CONTEXT_CLEAR_COLLAPSE_KEYS, 'contextClear.collapseWriteSteps')
+  let tools = [...DEFAULT_CONTEXT_CLEAR.collapseWriteSteps.tools]
+  if (collapseSource.tools !== undefined && collapseSource.tools !== null) {
+    if (!Array.isArray(collapseSource.tools)) {
+      throw new TypeError('dsh-eager-offload: contextClear.collapseWriteSteps.tools must be an array')
+    }
+    tools = collapseSource.tools.map((tool) => {
+      if (typeof tool !== 'string' || !tool.trim()) {
+        throw new TypeError(
+          'dsh-eager-offload: contextClear.collapseWriteSteps.tools entries must be non-empty strings',
+        )
+      }
+      return tool.trim()
+    })
+  }
+  const collapseWriteSteps = Object.freeze({
+    enabled: requireBoolean(
+      collapseSource.enabled,
+      'contextClear.collapseWriteSteps.enabled',
+      DEFAULT_CONTEXT_CLEAR.collapseWriteSteps.enabled,
+    ),
+    tools: Object.freeze(tools),
+    minArgChars: requireNonNegInt(
+      collapseSource.minArgChars,
+      'contextClear.collapseWriteSteps.minArgChars',
+      DEFAULT_CONTEXT_CLEAR.collapseWriteSteps.minArgChars,
+    ),
+  })
+
+  return Object.freeze({ enabled, mode, keepRecentResults, minResultBytes, placeholder, collapseWriteSteps })
+}
+
+/**
  * Validate and normalise plugin config. Throws on bad numbers at mount.
  *
  * @param {Record<string, unknown>} [config]
@@ -89,9 +267,21 @@ function requireNonNegInt(n, label, fallback) {
  *   offloadReadMaxInlineBytes: number,
  *   ageMaskEnabled: boolean,
  *   ageMaskKeepRecentN: number,
+ *   contextClear: {
+ *     enabled: boolean,
+ *     mode: 'off' | 'compaction-coupled',
+ *     keepRecentResults: number,
+ *     minResultBytes: number,
+ *     placeholder: { headBytes: number, tailBytes: number, failTailBytes: number },
+ *     collapseWriteSteps: { enabled: boolean, tools: readonly string[], minArgChars: number },
+ *   },
  *   excludeTools: Set<string>,
  *   toolOverrides: Map<string, { inlineMaxBytes?: number }>,
  * }}
+ *
+ * `ageMaskEnabled` / `ageMaskKeepRecentN` are accepted and validated only so
+ * existing profiles keep loading: ageMask is a no-op on this dsh and is
+ * deprecated in favour of `contextClear`.
  */
 export function normalizeConfig(config = {}, opts = {}) {
   const source = config && typeof config === 'object' ? config : {}
@@ -112,6 +302,8 @@ export function normalizeConfig(config = {}, opts = {}) {
     'offloadReadMaxInlineBytes',
     DEFAULT_OFFLOAD_READ_MAX_INLINE_BYTES,
   )
+  // ageMask* is accepted and validated only for backward compatibility with
+  // existing profiles (e.g. ageMaskEnabled: true); it is deprecated and a no-op.
   const ageMaskEnabled =
     source.ageMaskEnabled === undefined || source.ageMaskEnabled === null
       ? DEFAULT_AGE_MASK_ENABLED
@@ -125,6 +317,8 @@ export function normalizeConfig(config = {}, opts = {}) {
     'ageMaskKeepRecentN',
     DEFAULT_AGE_MASK_KEEP_RECENT_N,
   )
+
+  const contextClear = normalizeContextClear(source.contextClear)
 
   const excludeTools = new Set()
   if (Array.isArray(source.excludeTools)) {
@@ -155,6 +349,7 @@ export function normalizeConfig(config = {}, opts = {}) {
     offloadReadMaxInlineBytes,
     ageMaskEnabled,
     ageMaskKeepRecentN,
+    contextClear,
     excludeTools,
     toolOverrides,
   }
@@ -552,6 +747,12 @@ function withReplacedText(message, replacement) {
  * deep-frozen). Only plain-text, non-error tool results are eligible. Entries
  * already carrying an offload path reuse it; untouched entries are spilled once
  * via `save` (injectable for tests) so the full text stays re-readable.
+ *
+ * @deprecated ageMask is a no-op on dsh 0.1.5-rc.2 / 0.2.x: `agent/pre-step`
+ * only receives this step's newly claimed user messages, never the full history
+ * (the request is derived from `session.deriveMessages()`). Retained (and still
+ * unit-tested) for reference only; `contextClear` is the replacement and it
+ * reuses `offloadedPathFromText` / `isPlainTextToolResult` / `toolResultText`.
  *
  * @param {any[]} messages
  * @param {{ ageMaskEnabled?: boolean, ageMaskKeepRecentN?: number, offloadRoot?: string }} cfg

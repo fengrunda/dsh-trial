@@ -7,10 +7,21 @@
     previewHeadBytes: 1536
     previewTailBytes: 1024
     offloadReadMaxInlineBytes: 16384
-    # Age-based clearing (opt-in; product profiles keep this false/absent).
-    # Keeps the newest N tool results verbatim; older ones become placeholders.
-    ageMaskEnabled: false
-    ageMaskKeepRecentN: 8
+    # contextClear: compaction-coupled clearing of old tool results (opt-in).
+    # DEFAULT OFF — acp / acp-lite leave it unconfigured. Wiring lands in T2/T3.
+    # contextClear:
+    #   enabled: false                     # master switch (default false)
+    #   mode: compaction-coupled            # 'off' | 'compaction-coupled'
+    #   keepRecentResults: 8                # newest N results kept in full
+    #   minResultBytes: 1200                # smaller results are never cleared
+    #   placeholder:
+    #     headBytes: 160
+    #     tailBytes: 240
+    #     failTailBytes: 600
+    #   collapseWriteSteps:
+    #     enabled: true
+    #     tools: [write, edit]
+    #     minArgChars: 1200
     excludeTools: []
     toolOverrides:
       bash:

@@ -34,13 +34,68 @@
     "ageMaskEnabled": {
       "type": "boolean",
       "default": false,
-      "description": "Opt-in age-based clearing on agent/pre-step. When true, all but the newest ageMaskKeepRecentN plain-text tool results are replaced by a short placeholder carrying a re-readable path. Independent of, and never weakens, the byte-based offload above. Product profiles leave this false."
+      "description": "DEPRECATED no-op. Accepted only so existing profiles keep loading. On dsh 0.1.5-rc.2 / 0.2.x the agent/pre-step hook never sees the full history, so no tool result is ever masked; use contextClear instead."
     },
     "ageMaskKeepRecentN": {
       "type": "integer",
       "minimum": 0,
       "default": 8,
-      "description": "Number of newest tool_result messages kept in full when ageMaskEnabled. Older ones become placeholders. 0 = clear every tool result."
+      "description": "DEPRECATED no-op. Accepted only for backward compatibility with ageMaskEnabled; ignored. Use contextClear.keepRecentResults."
+    },
+    "contextClear": {
+      "type": "object",
+      "default": {},
+      "additionalProperties": false,
+      "description": "Compaction-coupled clearing of old tool results (opt-in; default off). Only acts in the pre-step right after compaction-basic summarises, clearing old tool results kept in the retained tail via a persistent surfaceOp replace. acp / acp-lite leave this unconfigured => disabled. Implementation lands in T2/T3.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Master switch. false (default) = never clear anything."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["off", "compaction-coupled"],
+          "default": "compaction-coupled",
+          "description": "Only 'compaction-coupled' has an effect; 'off' is equivalent to enabled:false."
+        },
+        "keepRecentResults": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 8,
+          "description": "Newest N tool results in the compaction-retained tail kept in full; older ones may be cleared."
+        },
+        "minResultBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1200,
+          "description": "Results smaller than this many UTF-8 bytes are left untouched."
+        },
+        "placeholder": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "headBytes": { "type": "integer", "minimum": 0, "default": 160 },
+            "tailBytes": { "type": "integer", "minimum": 0, "default": 240 },
+            "failTailBytes": { "type": "integer", "minimum": 0, "default": 600 }
+          },
+          "description": "Head/tail byte budgets for the placeholder left in place of a cleared result."
+        },
+        "collapseWriteSteps": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "tools": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": ["write", "edit"]
+            },
+            "minArgChars": { "type": "integer", "minimum": 0, "default": 1200 }
+          },
+          "description": "Also collapse oversized write/edit step arguments in the retained tail."
+        }
+      }
     },
     "excludeTools": {
       "type": "array",

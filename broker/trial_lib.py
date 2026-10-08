@@ -141,6 +141,116 @@ def max_concurrent_goals(limits: dict | None = None) -> int:
     return value if value > 0 else default
 
 
+# ---------------------------------------------------------------------------
+# T3c: broker heartbeat — status/report 展示并发（slots / queued）
+# ---------------------------------------------------------------------------
+HEARTBEAT_NAME = "trial-broker.heartbeat.json"
+
+
+def _heartbeat_candidates() -> list[Path]:
+    """Candidate heartbeat files, highest priority first.
+
+    Explicit env first (``TRIAL_BROKER_HEARTBEAT`` = exact file, as the broker
+    itself resolves it; ``TRIAL_BROKER_DIR`` = the daemon state dir), then the
+    ``bin/dsh-trial:broker_dir`` order (``DSH_TRIAL_ROOT`` checkout → this
+    ``broker/`` → legacy box default). The daemon's own default state dir
+    (``$DSH_HOME/broker-dsh-trial``, see ``broker/start.sh``) comes last so a
+    checkout-local heartbeat always wins over unrelated box state.
+    """
+    rows: list[Path] = []
+    if os.environ.get("TRIAL_BROKER_HEARTBEAT"):
+        rows.append(Path(os.environ["TRIAL_BROKER_HEARTBEAT"]).expanduser())
+    if os.environ.get("TRIAL_BROKER_DIR"):
+        rows.append(Path(os.environ["TRIAL_BROKER_DIR"]).expanduser() / HEARTBEAT_NAME)
+    if os.environ.get("DSH_TRIAL_ROOT"):
+        rows.append(Path(os.environ["DSH_TRIAL_ROOT"]) / "broker" / HEARTBEAT_NAME)
+    rows.append(Path(__file__).resolve().parent / HEARTBEAT_NAME)
+    rows.append(Path("/workspace/dsh-trial/broker") / HEARTBEAT_NAME)
+    rows.append(DSH_HOME / "broker-dsh-trial" / HEARTBEAT_NAME)
+    return rows
+
+
+def heartbeat_path(path: Path | None = None) -> Path:
+    """Resolved heartbeat file: explicit ``path`` wins, else first one on disk."""
+    if path is not None:
+        return Path(path)
+    rows = _heartbeat_candidates()
+    for p in rows:
+        if p.is_file():
+            return p
+    return rows[0]  # nothing written yet: report "no heartbeat" at top priority
+
+
+def read_broker_heartbeat(path: Path | None = None) -> dict:
+    """Parsed broker heartbeat JSON; ``{}`` when missing/unreadable/garbage.
+
+    Shape (broker ``_write_heartbeat``): ``pid``, ``at``/``wall``, ``slots``
+    (``{slot,goal,cwd,ticket,phase,started_at}``), ``max_concurrent_goals``,
+    ``queued`` (``{job,reason}``). Older beats lack the concurrency keys — that
+    is not an error, callers just see empty ``slots``/``queued``.
+    """
+    p = heartbeat_path(path)
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _heartbeat_wall(hb: dict) -> float | None:
+    """Epoch seconds of a beat: ``wall``/``ts``/``time`` first, then ISO ``at``."""
+    for key in ("wall", "ts", "time"):
+        try:
+            return float(hb.get(key))
+        except (TypeError, ValueError):
+            continue
+    at = hb.get("at")
+    if isinstance(at, str) and at.strip():
+        try:
+            return datetime.fromisoformat(at.strip()).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def heartbeat_summary(hb: dict | None, now: float | None = None) -> dict:
+    """Normalised view of a heartbeat for status/report.
+
+    Returns ``{pid, heartbeat_age, max_concurrent_goals, slots, queued}``.
+    An empty/legacy heartbeat yields ``None``/``[]`` values (not an error), so
+    callers can print "无心跳" instead of raising.
+    """
+    doc = hb if isinstance(hb, dict) else {}
+    slots = [s for s in (doc.get("slots") or []) if isinstance(s, dict)]
+    queued: list[dict] = []
+    for item in doc.get("queued") or []:
+        if isinstance(item, dict):
+            row = dict(item)
+            row["name"] = str(item.get("name") or item.get("job") or item.get("label") or "")
+            row["reason"] = str(item.get("reason") or "")
+            queued.append(row)
+        else:
+            queued.append({"name": str(item), "reason": ""})
+
+    def _num(key: str) -> float | None:
+        try:
+            return float(doc.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    wall = _heartbeat_wall(doc)
+    age = None if wall is None else max(0.0, (time.time() if now is None else now) - wall)
+    cap = _num("max_concurrent_goals")
+    pid = _num("pid")
+    return {
+        "pid": int(pid) if pid is not None else None,
+        "heartbeat_age": age,
+        "max_concurrent_goals": int(cap) if cap is not None else None,
+        "slots": slots,
+        "queued": queued,
+    }
+
+
 # Box limits.json written before idle timeouts pinned this whole-prompt wall.
 LEGACY_PROMPT_WALL_SEC = 1800
 
@@ -527,6 +637,19 @@ def aggregate_report(goals_dir: Path | None = None, since: str | None = None) ->
             "pass_rate": (pas / count) if count else 0.0,
         }
 
+    # T3c: concurrency snapshot from the broker heartbeat. `concurrency` carries
+    # the scheduling view; the full beat (pid/age/queued) travels as `heartbeat`.
+    # A missing heartbeat (broker down / legacy beat) leaves slots empty.
+    hb_summary = heartbeat_summary(read_broker_heartbeat())
+    concurrency = {
+        "max_concurrent_goals": hb_summary["max_concurrent_goals"],
+        "slots": hb_summary["slots"],
+        "running_goals": [
+            {"goal": s.get("goal"), "slot": s.get("slot"), "phase": s.get("phase")}
+            for s in hb_summary["slots"]
+        ],
+    }
+
     return {
         "goals": n,
         "done": done,
@@ -543,6 +666,8 @@ def aggregate_report(goals_dir: Path | None = None, since: str | None = None) ->
         "rework_fresh": rework_agg("fresh"),
         "by_kind": by_kind,
         "per_goal": per_goal,
+        "concurrency": concurrency,
+        "heartbeat": hb_summary,
         "generated_at": now_iso(),
     }
 
@@ -567,6 +692,28 @@ def format_report_zh(rep: dict) -> str:
         f"平均步数={rep.get('rework_fresh',{}).get('avg_steps',0):.1f} "
         f"平均总token={rep.get('rework_fresh',{}).get('avg_prompt_token_total',0):.0f} "
         f"通过率={rep.get('rework_fresh',{}).get('pass_rate',0):.1%}",
+    ]
+    conc = rep.get("concurrency") or {}
+    beat = rep.get("heartbeat") or {}
+    lines += ["", "### 并发"]
+    if beat.get("pid") is None and not conc.get("slots"):
+        lines.append("- 无心跳（broker 未运行或心跳不可读）")
+    else:
+        age = beat.get("heartbeat_age")
+        age_s = f"{age:.1f}s" if isinstance(age, (int, float)) else "-"
+        cap = conc.get("max_concurrent_goals")
+        lines.append(
+            f"- broker pid={beat.get('pid')} heartbeat_age={age_s} "
+            f"max_concurrent_goals={cap} slots_busy={len(conc.get('slots') or [])}/{cap}"
+        )
+        for s in conc.get("slots") or []:
+            lines.append(
+                f"- slot={s.get('slot')} goal={s.get('goal')} phase={s.get('phase')} "
+                f"ticket={s.get('ticket')} cwd={s.get('cwd')} since={s.get('started_at')}"
+            )
+        for q in beat.get("queued") or []:
+            lines.append(f"- queued name={q.get('name')} reason={q.get('reason')}")
+    lines += [
         "",
         "| Goal | 状态 | 切片 | HOLD | 返工 | 提问 | 监理票 | 总 token | 撞上限 |",
         "|------|------|-----:|-----:|-----:|-----:|-------:|---------:|--------|",

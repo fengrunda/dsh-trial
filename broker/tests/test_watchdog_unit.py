@@ -166,3 +166,78 @@ def test_freeze_helper_threshold():
     assert T.detect_resumed_after_freeze(0, 0, 100, 90, threshold_sec=300) is None
     # Clock moving backwards is not a freeze.
     assert T.detect_resumed_after_freeze(1000, 100, 900, 110, threshold_sec=300) is None
+
+
+# --- list_work_pids: only this broker's own work processes -------------------
+
+def _patch_ownership(work_pids, broker_pids, descendants, guarded=()):
+    """Fake ps / broker-pid / descendant / environ lookups for list_work_pids."""
+    guarded = set(guarded)
+    return mock.patch.multiple(
+        wd,
+        _ps_pids=mock.Mock(return_value=list(work_pids)),
+        list_broker_pids=mock.Mock(return_value=list(broker_pids)),
+        _descendant_pids=mock.Mock(
+            side_effect=lambda pid: list(descendants.get(pid, []))
+        ),
+        _proc_env_has=mock.Mock(
+            side_effect=lambda pid, key, value, environ=None: (
+                key == "DSH_TRIAL_GUARD" and value == "1" and pid in guarded
+            )
+        ),
+    )
+
+
+def test_list_work_pids_keeps_broker_descendants():
+    with _patch_ownership(
+        work_pids=[101, 202, 303],
+        broker_pids=[10],
+        descendants={10: [101, 202]},
+    ):
+        assert wd.list_work_pids() == [101, 202]
+
+
+def test_list_work_pids_drops_foreign_unguarded_pid():
+    # 303 is another agent's dsh-acp-ask: no broker ancestry, no guard.
+    with _patch_ownership(
+        work_pids=[101, 303],
+        broker_pids=[10],
+        descendants={10: [101]},
+        guarded=[],
+    ):
+        assert wd.list_work_pids() == [101]
+
+
+def test_list_work_pids_keeps_guarded_orphan():
+    # 404 was reparented to init after a broker crash but kept the guard env.
+    with _patch_ownership(
+        work_pids=[101, 404],
+        broker_pids=[10],
+        descendants={10: [101]},
+        guarded=[404],
+    ):
+        assert wd.list_work_pids() == [101, 404]
+
+
+def test_list_work_pids_without_broker_keeps_only_guarded():
+    with _patch_ownership(
+        work_pids=[202, 404, 505],
+        broker_pids=[],
+        descendants={},
+        guarded=[404],
+    ):
+        assert wd.list_work_pids() == [404]
+
+
+def test_proc_env_has_matches_exact_chunk():
+    env = b"PATH=/bin\0DSH_TRIAL_GUARD=1\0DSH_TRIAL_GOAL=g1"
+    assert wd._proc_env_has(1, "DSH_TRIAL_GUARD", "1", environ=env) is True
+    # Wrong value, prefix look-alike and embedded occurrence all fail.
+    assert wd._proc_env_has(1, "DSH_TRIAL_GUARD", "0", environ=env) is False
+    assert wd._proc_env_has(1, "DSH_TRIAL_GUARD", "1", environ=b"DSH_TRIAL_GUARD=10\0") is False
+    assert wd._proc_env_has(1, "DSH_TRIAL_GUARD", "1", environ=b"X=DSH_TRIAL_GUARD=1\0") is False
+
+
+def test_proc_env_has_unreadable_pid_is_false():
+    # A pid that cannot exist: /proc lookup fails, so no match is claimed.
+    assert wd._proc_env_has(2**31 - 1, "DSH_TRIAL_GUARD", "1") is False

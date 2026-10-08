@@ -296,8 +296,40 @@ def list_broker_pids() -> list[int]:
     return [p for p in _ps_pids(("trial-broker.py",))]
 
 
+def _proc_env_has(pid: int, key: str, value: str, environ: bytes | None = None) -> bool:
+    """True when ``pid``'s environment contains ``key=value``.
+
+    ``environ`` (the raw NUL-delimited block) is injectable for tests; a
+    missing or unreadable environ block counts as "no match".
+    """
+    raw = environ
+    if raw is None:
+        try:
+            raw = Path(f"/proc/{int(pid)}/environ").read_bytes()
+        except (OSError, ValueError):
+            return False
+    try:
+        return f"{key}={value}" in raw.decode("utf-8", "replace").split("\0")
+    except (UnicodeDecodeError, ValueError):
+        return False
+
+
 def list_work_pids() -> list[int]:
-    return _ps_pids(("open-slice.sh", "dsh-acp-ask.py"))
+    """Work pids belonging to *this* broker, not every look-alike on the box.
+
+    A candidate qualifies when it is a descendant of a broker pid, or when it
+    carries ``DSH_TRIAL_GUARD=1`` — the guard covers children orphaned onto
+    init after the broker died.  Foreign ``dsh-acp-ask.py`` / ``open-slice.sh``
+    invocations started by other agents carry neither and are dropped.
+    """
+    owned: set[int] = set()
+    for pid in list_broker_pids():
+        owned.update(_descendant_pids(pid))
+    out: list[int] = []
+    for pid in _ps_pids(("open-slice.sh", "dsh-acp-ask.py")):
+        if pid in owned or _proc_env_has(pid, "DSH_TRIAL_GUARD", "1"):
+            out.append(pid)
+    return out
 
 
 def _read_proc_cmdline(pid: int) -> list[str]:

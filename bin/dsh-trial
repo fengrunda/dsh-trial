@@ -50,7 +50,12 @@ def _ensure_trial_lib() -> Path:
 
 def cmd_status(args: argparse.Namespace) -> int:
     _ensure_trial_lib()
-    from trial_lib import GOALS  # noqa: E402
+    from trial_lib import (  # noqa: E402
+        GOALS,
+        heartbeat_summary,
+        max_concurrent_goals,
+        read_broker_heartbeat,
+    )
 
     if args.goal:
         path = GOALS / f"{args.goal}.json"
@@ -80,6 +85,16 @@ def cmd_status(args: argparse.Namespace) -> int:
             )
         return 0
 
+    # T3c: broker concurrency header (heartbeat slots/queued) before the goals.
+    heart = heartbeat_summary(read_broker_heartbeat())
+    slots = heart["slots"]
+    cap = heart["max_concurrent_goals"]
+    if cap is None:
+        cap = max_concurrent_goals()  # no beat yet: still show the effective cap
+    slot_by_goal = {
+        str(s.get("goal")): s.get("slot") for s in slots if s.get("goal")
+    }
+
     goals = sorted(GOALS.glob("*.json")) if GOALS.is_dir() else []
     if args.json:
         rows = []
@@ -93,20 +108,38 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "supervisor_ticket_count": g.get("supervisor_ticket_count"),
                     "prompt_token_total": (g.get("metrics") or {}).get("prompt_token_total"),
                     "limit_hit": g.get("limit_hit"),
+                    "slot": slot_by_goal.get(str(g.get("goal") or p.stem)),
                 })
             except (OSError, json.JSONDecodeError):
                 pass
-        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        print(json.dumps({"broker": heart, "goals": rows}, ensure_ascii=False, indent=2))
         return 0
+    age = heart["heartbeat_age"]
+    age_s = f"{age:.1f}s" if isinstance(age, (int, float)) else "-"
+    pid_s = heart["pid"] if heart["pid"] is not None else "-"
+    print(
+        f"broker pid={pid_s} heartbeat_age={age_s} max_concurrent_goals={cap} "
+        f"slots_busy={len(slots)}/{cap}"
+    )
+    for s in slots:
+        print(
+            f"slot={s.get('slot')} goal={s.get('goal')} phase={s.get('phase')} "
+            f"ticket={s.get('ticket')} cwd={s.get('cwd')} since={s.get('started_at')}"
+        )
+    print(f"queued count={len(heart['queued'])}")
+    for q in heart["queued"]:
+        print(f"queued name={q.get('name')} reason={q.get('reason')}")
     print(f"goals_dir={GOALS} count={len(goals)}")
     for p in goals:
         try:
             g = json.loads(p.read_text(encoding="utf-8"))
+            slot = slot_by_goal.get(str(g.get("goal") or p.stem))
+            slot_s = f" slot={slot}" if slot is not None else ""
             print(
                 f"- {g.get('goal')}: status={g.get('status')} slices={len(g.get('slices') or [])} "
                 f"sup_tickets={g.get('supervisor_ticket_count')} "
                 f"tokens={(g.get('metrics') or {}).get('prompt_token_total')} "
-                f"hit={g.get('limit_hit') and (g.get('limit_hit') or {}).get('limit')}"
+                f"hit={g.get('limit_hit') and (g.get('limit_hit') or {}).get('limit')}{slot_s}"
             )
         except (OSError, json.JSONDecodeError) as e:
             print(f"- {p.name}: read error {e}")
@@ -219,10 +252,12 @@ def main() -> int:
     )
     bs.set_defaults(func=cmd_broker_status)
 
-    _add_goal_status_parser(sub, "status", "list goals or show one (thin-state)")
+    _add_goal_status_parser(
+        sub, "status", "list goals or show one (thin-state; no goal → broker concurrency)"
+    )
     _add_goal_status_parser(sub, "goals", "alias for status (list/show goals)")
 
-    rp = sub.add_parser("report", help="cross-goal aggregate report")
+    rp = sub.add_parser("report", help="cross-goal aggregate report (+ 并发 from heartbeat)")
     rp.add_argument("--since", help="ISO timestamp lower bound on goal created_at")
     rp.add_argument("--json", action="store_true")
     rp.set_defaults(func=cmd_report)

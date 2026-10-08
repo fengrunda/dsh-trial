@@ -115,6 +115,86 @@ test('T3 requires an argument of at least minArgChars', () => {
   assert.equal(out.t3, 0)
 })
 
+test('clearReasoning off never collapses a reasoning-heavy step; on does', () => {
+  const build = () => [
+    { kind: 'sys', tok: 96 },
+    { kind: 'summary', tok: 1560 },
+    asst([['read', 300, 'r1']], { reasonChars: 800 }),
+    result('r1', 'read', 2000),
+    result('b1', 'bash', 5000),
+    result('b2', 'bash', 5000),
+  ]
+  const off = applyContextClear(build(), normalizeClearConfig({ keep: 1 }))
+  assert.equal(off.t3, 0)
+  assert.equal(off.surface.some((it) => it.collapsed), false)
+
+  const on = applyContextClear(
+    build(),
+    normalizeClearConfig({ keep: 1, clearReasoning: true, minReasoningChars: 600 }),
+  )
+  assert.equal(on.t3, 1)
+  assert.equal(on.t3reason, 1)
+  assert.equal(on.t3write, 0)
+  assert.equal(on.surface[2].kind, 'user')
+  assert.equal(on.surface[2].reason, 'reasoning')
+})
+
+test('clearReasoning requires the reasoning floor', () => {
+  const surface = [
+    { kind: 'sys', tok: 96 },
+    { kind: 'summary', tok: 1560 },
+    asst([['read', 300, 'r1']], { reasonChars: 599 }),
+    result('r1', 'read', 2000),
+    result('b1', 'bash', 5000),
+  ]
+  const out = applyContextClear(
+    surface,
+    normalizeClearConfig({ keep: 0, clearReasoning: true, minReasoningChars: 600 }),
+  )
+  assert.equal(out.t3, 0)
+})
+
+test('a step interrupted by a non-result node is never collapsed', () => {
+  const surface = [
+    { kind: 'sys', tok: 96 },
+    { kind: 'summary', tok: 1560 },
+    asst([['write', 2000, 'c1']]),
+    { kind: 'user', tok: 5 },
+    result('c1', 'write', 2000),
+    result('b1', 'bash', 5000),
+    result('b2', 'bash', 5000),
+  ]
+  const out = applyContextClear(surface, normalizeClearConfig({ keep: 1 }))
+  assert.equal(out.t3, 0)
+  assert.equal(out.surface.some((it) => it.collapsed), false)
+})
+
+test('a write step with an error or non-plain result is never collapsed', () => {
+  for (const extra of [{ isError: true }, { plain: false }]) {
+    const surface = [
+      { kind: 'sys', tok: 96 },
+      { kind: 'summary', tok: 1560 },
+      asst([['write', 2000, 'c1']]),
+      result('c1', 'write', 2000, extra),
+      result('b1', 'bash', 5000),
+    ]
+    const out = applyContextClear(surface, normalizeClearConfig({ keep: 0 }))
+    assert.equal(out.t3, 0, `expected no collapse for ${JSON.stringify(extra)}`)
+  }
+})
+
+test('a write step whose result is inside the newest keep is never collapsed', () => {
+  const surface = [
+    { kind: 'sys', tok: 96 },
+    { kind: 'summary', tok: 1560 },
+    asst([['write', 2000, 'c1']]),
+    result('c1', 'write', 2000),
+  ]
+  const out = applyContextClear(surface, normalizeClearConfig({ keep: 1 }))
+  assert.equal(out.t3, 0)
+  assert.equal(out.surface.some((it) => it.collapsed), false)
+})
+
 test('failure-flavoured placeholders keep a longer tail', () => {
   const cfg = normalizeClearConfig()
   assert.equal(placeholderTokens({ fail: false }, cfg), 130)

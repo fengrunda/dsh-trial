@@ -46,11 +46,13 @@ test('normalizeConfig contextClear defaults: disabled and deeply frozen', () => 
     minResultBytes: 1200,
     placeholder: { headBytes: 160, tailBytes: 240, failTailBytes: 600 },
     collapseWriteSteps: { enabled: true, tools: ['write', 'edit'], minArgChars: 1200 },
+    clearReasoning: { enabled: false, minReasoningChars: 600 },
   })
   assert.ok(Object.isFrozen(cc))
   assert.ok(Object.isFrozen(cc.placeholder))
   assert.ok(Object.isFrozen(cc.collapseWriteSteps))
   assert.ok(Object.isFrozen(cc.collapseWriteSteps.tools))
+  assert.ok(Object.isFrozen(cc.clearReasoning))
 })
 
 test('normalizeConfig contextClear merges partial input over defaults', () => {
@@ -62,6 +64,7 @@ test('normalizeConfig contextClear merges partial input over defaults', () => {
         keepRecentResults: 2,
         placeholder: { tailBytes: 10 },
         collapseWriteSteps: { tools: ['write'] },
+        clearReasoning: { enabled: true, minReasoningChars: 42 },
       },
     },
     { dshHome: '/tmp/x' },
@@ -72,6 +75,7 @@ test('normalizeConfig contextClear merges partial input over defaults', () => {
   assert.equal(cc.minResultBytes, 1200) // untouched default survives
   assert.deepEqual(cc.placeholder, { headBytes: 160, tailBytes: 10, failTailBytes: 600 })
   assert.deepEqual(cc.collapseWriteSteps, { enabled: true, tools: ['write'], minArgChars: 1200 })
+  assert.deepEqual(cc.clearReasoning, { enabled: true, minReasoningChars: 42 })
 })
 
 test('normalizeConfig contextClear null/undefined yield full defaults', () => {
@@ -86,6 +90,18 @@ test('normalizeConfig contextClear rejects unknown keys, bad enums and bad value
   assert.throws(
     () => normalizeConfig({ contextClear: { collapseWriteSteps: { nope: 1 } } }),
     /collapseWriteSteps\.nope/,
+  )
+  assert.throws(
+    () => normalizeConfig({ contextClear: { clearReasoning: { nope: 1 } } }),
+    /clearReasoning\.nope/,
+  )
+  assert.throws(
+    () => normalizeConfig({ contextClear: { clearReasoning: { enabled: 'yes' } } }),
+    /clearReasoning\.enabled/,
+  )
+  assert.throws(
+    () => normalizeConfig({ contextClear: { clearReasoning: { minReasoningChars: -1 } } }),
+    /minReasoningChars/,
   )
   assert.throws(() => normalizeConfig({ contextClear: { mode: 'sometimes' } }), /contextClear\.mode/)
   assert.throws(() => normalizeConfig({ contextClear: { enabled: 'yes' } }), /contextClear\.enabled/)

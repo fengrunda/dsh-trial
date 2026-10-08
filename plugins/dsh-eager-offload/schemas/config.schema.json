@@ -46,7 +46,7 @@
       "type": "object",
       "default": {},
       "additionalProperties": false,
-      "description": "Compaction-coupled clearing of old tool results (opt-in; default off). Only acts in the pre-step right after compaction-basic summarises, clearing old tool results kept in the retained tail via a persistent surfaceOp replace. acp / acp-lite leave this unconfigured => disabled. Tool-result clearing (T2) is implemented; write/edit step collapsing (T3) is pending.",
+      "description": "Compaction-coupled clearing of old tool results and oversized write/edit steps (opt-in; default off). Only acts in the pre-step right after compaction-basic summarises, rewriting old tool results and collapsible steps kept in the retained tail via a persistent surfaceOp replace. acp / acp-lite leave this unconfigured => disabled. Tool-result clearing (T2) and write/edit step collapsing (T3) are implemented.",
       "properties": {
         "enabled": {
           "type": "boolean",
@@ -93,7 +93,16 @@
             },
             "minArgChars": { "type": "integer", "minimum": 0, "default": 1200 }
           },
-          "description": "Also collapse oversized write/edit step arguments in the retained tail."
+          "description": "Collapse a retained-tail step whose tool calls are all in `tools` and at least one raw arguments JSON string is >= minArgChars characters into one user note."
+        },
+        "clearReasoning": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "minReasoningChars": { "type": "integer", "minimum": 0, "default": 600 }
+          },
+          "description": "Optional: also collapse a retained-tail step (any tools) whose assistant reasoning/thinking text totals at least minReasoningChars characters. Default off."
         }
       }
     },

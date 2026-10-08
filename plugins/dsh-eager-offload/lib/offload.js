@@ -44,11 +44,13 @@ export const DEFAULT_AGE_MASK_KEEP_RECENT_N = 8
 export const OFFLOAD_MARK = 'dsh-eager-offload:'
 
 /**
- * `contextClear` defaults (T2 tool-result clearing implemented; T3 write/edit
- * step collapsing pending). Compaction-coupled
- * clearing only: right after `compaction-basic` summarises, the old tool results
- * kept in its retained tail are cleared via a persistent surfaceOp `replace`.
- * Opt-in per profile: acp / acp-lite leave it unconfigured, i.e. disabled.
+ * `contextClear` defaults (T2 tool-result clearing + T3 write/edit step
+ * collapsing implemented). Compaction-coupled clearing only: right after
+ * `compaction-basic` summarises, the old tool results and oversized
+ * write/edit steps kept in its retained tail are rewritten via a persistent
+ * surfaceOp `replace`. Opt-in per profile: acp / acp-lite leave it
+ * unconfigured, i.e. disabled. `clearReasoning` (collapse reasoning-heavy
+ * steps) is an optional T3 extension and is off by default.
  */
 export const DEFAULT_CONTEXT_CLEAR = Object.freeze({
   enabled: false,
@@ -60,6 +62,10 @@ export const DEFAULT_CONTEXT_CLEAR = Object.freeze({
     enabled: true,
     tools: Object.freeze(['write', 'edit']),
     minArgChars: 1200,
+  }),
+  clearReasoning: Object.freeze({
+    enabled: false,
+    minReasoningChars: 600,
   }),
 })
 
@@ -155,9 +161,11 @@ const CONTEXT_CLEAR_KEYS = new Set([
   'minResultBytes',
   'placeholder',
   'collapseWriteSteps',
+  'clearReasoning',
 ])
 const CONTEXT_CLEAR_PLACEHOLDER_KEYS = new Set(['headBytes', 'tailBytes', 'failTailBytes'])
 const CONTEXT_CLEAR_COLLAPSE_KEYS = new Set(['enabled', 'tools', 'minArgChars'])
+const CONTEXT_CLEAR_REASONING_KEYS = new Set(['enabled', 'minReasoningChars'])
 
 /**
  * Validate and normalise the `contextClear` block, merging partial input over
@@ -172,6 +180,7 @@ const CONTEXT_CLEAR_COLLAPSE_KEYS = new Set(['enabled', 'tools', 'minArgChars'])
  *   minResultBytes: number,
  *   placeholder: { headBytes: number, tailBytes: number, failTailBytes: number },
  *   collapseWriteSteps: { enabled: boolean, tools: readonly string[], minArgChars: number },
+ *   clearReasoning: { enabled: boolean, minReasoningChars: number },
  * }}
  */
 export function normalizeContextClear(raw) {
@@ -252,7 +261,30 @@ export function normalizeContextClear(raw) {
     ),
   })
 
-  return Object.freeze({ enabled, mode, keepRecentResults, minResultBytes, placeholder, collapseWriteSteps })
+  const reasoningSource = optionalObject(source.clearReasoning, 'contextClear.clearReasoning')
+  rejectUnknownKeys(reasoningSource, CONTEXT_CLEAR_REASONING_KEYS, 'contextClear.clearReasoning')
+  const clearReasoning = Object.freeze({
+    enabled: requireBoolean(
+      reasoningSource.enabled,
+      'contextClear.clearReasoning.enabled',
+      DEFAULT_CONTEXT_CLEAR.clearReasoning.enabled,
+    ),
+    minReasoningChars: requireNonNegInt(
+      reasoningSource.minReasoningChars,
+      'contextClear.clearReasoning.minReasoningChars',
+      DEFAULT_CONTEXT_CLEAR.clearReasoning.minReasoningChars,
+    ),
+  })
+
+  return Object.freeze({
+    enabled,
+    mode,
+    keepRecentResults,
+    minResultBytes,
+    placeholder,
+    collapseWriteSteps,
+    clearReasoning,
+  })
 }
 
 /**
@@ -275,6 +307,7 @@ export function normalizeContextClear(raw) {
  *     minResultBytes: number,
  *     placeholder: { headBytes: number, tailBytes: number, failTailBytes: number },
  *     collapseWriteSteps: { enabled: boolean, tools: readonly string[], minArgChars: number },
+ *     clearReasoning: { enabled: boolean, minReasoningChars: number },
  *   },
  *   excludeTools: Set<string>,
  *   toolOverrides: Map<string, { inlineMaxBytes?: number }>,

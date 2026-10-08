@@ -13,7 +13,7 @@
 - `0.1.0-dev`，开发树：`/workspace/dsh-plugins/dsh-eager-offload/`（box 上 trial profile 软链安装的就是它；本目录自 2026-10-08 起与其同步入库）
 - 试验 profile：`acp-lite-offload`（从 `acp-lite` 克隆；**未**改 `acp` / `acp-lite`）
 - **未**装进产品 broker / 产品四票
-- `ageMask` 已废弃（no-op）；`contextClear` 已实现 **T2（压缩联动清旧 tool_result）**；**T3（折叠超大 write/edit 步骤）待做**
+- `ageMask` 已废弃（no-op）；`contextClear` 已实现 **T2（压缩联动清旧 tool_result）** 与 **T3（折叠超大 write/edit 步骤，可选 clearReasoning）**
 
 ## 离线评估
 
@@ -55,7 +55,7 @@ ctx.on('tools/post-execute', async (exec, result, next) => {
 | `offloadReadMaxInlineBytes` | `16384` | `read` 目标已在 offload 根下：允许更大内联；再超则**原地截断** |
 | `ageMaskEnabled` | `false` | **DEPRECATED（no-op）**。仅为兼容旧 profile 而接受；产品 profile 保持 `false`。见下节 |
 | `ageMaskKeepRecentN` | `8` | **DEPRECATED（no-op）**。仅为兼容旧 profile 而接受，不再生效 |
-| `contextClear.*` | 关闭 | 压缩联动的旧工具结果清理（T2 已实现；T3 折叠 write/edit 待做）；见下节 |
+| `contextClear.*` | 关闭 | 压缩联动的旧工具结果清理（T2）与步骤折叠（T3，含可选 clearReasoning）；见下节 |
 | `excludeTools` | `[]` | 完全跳过的工具名 |
 | `toolOverrides.<name>.inlineMaxBytes` | — | 单工具覆盖 |
 
@@ -65,7 +65,7 @@ ctx.on('tools/post-execute', async (exec, result, next) => {
 
 因此插件**不再注册** `agent/pre-step` 监听：`ageMaskEnabled` / `ageMaskKeepRecentN` 仍被接受并校验（旧 profile 照常加载），但 `ageMaskEnabled: true` 只在 mount 时 `logger.warn` 一次。`maskOldToolResults`、`formatAgeMaskPlaceholder` 等导出与其单测保留，仅供参考，不再被调用。替代方案见下节。
 
-## contextClear（压缩联动清旧；T2 已实现，T3 待做）
+## contextClear（压缩联动清旧；T2+T3 已实现，默认关）
 
 目的：处理体积 offload 管不到的「很多条都不大、但堆满压缩保留尾部」的旧 tool_result。
 
@@ -73,7 +73,7 @@ ctx.on('tools/post-execute', async (exec, result, next) => {
 - **默认关**：`contextClear.enabled` 默认 `false`；不配置即完全关闭。关闭时**完全不注册** `agent/pre-step`。
 - **产品 `acp` / `acp-lite` 不配置 `contextClear`，即默认关闭**；需要时用试验 profile 显式开启。
 - **T2（已实现，本分支）**：清旧 tool_result。开启且 `mode==='compaction-coupled'` 时注册 `{prepend:true}` 的 `agent/pre-step` 监听；`await next()` 返回且 `decision.kind==='enter'` 后运行 `clearAfterCompaction`，随后原样返回 decision。
-- **T3（待做）**：`collapseWriteSteps` 折叠超大 write/edit 步骤；目前键被接受/校验但行为尚未落地。
+- **T3（已实现，本分支）**：压缩之后、**先于 T2**，把保留尾部里的每个「旧步骤」折叠成**一条** `user/message`（`source = {kind:'plugin', plugin:'dsh-eager-offload'}`，form `notice`，标记 `[dsh-eager-offload:context-collapsed]`）。一个步骤 = assistant 工具调用消息 + 恰属于它的结果（连续、都不在最新 `keepRecentResults` 条内、都非 `isError`）。触发条件：(a) `collapseWriteSteps`：该步全部调用都是 write/edit 且至少一个参数 ≥ `minArgChars`；或 (b) `clearReasoning.enabled`（默认 `false`）：assistant 推理 ≥ `minReasoningChars`。推理只能靠这种折叠丢弃：`dsh-token-meter` 拒绝 step 之外的 `assistant/message` 替换，原地清空不可能。
 
 T2 触发与清理规则（实现见 `lib/context-clear.js`）：
 
@@ -95,13 +95,23 @@ T2 触发与清理规则（实现见 `lib/context-clear.js`）：
 | `contextClear.placeholder.headBytes` | `160` | 占位符头部字节 |
 | `contextClear.placeholder.tailBytes` | `240` | 占位符尾部字节 |
 | `contextClear.placeholder.failTailBytes` | `600` | 命令失败（末尾非零 `[exit code: N]`）时的尾部字节 |
-| `contextClear.collapseWriteSteps.enabled` | `true` | （T3 待做）是否同时折叠超大的 write/edit 步骤 |
-| `contextClear.collapseWriteSteps.tools` | `['write','edit']` | （T3 待做）参与折叠的工具名 |
-| `contextClear.collapseWriteSteps.minArgChars` | `1200` | （T3 待做）参数小于此字符数不折叠 |
+| `contextClear.collapseWriteSteps.enabled` | `true` | 是否同时折叠超大的 write/edit 步骤 |
+| `contextClear.collapseWriteSteps.tools` | `['write','edit']` | 参与折叠的工具名 |
+| `contextClear.collapseWriteSteps.minArgChars` | `1200` | 参数小于此字符数不折叠 |
+| `contextClear.clearReasoning.enabled` | `false` | 压缩边界折叠推理较重的旧步骤（任意工具） |
+| `contextClear.clearReasoning.minReasoningChars` | `600` | 推理字符下限 |
 
 未知键（任意层级）一律在 mount 时抛错；返回的 `contextClear` 对象深冻结。
 
 `mounted` 日志形如：`contextClear=off` 或 `contextClear=on(compaction-coupled,keep=8)`；清理后在触发的 pre-step 记 `context-clear: cleared=N bytes A->B`。
+
+实测（2026-10-08 官方 deepseek-flash，thinking+tools）：
+
+- 旧步骤 `reasoning_content:""` / 占位符 → 200，且这部分 token 真被移除。
+- 直接省略该键 → 200，但按「仍然存在」计费，没有节省。
+- 压缩边界折叠后的形状 `[sys, summary, user(collapsed), assistant(tool_call), tool]` → 200；探针里 prompt tokens −3065，下一请求缓存重新命中。
+- 会话中途改历史会从改动点起击穿缓存，所以清理只发生在压缩时。
+- 探针成本 $0.0155。
 
 ## 自测（无模型）
 

@@ -18,6 +18,7 @@ import { test } from 'node:test'
 
 import {
   CONTEXT_CLEAR_MARK,
+  CONTEXT_COLLAPSE_MARK,
   buildContextClearPlaceholder,
   clearAfterCompaction,
   isFailedCommandText,
@@ -160,6 +161,141 @@ function commitCompaction(session, startSeq, endSeq) {
 
 function largeText(step) {
   return `result-${step}:` + `${step}`.repeat(5000)
+}
+
+/* ------------------------------------------------------------------ *
+ * Rich (multi-call / reasoning) fixtures for T3 step collapsing      *
+ * ------------------------------------------------------------------ */
+
+function writeCall(id, filePath, content) {
+  return { id, name: 'write', arguments: JSON.stringify({ file_path: filePath, content }) }
+}
+
+function bashCall(id, command) {
+  return { id, name: 'bash', arguments: JSON.stringify({ command }) }
+}
+
+function readCall(id, filePath) {
+  return { id, name: 'read', arguments: JSON.stringify({ file_path: filePath }) }
+}
+
+function richAssistantMessage(id, spec) {
+  const content = []
+  if (spec.reasoning) content.push({ type: 'reasoning', text: spec.reasoning })
+  if (spec.text) content.push({ type: 'text', text: spec.text })
+  for (const call of spec.calls) {
+    content.push({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments })
+  }
+  return {
+    id,
+    role: 'assistant',
+    content,
+    source: { kind: 'model', provider: 'test-provider', model: 'test-model' },
+  }
+}
+
+/**
+ * Multi-call session: each spec = `{ calls, results, reasoning?, text? }` where
+ * `results[i]` answers `calls[i]`. Returns the surface result seqs in order.
+ */
+function buildRichSession(Session, specs) {
+  const session = Session.create('sess-rich')
+  session.append('system/message', { message: systemMessage('sys', 'SYSTEM HEAD') }, { surfaceOp: 'append' })
+  const userSeq = session.append('user/message', userMessage('u1', 'please run the tools'), {
+    surfaceOp: 'append',
+  }).seq
+  const resultSeqs = []
+  specs.forEach((spec, index) => {
+    const step = index + 1
+    session.append('step/start', { turn: 1, step })
+    session.append(
+      'assistant/message',
+      { turn: 1, step, stream: [], message: richAssistantMessage(`assistant-${step}`, spec) },
+      { surfaceOp: 'append' },
+    )
+    for (let i = 0; i < spec.calls.length; i++) {
+      const call = spec.calls[i]
+      const answer = spec.results[i] ?? { text: '', isError: false }
+      const callSeq = session.append('tool/call', {
+        turn: 1,
+        step,
+        callId: call.id,
+        name: call.name,
+        arguments: call.arguments,
+      }).seq
+      const resultSeq = session.append(
+        'tool/result',
+        { turn: 1, step, message: toolResultMessage(call.id, answer.text, answer.isError === true) },
+        { surfaceOp: 'append', sourceEventSeqs: [callSeq] },
+      ).seq
+      resultSeqs.push(resultSeq)
+    }
+    session.append('step/end', { turn: 1, step })
+  })
+  return { session, userSeq, resultSeqs }
+}
+
+/**
+ * T3 specs: 1 write-collapsible, 2 reasoning-only, 3 mixed, 4 small-arg,
+ * 5 isError, 6 kept-write (newest K), 7 kept-bash (newest K).
+ */
+function richSpecs() {
+  return [
+    { calls: [writeCall('w1', '/tmp/a.txt', 'A'.repeat(2000))], results: [{ text: largeText('w1') }] },
+    {
+      calls: [readCall('r2', '/tmp/b.txt')],
+      results: [{ text: largeText('r2') }],
+      reasoning: 'R'.repeat(800),
+    },
+    {
+      calls: [bashCall('b3', 'echo hi'), writeCall('w3', '/tmp/c.txt', 'C'.repeat(2000))],
+      results: [{ text: largeText('b3') }, { text: largeText('w3') }],
+    },
+    { calls: [writeCall('w4', '/tmp/d.txt', 'D'.repeat(100))], results: [{ text: largeText('w4') }] },
+    {
+      calls: [bashCall('b5', 'false')],
+      results: [{ text: `${largeText('b5')}\n[exit code: 1]`, isError: true }],
+    },
+    { calls: [writeCall('w6', '/tmp/f.txt', 'F'.repeat(2000))], results: [{ text: largeText('w6') }] },
+    { calls: [bashCall('b7', 'ls')], results: [{ text: largeText('b7') }] },
+  ]
+}
+
+async function buildRichFixture({ clearReasoning } = {}) {
+  const { Session, TokenMeter } = deps
+  const { session, userSeq } = buildRichSession(Session, richSpecs())
+  commitCompaction(session, userSeq, userSeq)
+  const offloadRoot = await mkdtemp(join(tmpdir(), 'ctxt3-'))
+  const contextClear = { enabled: true, keepRecentResults: 2, minResultBytes: 1200 }
+  if (clearReasoning !== undefined) contextClear.clearReasoning = clearReasoning
+  const cfg = normalizeConfig({ offloadRoot, contextClear }, { dshHome: offloadRoot })
+  const tokenMeter = new TokenMeter(fakeMeterContext())
+  return { session, cfg, tokenMeter, offloadRoot, sessionId: 'sess-rich' }
+}
+
+/** All collapsed-step notes (matched by their fixed marker). */
+function collapseNotes(messages) {
+  const notes = []
+  for (const message of messages) {
+    for (const block of message.content ?? []) {
+      if (block.type === 'text' && typeof block.text === 'string' && block.text.startsWith(CONTEXT_COLLAPSE_MARK)) {
+        notes.push(block.text)
+      }
+    }
+  }
+  return notes
+}
+
+/** All assistant tool-call ids still present on the surface. */
+function assistantCallIds(messages) {
+  const ids = new Set()
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue
+    for (const block of message.content ?? []) {
+      if (block.type === 'tool-call') ids.add(block.id)
+    }
+  }
+  return ids
 }
 
 /**
@@ -458,6 +594,236 @@ test('a fresh session replayed from the log derives identical messages', { skip:
 })
 
 /* ------------------------------------------------------------------ *
+ * T3: step collapsing                                                *
+ * ------------------------------------------------------------------ */
+
+test('write-only step with a large argument is collapsed by (a)', { skip: sessionSkip }, async () => {
+  const fixture = await buildRichFixture()
+  const { session, cfg, tokenMeter, sessionId } = fixture
+  try {
+    const before = session.deriveMessages()
+    const checkpointBeforeIdx = session.surface.nodes.indexOf(liveCompactionCheckpoint(session).checkpointSeq)
+    const prefixBefore = JSON.stringify(session.surface.nodes.slice(0, checkpointBeforeIdx + 1))
+
+    const result = await clearAfterCompaction(session, { cfg, tokenMeter, sessionId })
+    assert.equal(result.triggered, true)
+    assert.equal(result.collapsedSteps, 1)
+    assert.deepEqual(result.collapsedByReason, { write: 1, reasoning: 0 })
+    assert.ok(result.bytesBefore > result.bytesAfter)
+
+    const after = session.deriveMessages()
+    const checkpointAfterIdx = session.surface.nodes.indexOf(liveCompactionCheckpoint(session).checkpointSeq)
+    assert.equal(JSON.stringify(session.surface.nodes.slice(0, checkpointAfterIdx + 1)), prefixBefore)
+    assert.equal(JSON.stringify(after.slice(0, 2)), JSON.stringify(before.slice(0, 2)))
+
+    const notes = collapseNotes(after)
+    assert.equal(notes.length, 1)
+    assert.ok(notes[0].includes('earlier step 1/1 collapsed after compaction (reasoning omitted).'))
+    assert.ok(notes[0].startsWith(CONTEXT_COLLAPSE_MARK))
+    assert.ok(notes[0].includes('write /tmp/a.txt: 2000 chars, sha256 '))
+    assert.ok(notes[0].includes('first 3 / last 3 lines'))
+    assert.ok(notes[0].includes('file is on disk, re-read by path'))
+    assert.ok(notes[0].includes(CONTEXT_CLEAR_MARK)) // folded result keeps a re-readable path
+
+    const calls = assistantCallIds(after)
+    assert.equal(calls.has('w1'), false) // collapsed step's call is gone
+    assert.equal(calls.has('r2'), true)
+    assert.equal(calls.has('b3'), true)
+    assert.equal(calls.has('w3'), true)
+    assert.equal(calls.has('w4'), true)
+    assert.equal(calls.has('w6'), true)
+    assertToolPairing(after)
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+test('a mixed bash+write step is never collapsed by (a)', { skip: sessionSkip }, async () => {
+  const fixture = await buildRichFixture()
+  const { session, cfg, tokenMeter, sessionId } = fixture
+  try {
+    const result = await clearAfterCompaction(session, { cfg, tokenMeter, sessionId })
+    assert.equal(result.collapsedByReason.write, 1) // only step 1
+    const after = session.deriveMessages()
+    assert.ok(collapseNotes(after).every((note) => !note.includes('1/3')))
+    assert.equal(assistantCallIds(after).has('b3'), true)
+    assert.equal(assistantCallIds(after).has('w3'), true)
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+test('a write step whose result is in the newest keep is not collapsed', { skip: sessionSkip }, async () => {
+  const fixture = await buildRichFixture()
+  const { session, cfg, tokenMeter, sessionId } = fixture
+  try {
+    const result = await clearAfterCompaction(session, { cfg, tokenMeter, sessionId })
+    assert.equal(result.collapsedByReason.write, 1)
+    const after = session.deriveMessages()
+    assert.ok(collapseNotes(after).every((note) => !note.includes('1/6')))
+    assert.equal(assistantCallIds(after).has('w6'), true)
+    assert.equal(derivedResults(after).get('w6').text, largeText('w6'))
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+test('an isError step is not collapsed', { skip: sessionSkip }, async () => {
+  const fixture = await buildRichFixture()
+  const { session, cfg, tokenMeter, sessionId } = fixture
+  try {
+    await clearAfterCompaction(session, { cfg, tokenMeter, sessionId })
+    const after = session.deriveMessages()
+    assert.ok(collapseNotes(after).every((note) => !note.includes('1/5')))
+    assert.equal(assistantCallIds(after).has('b5'), true)
+    assert.equal(derivedResults(after).get('b5').isError, true)
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+test('clearReasoning off leaves a reasoning-heavy step; on collapses it', { skip: sessionSkip }, async () => {
+  const off = await buildRichFixture()
+  try {
+    const result = await clearAfterCompaction(off.session, {
+      cfg: off.cfg,
+      tokenMeter: off.tokenMeter,
+      sessionId: off.sessionId,
+    })
+    assert.deepEqual(result.collapsedByReason, { write: 1, reasoning: 0 })
+    const offMessages = off.session.deriveMessages()
+    assert.ok(collapseNotes(offMessages).every((note) => !note.includes('1/2')))
+    assert.equal(assistantCallIds(offMessages).has('r2'), true)
+  } finally {
+    await rm(off.offloadRoot, { recursive: true, force: true })
+  }
+
+  const on = await buildRichFixture({ clearReasoning: { enabled: true, minReasoningChars: 600 } })
+  try {
+    const result = await clearAfterCompaction(on.session, {
+      cfg: on.cfg,
+      tokenMeter: on.tokenMeter,
+      sessionId: on.sessionId,
+    })
+    assert.deepEqual(result.collapsedByReason, { write: 1, reasoning: 1 })
+    const onMessages = on.session.deriveMessages()
+    assert.ok(collapseNotes(onMessages).some((note) => note.includes('1/2')))
+    assert.equal(assistantCallIds(onMessages).has('r2'), false)
+    assertToolPairing(onMessages)
+  } finally {
+    await rm(on.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+test('token meter measures a lower total after collapsing', { skip: sessionSkip }, async () => {
+  const fixture = await buildRichFixture()
+  const { session, cfg, tokenMeter, sessionId } = fixture
+  try {
+    const before = tokenMeter.measure(session).totalTokens
+    assert.ok(Number.isFinite(before))
+    const result = await clearAfterCompaction(session, { cfg, tokenMeter, sessionId })
+    assert.ok(result.collapsedSteps >= 1)
+    const after = tokenMeter.measure(session).totalTokens
+    assert.ok(Number.isFinite(after))
+    assert.ok(after < before, `expected ${after} < ${before}`)
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+test('collapsing twice is idempotent', { skip: sessionSkip }, async () => {
+  const fixture = await buildRichFixture()
+  const { session, cfg, tokenMeter, sessionId } = fixture
+  try {
+    const first = await clearAfterCompaction(session, { cfg, tokenMeter, sessionId })
+    assert.ok(first.collapsedSteps >= 1)
+    const seqAfterFirst = session.seq
+    const derivedAfterFirst = JSON.stringify(session.deriveMessages())
+    const second = await clearAfterCompaction(session, { cfg, tokenMeter, sessionId })
+    assert.equal(second.collapsedSteps, 0)
+    assert.equal(second.cleared, 0)
+    assert.equal(session.seq, seqAfterFirst)
+    assert.equal(JSON.stringify(session.deriveMessages()), derivedAfterFirst)
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+test('a fresh session replayed from a collapsed log derives identical messages', { skip: sessionSkip }, async () => {
+  const { Session } = deps
+  const fixture = await buildRichFixture()
+  const { session, cfg, tokenMeter, sessionId } = fixture
+  try {
+    await clearAfterCompaction(session, { cfg, tokenMeter, sessionId })
+    const expected = JSON.stringify(session.deriveMessages())
+    const replay = Session.create('replay-rich', session.snapshotEvents())
+    assert.equal(JSON.stringify(replay.deriveMessages()), expected)
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+test('T2 still clears the remaining old results after collapsing', { skip: sessionSkip }, async () => {
+  const fixture = await buildRichFixture()
+  const { session, cfg, tokenMeter, sessionId } = fixture
+  try {
+    const result = await clearAfterCompaction(session, { cfg, tokenMeter, sessionId })
+    assert.ok(result.cleared >= 1)
+    const byCall = derivedResults(session.deriveMessages())
+    for (const callId of ['r2', 'b3', 'w3', 'w4']) {
+      assert.ok(byCall.get(callId).text.startsWith(CONTEXT_CLEAR_MARK), `${callId} should be T2-cleared`)
+    }
+    assert.equal(byCall.get('w6').text, largeText('w6'))
+    assert.equal(byCall.get('b7').text, largeText('b7'))
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * Trigger guard scan efficiency                                      *
+ * ------------------------------------------------------------------ */
+
+test('liveCompactionCheckpoint scans backward and stops at the latest summary', { skip: sessionSkip }, async () => {
+  const fixture = await buildFixture()
+  const { session } = fixture
+  try {
+    const checkpoint = liveCompactionCheckpoint(session)
+    assert.ok(checkpoint)
+    const seen = []
+    const original = session.eventAt.bind(session)
+    session.eventAt = (seq) => {
+      seen.push(Number(seq))
+      return original(seq)
+    }
+    assert.deepEqual(liveCompactionCheckpoint(session), checkpoint)
+    assert.ok(seen.length > 0)
+    assert.equal(Math.min(...seen), checkpoint.summarySeq)
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+test('liveCompactionCheckpoint stops at a newest step/start without touching older seqs', { skip: sessionSkip }, async () => {
+  const fixture = await buildFixture()
+  const { session } = fixture
+  try {
+    session.append('step/start', { turn: 1, step: 9 })
+    const newest = Number(session.seq) - 1
+    const seen = []
+    const original = session.eventAt.bind(session)
+    session.eventAt = (seq) => {
+      seen.push(Number(seq))
+      return original(seq)
+    }
+    assert.equal(liveCompactionCheckpoint(session), undefined)
+    assert.deepEqual(seen, [newest])
+  } finally {
+    await rm(fixture.offloadRoot, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
  * Plugin wiring                                                      *
  * ------------------------------------------------------------------ */
 
@@ -510,7 +876,7 @@ test('mounted listener clears on enter and passes the decision through', { skip:
     const returned = await pre.handler({ agent: { session: fixture.session } }, async () => decision)
     assert.equal(returned, decision)
     assert.ok(
-      infos.some((m) => /^context-clear: cleared=2 bytes \d+->\d+$/.test(m)),
+      infos.some((m) => /^context-clear: cleared=2 collapsed=0 bytes \d+->\d+$/.test(m)),
       `expected a context-clear info log, got ${JSON.stringify(infos)}`,
     )
   } finally {

@@ -13,9 +13,9 @@
         # previewTailBytes: 1024
         # Cap for read of paths under offloadRoot (in-place truncate, no new file)
         # offloadReadMaxInlineBytes: 16384
-        # contextClear: compaction-coupled clearing of old tool results
+        # contextClear: compaction-coupled clearing of old tool results + steps
         # (default false/absent = off; acp / acp-lite stay off).
-        # T2 tool-result clearing implemented; T3 write/edit collapsing pending.
+        # T2 tool-result clearing + T3 write/edit step collapsing implemented.
         # contextClear:
         #   enabled: false                 # master switch (default false)
         #   mode: compaction-coupled        # 'off' | 'compaction-coupled'
@@ -23,6 +23,7 @@
         #   minResultBytes: 1200            # smaller results never cleared
         #   placeholder: { headBytes: 160, tailBytes: 240, failTailBytes: 600 }
         #   collapseWriteSteps: { enabled: true, tools: [write, edit], minArgChars: 1200 }
+        #   clearReasoning: { enabled: false, minReasoningChars: 600 }
         # excludeTools: []
         # toolOverrides:
         #   bash:

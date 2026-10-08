@@ -7,9 +7,9 @@
     previewHeadBytes: 1536
     previewTailBytes: 1024
     offloadReadMaxInlineBytes: 16384
-    # contextClear: compaction-coupled clearing of old tool results (opt-in).
+    # contextClear: compaction-coupled clearing of old tool results + collapsible steps (opt-in).
     # DEFAULT OFF — acp / acp-lite leave it unconfigured.
-    # T2 (tool-result clearing) implemented; T3 (write/edit step collapsing) pending.
+    # T2 (tool-result clearing) + T3 (write/edit step collapsing) implemented.
     # contextClear:
     #   enabled: false                     # master switch (default false)
     #   mode: compaction-coupled            # 'off' | 'compaction-coupled'
@@ -23,6 +23,9 @@
     #     enabled: true
     #     tools: [write, edit]
     #     minArgChars: 1200
+    #   clearReasoning:                     # optional T3 extension, default off
+    #     enabled: false
+    #     minReasoningChars: 600
     excludeTools: []
     toolOverrides:
       bash:

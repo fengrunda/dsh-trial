@@ -75,7 +75,15 @@ export function build(session) {
         masked: false,
       }))
       const textTok = Math.max(0, nonReason - args.reduce((x, y) => x + y.tok, 0))
-      items.push({ id: id++, kind: 'asst', step: i - 1, reason, args, text: textTok })
+      items.push({
+        id: id++,
+        kind: 'asst',
+        step: i - 1,
+        reason,
+        reasonChars: a.rc,
+        args,
+        text: textTok,
+      })
       for (const x of pre) {
         const tok = chars > 0 ? Math.max(1, Math.round((rest * x.chars) / chars)) : 1
         items.push({

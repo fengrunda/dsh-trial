@@ -44,6 +44,8 @@ const SPEC = {
   keep: { default: 8, parse: Number },
   minResultBytes: { flag: '--min-result-bytes', default: 1200, parse: Number },
   noCollapse: { flag: '--no-collapse', boolean: true },
+  clearReasoning: { flag: '--clear-reasoning', boolean: true },
+  minReasoningChars: { flag: '--min-reasoning-chars', default: 600, parse: Number },
   prices: { default: undefined },
   json: { boolean: true },
   help: { flag: '--help', boolean: true },
@@ -70,6 +72,8 @@ Simulation:
   --keep <n>               newest tool results protected by contextClear (default 8)
   --min-result-bytes <n>   T2 eligibility floor in bytes (default 1200)
   --no-collapse            disable T3 write/edit step collapse
+  --clear-reasoning        also collapse reasoning-heavy steps (any tools; default off)
+  --min-reasoning-chars <n> reasoning-text floor for --clear-reasoning (default 600)
   --prices '<json>'        {hit,miss,out} peak rates (off-peak = half) or {peak,offpeak}
 
 Output:
@@ -110,7 +114,7 @@ function main(argv) {
     return
   }
 
-  for (const key of ['threshold', 'retain', 'keep', 'minResultBytes']) {
+  for (const key of ['threshold', 'retain', 'keep', 'minResultBytes', 'minReasoningChars']) {
     const value = args[key]
     if (!Number.isInteger(value) || value < 0) fail(`--${key} must be a non-negative integer`)
   }
@@ -185,6 +189,8 @@ function main(argv) {
     keep: args.keep,
     minResultBytes: args.minResultBytes,
     collapse: !args.noCollapse,
+    clearReasoning: args.clearReasoning === true,
+    minReasoningChars: args.minReasoningChars,
   })
 
   const actual = actualTotals(sessions, windowOf, windows, prices)
@@ -208,6 +214,8 @@ function main(argv) {
     keep: args.keep,
     minResultBytes: args.minResultBytes,
     collapse: !args.noCollapse,
+    clearReasoning: args.clearReasoning === true,
+    minReasoningChars: args.minReasoningChars,
     prices,
     sessionsScanned: uniqueFiles.length,
     sessionsWithWindowRequests: sessions.length,

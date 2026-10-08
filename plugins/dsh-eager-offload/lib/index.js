@@ -15,8 +15,8 @@
  * the full history, so nothing was ever masked. The config keys are still
  * accepted (and a one-time warning is logged) so existing profiles load. The
  * replacement is `contextClear` (compaction-coupled, persistent surfaceOp
- * `replace`): T2 wires the tool-result clearing; collapsing oversized
- * write/edit steps (T3) is still pending.
+ * `replace`): T2 wires the tool-result clearing and T3 the collapse of
+ * eligible old steps (write/edit arguments and, optionally, large reasoning).
  *
  * Named exports only (`apply` / `inject` / `name`) — `export default apply`
  * breaks Cordis inject metadata (see dsh-design-pack).
@@ -131,7 +131,8 @@ export function apply(ctx, config = {}) {
           })
           if (result.triggered) {
             ctx.logger?.info?.(
-              `context-clear: cleared=${result.cleared} bytes ${result.bytesBefore}->${result.bytesAfter}`,
+              `context-clear: cleared=${result.cleared} collapsed=${result.collapsedSteps} ` +
+                `bytes ${result.bytesBefore}->${result.bytesAfter}`,
             )
           }
         } catch (error) {

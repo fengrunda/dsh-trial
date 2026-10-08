@@ -13,6 +13,9 @@
 //        at least one argument is >= `minArgChars`, when all of that step's
 //        results sit before the newest `keep` results, into one ~80-token user
 //        note. Mixed-tool steps (e.g. bash+write) are never collapsed.
+//        Optional `clearReasoning` (default off) additionally collapses a step
+//        of any tools whose assistant thinking text is >= `minReasoningChars`
+//        characters (chars are read from the real reasoning blocks).
 
 import { tokOf } from './model.mjs'
 
@@ -27,6 +30,8 @@ export const DEFAULT_CONTEXT_CLEAR_CFG = Object.freeze({
   collapseTools: DEFAULT_COLLAPSE_TOOLS,
   collapseMinArgChars: 1200,
   collapseTok: 80,
+  clearReasoning: false,
+  minReasoningChars: 600,
   placeholder: Object.freeze({
     headBytes: 160,
     tailBytes: 240,
@@ -65,7 +70,7 @@ export function isClearableResult(item, cfg = DEFAULT_CONTEXT_CLEAR_CFG) {
  *
  * @param {any[]} surface `[sys, summary, ...tail]` (or a bare tail)
  * @param {object} [cfg]
- * @returns {{surface:any[], t2:number, t3:number, cleared:number, changedFrom:number}}
+ * @returns {{surface:any[], t2:number, t3:number, t3write:number, t3reason:number, cleared:number, changedFrom:number}}
  */
 export function applyContextClear(surface, cfg = DEFAULT_CONTEXT_CLEAR_CFG) {
   const tailStart =
@@ -74,6 +79,8 @@ export function applyContextClear(surface, cfg = DEFAULT_CONTEXT_CLEAR_CFG) {
     surface,
     t2: 0,
     t3: 0,
+    t3write: 0,
+    t3reason: 0,
     cleared: 0,
     changedFrom: Number.POSITIVE_INFINITY,
   }
@@ -81,31 +88,51 @@ export function applyContextClear(surface, cfg = DEFAULT_CONTEXT_CLEAR_CFG) {
   surface.forEach((item, i) => origIndex.set(item, i))
 
   // ------------------------------------------------------------------ T3
-  const resultByCall = new Map()
-  surface.forEach((item, i) => {
-    if (i >= tailStart && item.kind === 'result' && item.callId && !resultByCall.has(item.callId)) {
-      resultByCall.set(item.callId, i)
-    }
-  })
   const writeTools = new Set(cfg.collapseTools ?? DEFAULT_COLLAPSE_TOOLS)
+  const collapseWrite = cfg.collapse !== false
+  const clearReasoning = cfg.clearReasoning === true
+  const minReasoningChars = cfg.minReasoningChars ?? DEFAULT_CONTEXT_CLEAR_CFG.minReasoningChars
   const collapses = []
-  if (cfg.collapse !== false) {
+  if (collapseWrite || clearReasoning) {
     const allResults = []
     for (let i = tailStart; i < surface.length; i++) if (surface[i].kind === 'result') allResults.push(i)
-    const cutIdx = allResults.length > cfg.keep ? allResults[allResults.length - cfg.keep] : Number.POSITIVE_INFINITY
+    // Plugin parity: the newest `keep` results are protected (all of them when
+    // the tail holds fewer than `keep`).
+    const cutIdx =
+      cfg.keep > 0 && allResults.length > 0
+        ? allResults[Math.max(0, allResults.length - cfg.keep)]
+        : Number.POSITIVE_INFINITY
     for (let i = tailStart; i < surface.length; i++) {
       const item = surface[i]
       if (item.kind !== 'asst') continue
       const calls = item.args ?? []
       if (!calls.length) continue
-      if (!calls.every((a) => writeTools.has(a.tool))) continue
-      if (!calls.some((a) => a.chars >= cfg.collapseMinArgChars)) continue
-      const resultIdxs = calls.map((a) => (a.id !== undefined ? resultByCall.get(a.id) : undefined))
-      if (resultIdxs.some((ri) => ri === undefined)) continue
-      if (resultIdxs.some((ri) => ri >= cutIdx)) continue
+      // Plugin parity: the assistant must be immediately followed by exactly
+      // its results, one per call, in call order, nothing interleaved.
+      let end = i
+      let contiguous = true
+      for (let ci = 0; ci < calls.length; ci++) {
+        const next = surface[i + 1 + ci]
+        if (next?.kind !== 'result' || next.callId !== calls[ci].id) {
+          contiguous = false
+          break
+        }
+        end = i + 1 + ci
+      }
+      if (!contiguous) continue
+      const stepResults = surface.slice(i + 1, end + 1)
       const start = i
-      const end = Math.max(...resultIdxs)
-      collapses.push({ start, end, step: item.step })
+      i = end
+      if (stepResults.some((it) => it.isError || it.plain === false)) continue
+      if (stepResults.some((_it, ci) => start + 1 + ci >= cutIdx)) continue
+      const byWrite =
+        collapseWrite &&
+        calls.every((a) => writeTools.has(a.tool)) &&
+        calls.some((a) => a.chars >= cfg.collapseMinArgChars)
+      const byReasoning = !byWrite && clearReasoning && (item.reasonChars ?? 0) >= minReasoningChars
+      const reason = byWrite ? 'write' : byReasoning ? 'reasoning' : null
+      if (reason === null) continue
+      collapses.push({ start, end, step: item.step, reason })
     }
   }
 
@@ -120,8 +147,16 @@ export function applyContextClear(surface, cfg = DEFAULT_CONTEXT_CLEAR_CFG) {
     for (let i = 0; i < surface.length; i++) {
       const collapse = collapses.find((c) => c.start === i)
       if (collapse) {
-        rebuilt.push({ kind: 'user', tok: cfg.collapseTok, collapsed: true, step: collapse.step })
+        rebuilt.push({
+          kind: 'user',
+          tok: cfg.collapseTok,
+          collapsed: true,
+          step: collapse.step,
+          reason: collapse.reason,
+        })
         result.t3 += 1
+        if (collapse.reason === 'write') result.t3write += 1
+        else result.t3reason += 1
         continue
       }
       if (drop.has(i)) continue
@@ -132,8 +167,11 @@ export function applyContextClear(surface, cfg = DEFAULT_CONTEXT_CLEAR_CFG) {
   // ------------------------------------------------------------------ T2
   const tailResults = []
   for (let i = tailStart; i < rebuilt.length; i++) if (rebuilt[i].kind === 'result') tailResults.push(i)
-  const protectedFrom = tailResults.length > cfg.keep ? tailResults.length - cfg.keep : 0
-  const cutIdx = protectedFrom > 0 ? tailResults[protectedFrom] : Number.POSITIVE_INFINITY
+  // Plugin parity: newest `keep` protected, all when fewer than `keep` exist.
+  const cutIdx =
+    cfg.keep > 0 && tailResults.length > 0
+      ? tailResults[Math.max(0, tailResults.length - cfg.keep)]
+      : Number.POSITIVE_INFINITY
   for (const i of tailResults) {
     if (i >= cutIdx) continue
     const item = rebuilt[i]

@@ -20,7 +20,20 @@ export const SUMMARY_MAX = 8192
 
 /** Empty per-window accumulator. */
 export function newAccumulator() {
-  return { P: 0, hit: 0, miss: 0, out: 0, req: 0, cost: 0, comp: 0, cleared: 0, t2: 0, t3: 0 }
+  return {
+    P: 0,
+    hit: 0,
+    miss: 0,
+    out: 0,
+    req: 0,
+    cost: 0,
+    comp: 0,
+    cleared: 0,
+    t2: 0,
+    t3: 0,
+    t3write: 0,
+    t3reason: 0,
+  }
 }
 
 function addTo(acc, win, key, value) {
@@ -104,6 +117,8 @@ export function runSession(session, cfg, windowOf, windows, prices) {
         addTo(acc, win, 'cleared', cleared.cleared)
         addTo(acc, win, 't2', cleared.t2)
         addTo(acc, win, 't3', cleared.t3)
+        addTo(acc, win, 't3write', cleared.t3write ?? 0)
+        addTo(acc, win, 't3reason', cleared.t3reason ?? 0)
         if (cleared.changedFrom >= 0) cache.invalidateFrom(cleared.changedFrom)
       }
       measured = sumTokens(surface)

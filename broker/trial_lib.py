@@ -141,6 +141,49 @@ def max_concurrent_goals(limits: dict | None = None) -> int:
     return value if value > 0 else default
 
 
+# T6: per-role reasoning effort / step budget for spawned tickets. Both are
+# handed to the tool layer as env (DSH_REASONING_EFFORT / DSH_STEP_BUDGET).
+# NOTE: DeepSeek really only has low/high/max today — an emitted "medium" is
+# treated as "high" downstream, so this table saves nothing yet; to genuinely
+# lower a role's effort, change that role to "low".
+DEFAULT_REASONING_EFFORT_BY_ROLE = {"supervisor": "medium", "impl": "medium", "gate": "high"}
+
+# Soft reminder only (>0 enables the plugin hint); never a hard kill.
+DEFAULT_STEP_BUDGET_BY_ROLE = {"supervisor": 30, "impl": 80, "gate": 60}
+
+
+def role_reasoning_effort(role: str | None, limits: dict | None = None) -> str | None:
+    """Reasoning effort for ``role``; unknown role -> ``None`` (do not set env)."""
+    key = str(role or "").strip()
+    if key not in DEFAULT_REASONING_EFFORT_BY_ROLE:
+        return None
+    if limits is None:
+        limits = load_global_limits()
+    table = (limits or {}).get("reasoning_effort_by_role")
+    if not isinstance(table, dict):
+        table = {}
+    value = table.get(key, DEFAULT_REASONING_EFFORT_BY_ROLE[key])
+    text = str(value or "").strip()
+    return text or None
+
+
+def role_step_budget(role: str | None, limits: dict | None = None) -> int:
+    """Step budget for ``role``; unknown role or bad value -> ``0`` (do not set)."""
+    key = str(role or "").strip()
+    if key not in DEFAULT_STEP_BUDGET_BY_ROLE:
+        return 0
+    if limits is None:
+        limits = load_global_limits()
+    table = (limits or {}).get("step_budget_by_role")
+    if not isinstance(table, dict):
+        table = {}
+    try:
+        value = int(table.get(key, DEFAULT_STEP_BUDGET_BY_ROLE[key]))
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 # ---------------------------------------------------------------------------
 # T3c: broker heartbeat — status/report 展示并发（slots / queued）
 # ---------------------------------------------------------------------------

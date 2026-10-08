@@ -1264,6 +1264,22 @@ def _spawn_env(
     gid = str(goal or current_goal_id() or "")
     if gid:
         env["DSH_TRIAL_GOAL"] = gid
+    # T6: per-role reasoning effort / step budget. Broker-computed values win;
+    # unknown role clears any inherited value so a parent shell cannot leak it.
+    try:
+        eff_limits = T.load_global_limits()
+    except Exception:  # noqa: BLE001 - a bad limits.json must not block spawn
+        eff_limits = None
+    effort = T.role_reasoning_effort(role, eff_limits)
+    if effort:
+        env["DSH_REASONING_EFFORT"] = str(effort)
+    else:
+        env.pop("DSH_REASONING_EFFORT", None)
+    budget = T.role_step_budget(role, eff_limits)
+    if budget > 0:
+        env["DSH_STEP_BUDGET"] = str(budget)
+    else:
+        env.pop("DSH_STEP_BUDGET", None)
     env.pop("NEW_API_KEY", None)
     _ = _redact_env(env)
     return env

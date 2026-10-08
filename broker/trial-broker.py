@@ -193,6 +193,13 @@ _CTX = threading.local()
 # window between tickets" dance from stop.sh.
 DRAIN_POLL_SEC = 0.1
 
+# --- T3 resume: is the impl ticket really finished? -------------------------
+# A resumed round only trusts an on-disk impl summary as "finished" when the
+# ticket log shows its closing ``=== exit=`` line (or the slice already has a
+# review PASS). While the ticket is still running the chain waits, polling
+# every RESUME_IMPL_WAIT_POLL_SEC up to gate_job_timeout_sec().
+RESUME_IMPL_WAIT_POLL_SEC = 10.0
+
 
 class BrokerDraining(Exception):
     """Raised when a ticket would be spawned while the broker is draining.
@@ -4707,6 +4714,80 @@ def limit_stop_closeout(
     return {"action": "fail", "error": err, "note": "", **record}
 
 
+def _args_have_ticket(args: str, ticket: str) -> bool:
+    """True when ``args`` carries ``--ticket <ticket>`` (exact value match)."""
+    ticket = str(ticket or "")
+    if not ticket:
+        return False
+    try:
+        toks = shlex.split(args)
+    except ValueError:
+        toks = args.split()
+    for i, tok in enumerate(toks):
+        if tok == "--ticket":
+            if i + 1 < len(toks) and toks[i + 1] == ticket:
+                return True
+        elif tok.startswith("--ticket="):
+            if tok.split("=", 1)[1] == ticket:
+                return True
+    return False
+
+
+def _live_ticket_pids(ticket: str) -> list[int]:
+    """PIDs whose command line is an open-slice/dsh-acp-ask run of ``ticket``.
+
+    Mockable seam around ``ps``: the ticket argument must match ``--ticket``
+    exactly so ``impl-trial-s1-r1`` never matches ``impl-trial-s1-r10``.
+    """
+    ticket = str(ticket or "")
+    if not ticket:
+        return []
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        head, _, args = line.partition(" ")
+        args = args.strip()
+        if "open-slice.sh" not in args and "dsh-acp-ask.py" not in args:
+            continue
+        if not _args_have_ticket(args, ticket):
+            continue
+        try:
+            pids.append(int(head))
+        except ValueError:
+            continue
+    return pids
+
+
+def _impl_ticket_state(ticket: str, log_path: Path) -> str:
+    """``"ended" | "running" | "dead"`` for the impl ticket of a resumed round.
+
+    ``ended``   — the log's last ``=== open-slice <ts> ===`` header is followed
+                  by its closing ``=== exit=<ec> ===`` line (an exit line from
+                  an earlier run, i.e. before the last header, proves nothing);
+    ``running`` — no closing line yet, but a live process runs that ticket;
+    ``dead``    — neither: the run died mid-flight.
+    """
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    head = text.rfind("=== open-slice ")
+    if head >= 0 and text.find("=== exit=", head) >= 0:
+        return "ended"
+    if _live_ticket_pids(ticket):
+        return "running"
+    return "dead"
+
+
 def run_chain_rounds(
     job: dict,
     chain: dict,
@@ -4761,6 +4842,37 @@ def run_chain_rounds(
         reuse_impl = bool(resume) and (
             resumed_rec is not None or impl_summary.is_file()
         )
+        # T3: a bare summary file is not proof the impl ticket finished — the
+        # broker may have died while it was still running (or after it died
+        # mid-flight). Only the log's closing ``=== exit=`` line, a review
+        # PASS, or a live ticket that later reaches its exit line counts.
+        if reuse_impl and resumed_rec is None and impl_summary.is_file():
+            state = _impl_ticket_state(impl_ticket, impl_log)
+            if state != "ended" and _slice_has_review_pass(
+                goal_obj, slice_id, reload=True
+            )[0]:
+                state = "ended"
+            if state == "running":
+                deadline = time.monotonic() + max(0, int(gate_job_timeout_sec()))
+                while state == "running" and time.monotonic() < deadline:
+                    time.sleep(max(0.0, float(RESUME_IMPL_WAIT_POLL_SEC)))
+                    state = _impl_ticket_state(impl_ticket, impl_log)
+                if state == "running":
+                    state = "dead"
+            if state != "ended":
+                try:
+                    impl_summary.rename(impl_summary.with_name(
+                        f"{impl_summary.name}.unfinished-{_stamp()}"
+                    ))
+                except OSError:
+                    pass
+                print(
+                    f"[trial-broker] chain {slice_id} resume r{round_n}: impl "
+                    f"ticket {impl_ticket} did not finish ({state}); summary "
+                    f"set aside, re-opening impl",
+                    flush=True,
+                )
+                reuse_impl = False
         append_round = True
         if reuse_impl:
             _adopt_misplaced_summary(impl_summary)

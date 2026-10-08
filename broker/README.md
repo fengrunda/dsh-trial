@@ -79,8 +79,14 @@ python3 ./broker/trial-watchdog.py --once --dry-run   # 只打印 payload，不�
    持续刷新心跳，不会误报。
 3. **Goal thin-state 仍是 `running`/`planning`/`closeout` 但无活票**（processing+inbox 空、
    无 work 进程）超过 `TRIAL_WATCHDOG_GOAL_STALL_SEC`（默认 600s）→ stalled。
-4. **冻后恢复**：墙钟 `time.time()` 与单调钟推断偏差 ≥ `DSH_TRIAL_FREEZE_JUMP_SEC`
-   （默认 300s）→ kind=`dsh-trial-resumed-after-freeze`（每次跳变只发一次）。
+4. **冻后恢复**：任一判据成立 → kind=`dsh-trial-resumed-after-freeze`（每次跳变只发一次）：
+   (a) 墙钟 − 单调钟前进量偏差 ≥ `DSH_TRIAL_FREEZE_JUMP_SEC`（默认 300s）；
+   (b) `CLOCK_BOOTTIME` − 单调钟偏差 ≥ 同阈值（平台无该时钟则跳过）；
+   (c) `--loop` 下同一 watchdog pid 的单轮单调间隔超出 `--interval` ≥ 同阈值（进程被挂起）。
+   冻结轮及其后 `TRIAL_WATCHDOG_FREEZE_GRACE_SEC`（默认 120s，且不小于 `--interval`）内，
+   依赖墙钟的 stalled（`heartbeat_stale` / `no_heartbeat` / `goal_no_ticket:*`）不报；
+   宽限期内 broker 续心跳即恢复正常，宽限过后仍不续才报 stalled。`no_broker_process`
+   与 session-idle（纯单调钟）不受宽限影响。
 
 事件 payload 统一带 `goal` / `status` / `reason` / `suggested_action`；同一 `reason_key`
 在 `TRIAL_WATCHDOG_COOLDOWN_SEC`（默认 900s）内不重复发。

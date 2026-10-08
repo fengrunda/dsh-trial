@@ -16,9 +16,23 @@ webhook the broker uses (``khub-dsh-complete-notify.py``). Four stall checks:
    — idle is measured purely from the monotonic clock, so a wall-clock jump
    (freeze/resume/NTP step) can never raise a false session-idle alarm
 
-Plus freeze detection: when the wall clock jumps forward relative to the
-monotonic clock by more than the threshold, emit
-``dsh-trial-resumed-after-freeze`` once.
+Plus freeze detection: emit ``dsh-trial-resumed-after-freeze`` once when any of
+three criteria fires in a round —
+
+  a. wall − monotonic drift ≥ ``DSH_TRIAL_FREEZE_JUMP_SEC`` (default 300)
+  b. boottime − monotonic drift ≥ the same threshold (skipped when the platform
+     has no ``CLOCK_BOOTTIME``)
+  c. a single round took ``expected_interval + threshold`` monotonic seconds
+     while the previous round belonged to the same loop pid (``--loop`` only, so
+     a watchdog restart never mistakes its own downtime for a freeze)
+
+The freeze round and the ``TRIAL_WATCHDOG_FREEZE_GRACE_SEC`` seconds after it
+(monotonic deadline persisted as ``freeze_grace_until_mono``) discard the
+clock-based stalls — ``heartbeat_stale`` / ``no_heartbeat`` /
+``goal_no_ticket:*`` — because a wall-clock jump makes all of them lie.
+``no_broker_process`` and the already-monotonic ``session_idle:*`` still report.
+Past the grace window the old rules apply unchanged, so a heartbeat the broker
+really stopped renewing still stalls.
 
 Dedup: the same stall key is not re-sent within ``--cooldown`` seconds.
 
@@ -31,7 +45,9 @@ Env knobs (all optional):
   TRIAL_WATCHDOG_HEARTBEAT_SEC  stale heartbeat threshold (default 300)
   TRIAL_WATCHDOG_GOAL_STALL_SEC goal thin-state stall threshold (default 600)
   TRIAL_WATCHDOG_COOLDOWN_SEC   per-reason dedup cooldown (default 900)
-  DSH_TRIAL_FREEZE_JUMP_SEC     wall-clock jump threshold (default 300)
+  DSH_TRIAL_FREEZE_JUMP_SEC     wall/boottime jump threshold (default 300)
+  TRIAL_WATCHDOG_FREEZE_GRACE_SEC  post-freeze grace for clock-based stalls
+                                (default 120, never below --interval)
   TRIAL_WATCHDOG_SESSION_IDLE_SEC  live-ticket session idle threshold (default 1800)
   TRIAL_WATCHDOG_LOG_DIR        open-slice default log dir (default /workspace/tmp)
   DSH_HOMES_ROOT                ACP homes root for the session fallback
@@ -110,6 +126,109 @@ def session_idle_timeout() -> float:
 
 def cooldown_sec() -> float:
     return _env_float("TRIAL_WATCHDOG_COOLDOWN_SEC", 900)
+
+
+FREEZE_GRACE_DEFAULT_SEC = 120
+
+# Stalls whose verdict depends on the wall clock (heartbeat mtime, goal
+# thin-state timestamps) and therefore lie for a whole freeze recovery window.
+CLOCK_STALL_KEYS = frozenset({"heartbeat_stale", "no_heartbeat"})
+CLOCK_STALL_KEY_PREFIXES = ("goal_no_ticket:",)
+
+# ``boottime=None`` must be distinguishable from "detect it yourself".
+_AUTO = object()
+
+
+def freeze_grace_sec(expected_interval: float | None = None) -> float:
+    """Grace after a detected freeze, never shorter than one loop interval."""
+    grace = _env_float("TRIAL_WATCHDOG_FREEZE_GRACE_SEC", FREEZE_GRACE_DEFAULT_SEC)
+    if expected_interval is not None:
+        grace = max(grace, float(expected_interval))
+    return max(0.0, grace)
+
+
+def boottime_now() -> float | None:
+    """``CLOCK_BOOTTIME`` seconds, or ``None`` when the platform lacks it."""
+    clock = getattr(time, "CLOCK_BOOTTIME", None)
+    if clock is None:
+        return None
+    try:
+        return float(time.clock_gettime(clock))
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def is_clock_related_stall(event: dict) -> bool:
+    """True for stall reasons invalidated by a wall-clock jump (freeze grace)."""
+    key = str(event.get("reason_key") or "")
+    if key in CLOCK_STALL_KEYS:
+        return True
+    return any(key.startswith(prefix) for prefix in CLOCK_STALL_KEY_PREFIXES)
+
+
+def persisted_grace_deadline(
+    now_mono: float,
+    state: dict | None = None,
+    grace_sec: float | None = None,
+) -> float | None:
+    """The still-trusted persisted grace deadline, or ``None`` when unusable.
+
+    Rejected: missing/expired values, and values further ahead than
+    ``grace_sec`` (+1s tolerance). The upper bound matters because the monotonic
+    clock restarts near zero on reboot — a deadline left over from the previous
+    boot (e.g. 67000) would otherwise hold the grace window open for hours and
+    swallow a genuinely stale heartbeat.
+    """
+    doc = state if isinstance(state, dict) else {}
+    until = doc.get("freeze_grace_until_mono")
+    if not isinstance(until, (int, float)):
+        return None
+    until = float(until)
+    if float(now_mono) >= until:
+        return None
+    if grace_sec is not None and until - float(now_mono) > float(grace_sec) + 1.0:
+        return None
+    return until
+
+
+def grace_is_active(
+    now_mono: float,
+    freeze: bool,
+    state: dict | None = None,
+    grace_sec: float | None = None,
+) -> bool:
+    """The freeze round itself, plus every round before the persisted deadline.
+
+    ``grace_sec`` bounds how far ahead that deadline may sit (a stale deadline
+    from a previous boot is ignored); ``None`` keeps the old unbounded check.
+    """
+    if freeze:
+        return True
+    return persisted_grace_deadline(now_mono, state, grace_sec) is not None
+
+
+def _freeze_state_fields(
+    now_wall: float,
+    now_mono: float,
+    boot: float | None,
+    loop_pid: int,
+    expected_interval: float | None,
+    grace_until: float | None,
+) -> dict:
+    """Baseline (+ loop identity and grace deadline) persisted every round."""
+    fields: dict = {
+        "wall": float(now_wall),
+        "mono": float(now_mono),
+        "loop_pid": int(loop_pid),
+        "at": T.now_iso(),
+    }
+    if boot is not None:
+        fields["boot"] = float(boot)
+    if expected_interval is not None:
+        fields["interval"] = float(expected_interval)
+    if grace_until is not None:
+        fields["freeze_grace_until_mono"] = float(grace_until)
+    return fields
 
 
 def read_pidfile(pidfile: Path | None = None) -> int | None:
@@ -538,13 +657,24 @@ def read_watchdog_state(path: Path | None = None) -> dict:
         return {}
 
 
-def write_watchdog_state(state: dict, path: Path | None = None) -> None:
-    """Read-modify-write ``state`` so freeze and session-idle keys coexist."""
+def write_watchdog_state(
+    state: dict,
+    path: Path | None = None,
+    *,
+    drop: tuple[str, ...] = (),
+) -> None:
+    """Read-modify-write ``state`` so freeze and session-idle keys coexist.
+
+    ``drop`` removes keys that must not survive the merge (an unusable
+    ``freeze_grace_until_mono``).
+    """
     p = path or STATE_FILE
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         doc = read_watchdog_state(p)
         doc.update(state)
+        for key in drop:
+            doc.pop(key, None)
         p.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except OSError:
         pass
@@ -556,29 +686,95 @@ def collect_freeze_events(
     *,
     state_path: Path | None = None,
     persist: bool = True,
+    boottime: float | None | object = _AUTO,
+    expected_interval: float | None = None,
+    loop_pid: int | None = None,
+    state: dict | None = None,
+    grace_sec: float | None = None,
 ) -> list[dict]:
-    """Emit once when the wall clock jumped forward vs the monotonic clock."""
+    """Emit at most one event when any freeze criterion fired this round.
+
+    ``expected_interval`` (the ``--loop`` interval) enables the one-round-gap
+    criterion; it is only trusted while ``prev.loop_pid`` equals the current pid,
+    so a watchdog restart does not read its own downtime as a freeze.
+    ``boottime`` defaults to auto-detection via :func:`boottime_now`.
+    ``state`` lets ``run_once`` share its single read of the state file.
+
+    ``persist`` writes the baseline (plus the grace deadline on a freeze round);
+    ``run_once`` passes ``persist=False`` and owns that write.
+    """
     now_wall = time.time() if now_wall is None else now_wall
     now_mono = time.monotonic() if now_mono is None else now_mono
-    prev = read_watchdog_state(state_path)
+    boot = boottime_now() if boottime is _AUTO else boottime
+    pid = os.getpid() if loop_pid is None else int(loop_pid)
+    prev = read_watchdog_state(state_path) if state is None else state
+    prev = prev if isinstance(prev, dict) else {}
+    if grace_sec is None:
+        grace_sec = freeze_grace_sec(expected_interval)
+
+    threshold = T.freeze_jump_threshold()
     prev_wall = prev.get("wall")
     prev_mono = prev.get("mono")
+    hits: dict[str, float] = {}
+
+    # (a) wall clock ran ahead of the monotonic clock.
+    if isinstance(prev_wall, (int, float)) and isinstance(prev_mono, (int, float)):
+        drift = T.wall_clock_drift_sec(prev_wall, prev_mono, now_wall, now_mono)
+        if drift >= threshold:
+            hits["wall-mono"] = drift
+
+    # (b) boottime ran ahead of the monotonic clock (skipped without the clock).
+    prev_boot = prev.get("boot")
+    if (
+        boot is not None
+        and isinstance(prev_boot, (int, float))
+        and isinstance(prev_mono, (int, float))
+    ):
+        drift_boot = T.wall_clock_drift_sec(prev_boot, prev_mono, boot, now_mono)
+        if drift_boot >= threshold:
+            hits["boottime-mono"] = drift_boot
+
+    # (c) this round simply took far longer than the loop asked for, while the
+    # previous round was ours (a restarted watchdog starts a fresh baseline).
+    if (
+        expected_interval is not None
+        and prev.get("loop_pid") == pid
+        and isinstance(prev_mono, (int, float))
+    ):
+        gap = (float(now_mono) - float(prev_mono)) - float(expected_interval)
+        if gap >= threshold:
+            hits["loop-interval"] = gap
+
+    freeze = bool(hits)
+    grace_until = float(now_mono) + float(grace_sec) if freeze else None
     if persist:
         write_watchdog_state(
-            {"wall": now_wall, "mono": now_mono, "at": T.now_iso()}, state_path
+            _freeze_state_fields(
+                now_wall, now_mono, boot, pid, expected_interval, grace_until
+            ),
+            state_path,
+            drop=() if grace_until is not None else ("freeze_grace_until_mono",),
         )
-    if prev_wall is None or prev_mono is None:
+    if not freeze:
         return []
-    drift = T.detect_resumed_after_freeze(prev_wall, prev_mono, now_wall, now_mono)
-    if drift is None:
-        return []
+
+    jump = max(hits.values())
+    primary = next(name for name, value in hits.items() if value == jump)
+    criteria = ",".join(sorted(hits))
     return [{
         "kind": FREEZE_KIND,
         "status": "resumed-after-freeze",
         "goal": "*",
-        "reason": f"wall clock jumped {drift / 60.0:.1f} min vs monotonic clock",
+        "reason": (
+            f"clock jump {jump / 60.0:.1f} min ({criteria}) vs monotonic clock; "
+            f"clock-based stall checks granted {float(grace_sec):.0f}s grace"
+        ),
         "suggested_action": "核对 running Goal / 是否需 salvage；检查系统是否刚从冻住恢复",
         "reason_key": "resumed-after-freeze",
+        "criterion": primary,
+        "criteria": sorted(hits),
+        "jump_sec": jump,
+        "grace_sec": float(grace_sec),
     }]
 
 
@@ -700,12 +896,14 @@ def run_once(
     persist_freeze: bool = True,
     persist: bool | None = None,
     now_mono: float | None = None,
+    expected_interval: float | None = None,
 ) -> dict:
     """Evaluate all checks, dedup, notify. Returns a structured result.
 
-    ``persist`` overrides the legacy ``persist_freeze`` switch (which is kept
-    for back-compat); either way ``dry_run=True`` forces a read-only pass so no
-    state is ever written.
+    ``expected_interval`` is the loop interval (``--loop`` only); it arms the
+    one-round-gap freeze criterion and the grace floor. ``persist`` overrides the
+    legacy ``persist_freeze`` switch (which is kept for back-compat); either way
+    ``dry_run=True`` forces a read-only pass so no state is ever written.
     """
     now = time.time() if now is None else now
     now_mono = time.monotonic() if now_mono is None else now_mono
@@ -715,9 +913,34 @@ def run_once(
     broker_pids = list_broker_pids()
     work_pids = list_work_pids()
     prior = read_watchdog_state()
+    boot = boottime_now()
+
+    # Freeze first: its verdict decides whether the clock-based stalls below are
+    # trustworthy this round (and for the following grace window).
+    freeze_events = collect_freeze_events(
+        now,
+        now_mono,
+        persist=False,
+        boottime=boot,
+        expected_interval=expected_interval,
+        state=prior,
+    )
+    freeze = bool(freeze_events)
+    grace_sec = freeze_grace_sec(expected_interval)
+    if freeze:
+        grace_until = float(now_mono) + float(
+            freeze_events[0].get("grace_sec") or grace_sec
+        )
+    else:
+        # A deadline from a previous boot (monotonic clock reset) is unusable
+        # and must neither arm the grace window nor be persisted again.
+        grace_until = persisted_grace_deadline(now_mono, prior, grace_sec)
+    grace_active = grace_is_active(now_mono, freeze, prior, grace_sec)
 
     events = collect_stall_events(now, broker_pids=broker_pids, work_pids=work_pids)
-    events += collect_freeze_events(now, now_mono, persist=False)
+    if grace_active:
+        events = [e for e in events if not is_clock_related_stall(e)]
+    events += freeze_events
     idle_events, idle_state = collect_session_idle_events(
         work_pids, now_mono, prior.get("session_idle") or {}
     )
@@ -725,11 +948,16 @@ def run_once(
 
     if persist:
         doc = dict(prior)
-        doc["wall"] = now
-        doc["mono"] = now_mono
-        doc["at"] = T.now_iso()
+        doc.update(
+            _freeze_state_fields(
+                now, now_mono, boot, os.getpid(), expected_interval, grace_until
+            )
+        )
         doc["session_idle"] = idle_state
-        write_watchdog_state(doc)
+        write_watchdog_state(
+            doc,
+            drop=() if grace_until is not None else ("freeze_grace_until_mono",),
+        )
 
     sent: list[dict] = []
     suppressed: list[str] = []
@@ -742,7 +970,14 @@ def run_once(
         ev = dict(ev)
         ev["notify"] = info
         sent.append(ev)
-    return {"at": T.now_iso(), "events": events, "sent": sent, "suppressed": suppressed}
+    return {
+        "at": T.now_iso(),
+        "events": events,
+        "sent": sent,
+        "suppressed": suppressed,
+        "freeze": freeze,
+        "grace_active": grace_active,
+    }
 
 
 def main() -> int:
@@ -767,6 +1002,7 @@ def main() -> int:
                 dry_run=args.dry_run,
                 dedupe=dedupe,
                 persist_freeze=not args.dry_run,
+                expected_interval=interval,
             )
         except Exception as e:  # noqa: BLE001 — a watchdog must not die
             print(f"[trial-watchdog] check error: {e}", file=sys.stderr, flush=True)

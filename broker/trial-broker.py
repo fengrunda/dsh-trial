@@ -1712,11 +1712,107 @@ def _atomic_write_json(path: Path, body: dict) -> None:
     os.replace(tmp, path)
 
 
+_IMPL_ROUND_TICKET_RE = re.compile(r"-r(\d+)\s*$")
+
+
+def _expected_impl_summary(ask: dict, goal: dict | None, slice_id: str) -> str | None:
+    """Expected impl-summary path for a submit_for_review, or None if unknowable.
+
+    Resolution order:
+      1. ``ask.summary_path`` (explicit),
+      2. ``goal["current_impl_summary"]`` (published when the impl ticket
+         started),
+      3. ``SUMMARIES/<slice>-impl-r<N>.md`` with N parsed from the trailing
+         ``-r<N>`` of ``from.ticket`` (falling back to ``ask.ticket``).
+
+    Returns None when none of these yields a path — the caller then skips the
+    check instead of guessing (an odd ask shape must not be blocked by mistake).
+    """
+    expected = str(
+        ask.get("summary_path")
+        or (goal or {}).get("current_impl_summary")
+        or ""
+    ).strip()
+    if expected:
+        return expected
+    frm = ask.get("from") if isinstance(ask.get("from"), dict) else {}
+    ticket = str(frm.get("ticket") or ask.get("ticket") or "").strip()
+    m = _IMPL_ROUND_TICKET_RE.search(ticket)
+    if not m:
+        return None
+    return str(SUMMARIES / f"{slice_id}-impl-r{m.group(1)}.md")
+
+
+def _submit_precheck(ask: dict, goal: dict | None, slice_id: str) -> str | None:
+    """F2 — refuse a submit_for_review whose impl summary is not on disk yet.
+
+    The incident: the impl agent submitted for review *before* writing its
+    summary; the gate then reviewed an empty submission and burned a review
+    round. This is a process-completeness check only — it never judges content.
+
+    Returns the rejection instruction string, or ``None`` when the summary is
+    present and non-empty — or when no expected path can be resolved at all,
+    so an odd ask shape is never blocked by mistake.
+    """
+    expected = _expected_impl_summary(ask, goal, slice_id)
+    if not expected:
+        return None
+    p = Path(expected)
+    body = ""
+    try:
+        if p.is_file():
+            body = p.read_text(encoding="utf-8")
+    except OSError:
+        body = ""
+    if body.strip():
+        return None
+    return (
+        f"提交被退回：summary 未落盘或为空（{expected}）。先把本票 summary（含机器块）写到该路径，"
+        "再重新 submit_for_review。本次未启动 gate、不计轮次。"
+    )
+
+
 def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cwd: str, goal: dict | None) -> None:
     """Open delta gate short-ticket; write PASS/HOLD(+rework_mode) answer for submit_for_review."""
     t0 = time.monotonic()  # 处理耗时 → wait_ms / by_kind.wait_ms_total
     ask_id = str(ask.get("ask_id") or path.stem)
     slice_id = _resolve_ask_slice_id(ask, goal, fallback="slice")
+
+    # F2: process-completeness gate BEFORE the review_seq bump — a submission
+    # whose impl summary is missing/empty must cost no round and spawn no gate.
+    rejection = _submit_precheck(ask, goal, slice_id)
+    if rejection is not None:
+        summary_path = _expected_impl_summary(ask, goal, slice_id) or ""
+        (MAILBOX / "answers").mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(
+            MAILBOX / "answers" / f"{ask_id}.json",
+            {
+                "ask_id": ask_id,
+                "status": "done",
+                "ok": False,
+                "verdict": "HOLD",
+                "rework_mode": "inplace",
+                "mode": "inplace",
+                "precheck": "summary_missing",
+                "summary_path": summary_path or None,
+                "instruction": rejection,
+            },
+        )
+        # archive pending, exactly like the normal path does after the verdict
+        try:
+            arch = MAILBOX / "archive"
+            arch.mkdir(parents=True, exist_ok=True)
+            if path.is_file():
+                path.rename(arch / f"{ask_id}.pending.json")
+        except OSError:
+            pass
+        print(
+            f"[trial-broker] submit_for_review precheck rejected {ask_id} "
+            f"summary={summary_path or '(unresolved)'}",
+            flush=True,
+        )
+        return
+
     lim = T.resolve_limits(goal=goal) if goal else T.load_global_limits()
     round_n = int(ask.get("round") or (goal or {}).get("review_seq") or 1)
     if goal is not None:
@@ -4435,6 +4531,9 @@ def run_chain_rounds(
         if goal_obj is not None:
             goal_obj["current_slice"] = slice_id
             goal_obj["current_pack"] = Path(pack_for_impl).name
+            # F2: the summary this round's impl must have written before it is
+            # allowed to submit_for_review (checked by _submit_precheck).
+            goal_obj["current_impl_summary"] = str(impl_summary)
             goal_obj["current_acceptance"] = list(
                 job.get("acceptance") or chain.get("acceptance") or []
             )
@@ -6081,6 +6180,11 @@ def run_ticket_job(path: Path, job: dict) -> int:
         summary_name = base_summary if round_n == 1 else f"{slice_id}-impl-r{round_n}"
         log_path = ARTIFACT_ROOT / f"{ticket}.log"
         round_summary = SUMMARIES / f"{summary_name}.md"
+        # F2: publish the summary this ticket must write before submit_for_review,
+        # so _submit_precheck has an expected path even without an explicit one.
+        if goal_obj is not None and str(role) != "gate":
+            goal_obj["current_impl_summary"] = str(round_summary)
+            _write_goal(goal_obj)
         ec = run_open_slice(
             ticket=ticket,
             pack_name=pack_for_impl,

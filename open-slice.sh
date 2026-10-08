@@ -156,7 +156,7 @@ build_prompt_foreman() {
 
 ## 票中沟通（role-bridge 桥；本票只允许以下两个工具）
 - 「ask_supervisor」：**仅当**实现歧义真实影响 Done-when（缺参/冲突/不可验证）时找监理澄清；文案风格等可合理默认则不要问。必传 `questions`（非空字符串数组，可附 `context`）。**允许**。
-- 「submit_for_review」：改动做完后提交 gate 审查。必传 `usage_prompt` 与 `summary`，可附 `changed_files` / `base` / `commit`。**允许**。
+- 「submit_for_review」：改动做完后提交 gate 审查。必传 `usage_prompt` 与 `summary`，可附 `changed_files` / `base` / `commit`。提交前 summary 必须已写到「@@SUMMARY_OUT@@」且非空（未落盘/为空会被 broker 直接退回，不启动 gate、不计轮次）。**允许**。
 - 除上述两个薄封装外：**禁止** send_to_role 直连、room_*、join。
 - **默认仍禁**裸 `git push` / `gh`（含 `gh pr create|merge`）。
 - **仅当** pack / Goal Done-when 要求对 main 开 PR，且 gate 已 PASS（或 pack 明确允许开 PR）时：**必须**用受控包装：
@@ -176,12 +176,12 @@ build_prompt_foreman() {
 1. design_pack_read path=「@@PACK_BASENAME@@」。
 2. 按 pack 的 Done when / Steps 做最少必要改动（可用 edit/write/bash 做 git 与文件；禁止 room_*）。
 3. **仅当**歧义真实影响 Done-when：调 `ask_supervisor`；**超时/失败**（timed_out / degrade）时不要干等，写 summary status=question，并把同样的问题放进 questions。
-4. 改完调 `submit_for_review`（务必带 usage_prompt）：
-   - 返回 PASS → 写 summary status=done 并停止。
-   - 返回 HOLD + rework_mode=inplace → **本票内**按 findings 逐条修完，再 `submit_for_review` 一次（不要提前关票）。
-   - 返回 HOLD + rework_mode=fresh → 本票写 status=done，notes 必须含 `rework_fresh`；**broker 会立刻另开一张 findings-first 修复票并重跑 gate**，这不是 slice 完成。
-   - 工具不可用/超时（degrade=close_ticket）→ 视为普通完成，写 status=done，交给 broker 兜底 gate。
-5. 写关票摘要到：「@@SUMMARY_OUT@@」
+4. 改完**先**把关票摘要（含机器块，status=done）按第 5 步格式写到「@@SUMMARY_OUT@@」，**再**调 `submit_for_review`（务必带 usage_prompt；summary 未落盘/为空会被 broker 直接退回，不启动 gate、不计轮次）：
+   - 返回 PASS → 确认摘要为最终版后停止。
+   - 返回 HOLD + rework_mode=inplace → **本票内**按 findings 逐条修完，更新摘要（逐条 finding_resolutions）后再 `submit_for_review` 一次（不要提前关票）。
+   - 返回 HOLD + rework_mode=fresh → 更新摘要 status=done、notes 含 `rework_fresh` 后停止；**broker 会立刻另开一张 findings-first 修复票并重跑 gate**，这不是 slice 完成。
+   - 工具不可用/超时（degrade=close_ticket）→ 摘要已在，status=done，停止，交给 broker 兜底 gate。
+5. 摘要格式（第 4 步写入「@@SUMMARY_OUT@@」的内容；HOLD 时更新同一文件）
    摘要必须短，并在文末含 **一个** 机器可读 fenced json 块，键固定：
 ```json
 {
@@ -201,7 +201,7 @@ build_prompt_foreman() {
    未修 P0/P1 时只能写 status=blocked/question，或继续 inplace 再 `submit_for_review`，**禁止** status=done 假装收口。
 6. status=done 表示你认为可交 gate；blocked/question 则不要假装完成。
    有未解决 P0/P1 却写 done：broker 不会当干净完成，会另开修复票或降级，白费一轮。
-7. 写完摘要后停止。
+7. 确认摘要已是最终版（与本次 gate 结果一致）后停止。
 
 硬禁：room_* / join / send_to_role 直连；裸 `git push` / 裸 `gh`；force-push；push main/master；`gh pr merge`；其他仓；不要把整仓灌进摘要；不要打印 API key / GH_TOKEN。
 若 Done-when 要求 PR：gate PASS（或 pack 允许）后经 `dsh-trial-pr` 开 PR，stdout 的 PR URL 写入 summary notes。

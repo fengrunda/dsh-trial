@@ -2,6 +2,7 @@
 """Unit tests for chain HOLD→fix→PASS and chain-reply (mocked open-slice)."""
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import sys
@@ -10,9 +11,59 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:  # standalone ``python3 tests/test_chain_unit.py``
+    sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location("trial_broker_mod", ROOT / "trial-broker.py")
 tb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tb)
+
+_STATE_DIRS = (
+    "inbox",
+    "outbox",
+    "processing",
+    "failed",
+    "packs",
+    "summaries",
+    "chains",
+    "goals",
+    "artifacts",
+    "state",
+    "mailbox",
+)
+
+
+def _patched_state(root: Path):
+    """Patch every broker state dir onto ``root`` (never the real DSH_HOME)."""
+    dirs = {name: root / name for name in _STATE_DIRS}
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    return mock.patch.multiple(
+        tb,
+        INBOX=dirs["inbox"],
+        OUTBOX=dirs["outbox"],
+        PROCESSING=dirs["processing"],
+        FAILED=dirs["failed"],
+        PACKS=dirs["packs"],
+        SUMMARIES=dirs["summaries"],
+        CHAINS=dirs["chains"],
+        GOALS=dirs["goals"],
+        ARTIFACT_ROOT=dirs["artifacts"],
+        STATE_DIR=dirs["state"],
+        HEARTBEAT=dirs["state"] / "trial-broker.heartbeat.json",
+        MAILBOX=dirs["mailbox"],
+        maybe_offload_gc=lambda **k: None,
+    )
+
+
+def _with_tmp_state(fn):
+    """Run a chain test with all broker state dirs bound to a per-test tmp tree."""
+
+    @functools.wraps(fn)
+    def wrapper(tmp_cwd: Path, *args, **kwargs):
+        with _patched_state(Path(tmp_cwd) / "broker-state"):
+            return fn(tmp_cwd, *args, **kwargs)
+
+    return wrapper
 
 
 def _write_summary(path: Path, block: dict, prose: str = "") -> None:
@@ -23,6 +74,7 @@ def _write_summary(path: Path, block: dict, prose: str = "") -> None:
     )
 
 
+@_with_tmp_state
 def test_pack_builders_and_byte_cap(tmp_cwd: Path):
     slice_id = "unit-hold"
     orig = tb.PACKS / "unit-hold-orig.pack.md"
@@ -85,6 +137,7 @@ def test_pack_builders_and_byte_cap(tmp_cwd: Path):
     print("OK pack builders")
 
 
+@_with_tmp_state
 def test_hold_fix_pass_mocked(tmp_cwd: Path):
     slice_id = "unit-chain-h2p"
     chain_path = tb.CHAINS / f"{slice_id}.json"
@@ -197,6 +250,7 @@ def test_hold_fix_pass_mocked(tmp_cwd: Path):
     print("OK HOLD→fix→PASS", state["state"], "rounds", len(state["rounds"]))
 
 
+@_with_tmp_state
 def test_chain_reply_mocked(tmp_cwd: Path):
     slice_id = "unit-chain-reply"
     chain_path = tb.CHAINS / f"{slice_id}.json"
@@ -324,12 +378,15 @@ def test_enforce_gate_verdict():
 
 
 def main():
-    tb._ensure_dirs()
+    # Standalone (non-pytest) driver: keep every broker state dir in a tmp tree so
+    # running this file directly can never touch the real DSH_HOME either.
     cwd = Path(tempfile.mkdtemp(prefix="dsh-trial-unit-"))
-    test_pack_builders_and_byte_cap(cwd)
-    test_hold_fix_pass_mocked(cwd)
-    test_chain_reply_mocked(cwd)
-    test_enforce_gate_verdict()
+    with _patched_state(cwd / "broker-state"):
+        tb._ensure_dirs()
+        test_pack_builders_and_byte_cap(cwd)
+        test_hold_fix_pass_mocked(cwd)
+        test_chain_reply_mocked(cwd)
+        test_enforce_gate_verdict()
     print("ALL UNIT OK")
 
 

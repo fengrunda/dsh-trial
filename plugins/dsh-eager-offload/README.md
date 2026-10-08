@@ -15,6 +15,10 @@
 - **未**装进产品 broker / 产品四票
 - `ageMask` 已废弃（no-op）；`contextClear` 已实现 **T2（压缩联动清旧 tool_result）**；**T3（折叠超大 write/edit 步骤）待做**
 
+## 离线评估
+
+`tools/ctxclear-eval/` 用真实会话日志重放 contextClear（T2/T3）× 60k/20k 压缩 × DeepSeek 前缀缓存；运行方式、模型假设与 2026-10-08 结果表见 `tools/ctxclear-eval/README.md`。
+
 ## Hook API（实测）
 
 与 `@deepseek-ai/dsh-spill-policy` 相同：

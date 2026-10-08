@@ -20,10 +20,12 @@
     "schemas",
     "examples",
     "test",
+    "tools/ctxclear-eval",
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test test/*.test.mjs tools/ctxclear-eval/test/*.test.mjs",
+    "test:eval": "node --test tools/ctxclear-eval/test/*.test.mjs",
     "check": "node --check lib/offload.js && node --check lib/context-clear.js && node --check lib/index.js"
   },
   "dsh": {

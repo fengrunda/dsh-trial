@@ -14,6 +14,7 @@ Usage:
                 [--cwd ABS] [--role gate|impl|supervisor] [--final] [--keep-open]
                 [--log PATH] [--summary-name NAME]
                 [--prompt-mode baseline|foreman|gate|supervisor-plan|supervisor-answer|supervisor-close] [--prompt-file PATH]
+                [--print-prompt]
 
 Defaults:
   --profile acp
@@ -35,6 +36,10 @@ prompt-mode:
   supervisor-answer — dsh 监理：读问题 pack，写 chain_reply 机器块
   supervisor-close  — dsh 监理：读收尾 pack，写 goal_done 机器块
   ( --prompt-file overrides the built-in template entirely )
+
+print-prompt:
+  Build the prompt, print it to stdout and exit 0 - no mkdir, no role-bridge,
+  no log tee, no ask call.
 USAGE
 }
 
@@ -49,6 +54,7 @@ LOG=""
 SUMMARY_NAME=""
 PROMPT_MODE="baseline"
 PROMPT_FILE=""
+PRINT_PROMPT=0
 ASK_BIN="${DSH_ACP_ASK:-$DSH_HOME/bin/dsh-acp-ask.py}"
 
 while [[ $# -gt 0 ]]; do
@@ -64,13 +70,13 @@ while [[ $# -gt 0 ]]; do
     --summary-name) SUMMARY_NAME="${2:-}"; shift 2 ;;
     --prompt-mode) PROMPT_MODE="${2:-}"; shift 2 ;;
     --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
+    --print-prompt) PRINT_PROMPT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
   esac
 done
 
 [[ -n "$TICKET" && -n "$PACK" ]] || { usage; exit 2; }
-[[ -x "$ASK_BIN" || -f "$ASK_BIN" ]] || { echo "missing ask: $ASK_BIN" >&2; exit 2; }
 
 PACK_BASENAME="$(basename "$PACK")"
 if [[ "$PACK" = /* ]]; then
@@ -83,7 +89,6 @@ fi
 LOG="${LOG:-/workspace/tmp/${TICKET}.log}"
 SUMMARY_NAME="${SUMMARY_NAME:-${PACK_BASENAME%.pack.md}}"
 SUMMARY_OUT="$THIN_STATE/summaries/${SUMMARY_NAME}.md"
-mkdir -p "$(dirname "$LOG")" "$THIN_STATE/summaries"
 
 ensure_role_pack_bridge() {
   local role="$1"
@@ -101,27 +106,31 @@ ensure_role_pack_bridge() {
   fi
 }
 
-INF_ROLE="$ROLE"
-if [[ -z "$INF_ROLE" ]]; then
-  case "$TICKET" in
-    gate-*|gate_*|review-*|review_*|pr-gate-*) INF_ROLE=gate ;;
-    supervisor-*|supervisor_*|sup-*|sup_*) INF_ROLE=supervisor ;;
-    impl-*|impl_*|fix-*|fix_*|dev-*|dev_*) INF_ROLE=impl ;;
-  esac
-fi
-[[ -n "$INF_ROLE" ]] && ensure_role_pack_bridge "$INF_ROLE"
+# Render a literal prompt template: substitute @@NAME@@ markers in bash.
+# The replacement is quoted so bash 5.2 patsub_replacement does not treat
+# "&" (or backslashes) inside a value as special.
+_render_prompt() {
+  local _text="$1"; shift
+  local _ph _val
+  while [[ $# -ge 2 ]]; do
+    _ph="$1"; _val="$2"; shift 2
+    _text="${_text//"$_ph"/"$_val"}"
+  done
+  printf '%s\n' "$_text"
+}
 
 build_prompt_baseline() {
-  cat <<PROMPT
+  local _tpl
+  _tpl="$(cat <<'PROMPT'
 你是 Route C 中票执行器（基线片）。执行票 **禁止 join 任何 team-room**，禁止一切 room_*（含 room_post / room_read / room_join / room_list）。
 
 本 slice 的唯一权威任务包在 design-pack 工具可读路径下；pack 正文只允许经 design_pack_read 进入上下文。
 
 强制步骤（最多约 8 步，完成后停止）：
-1. 调用工具 design_pack_read，path 使用相对名：「${PACK_BASENAME}」。
+1. 调用工具 design_pack_read，path 使用相对名：「@@PACK_BASENAME@@」。
 2. 用一句话确认：slice_id + pack bytes（工具返回的字节数）。
 3. 严格按 pack 的 Done when 执行（需要读文件时只用 read 工具，禁止 bash）。
-4. 把关票摘要写入：「${SUMMARY_OUT}」
+4. 把关票摘要写入：「@@SUMMARY_OUT@@」
    至少含：status / used_tool=design_pack_read / room_joined=false / blockers。
 5. 写完摘要后停止；不要继续探索。
 
@@ -132,17 +141,22 @@ build_prompt_baseline() {
 
 Done when: design_pack_read 成功 + pack 要求的产物落盘 + summary 落盘 + 未进房。
 PROMPT
+)"
+  _render_prompt "$_tpl" \
+    '@@PACK_BASENAME@@' "$PACK_BASENAME" \
+    '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
 }
 
 build_prompt_foreman() {
-  cat <<PROMPT
+  local _tpl
+  _tpl="$(cat <<'PROMPT'
 你是 Route C 工头中票（foreman / impl）。**禁止 join 任何 team-room**，禁止一切 room_*（含 room_post / room_read / room_join / room_list）。
 
-唯一权威任务：经 design_pack_read 读取 pack「${PACK_BASENAME}」，按 pack 执行改动（cwd=${CWD}）。
+唯一权威任务：经 design_pack_read 读取 pack「@@PACK_BASENAME@@」，按 pack 执行改动（cwd=@@CWD@@）。
 
 ## 票中沟通（role-bridge 桥；本票只允许以下两个工具）
-- 「ask_supervisor」：**仅当**实现歧义真实影响 Done-when（缺参/冲突/不可验证）时找监理澄清；文案风格等可合理默认则不要问。必传 \`questions\`（非空字符串数组，可附 \`context\`）。**允许**。
-- 「submit_for_review」：改动做完后提交 gate 审查。必传 \`usage_prompt\` 与 \`summary\`，可附 \`changed_files\` / \`base\` / \`commit\`。**允许**。
+- 「ask_supervisor」：**仅当**实现歧义真实影响 Done-when（缺参/冲突/不可验证）时找监理澄清；文案风格等可合理默认则不要问。必传 `questions`（非空字符串数组，可附 `context`）。**允许**。
+- 「submit_for_review」：改动做完后提交 gate 审查。必传 `usage_prompt` 与 `summary`，可附 `changed_files` / `base` / `commit`。**允许**。
 - 除上述两个薄封装外：**禁止** send_to_role 直连、room_*、join。
 - **默认仍禁**裸 `git push` / `gh`（含 `gh pr create|merge`）。
 - **仅当** pack / Goal Done-when 要求对 main 开 PR，且 gate 已 PASS（或 pack 明确允许开 PR）时：**必须**用受控包装：
@@ -159,17 +173,17 @@ build_prompt_foreman() {
 - 大工具输出已由 eager-offload 裁剪：优先 offset/limit 读所需片段，不要为「看全量」空转。
 
 ## 强制步骤：
-1. design_pack_read path=「${PACK_BASENAME}」。
+1. design_pack_read path=「@@PACK_BASENAME@@」。
 2. 按 pack 的 Done when / Steps 做最少必要改动（可用 edit/write/bash 做 git 与文件；禁止 room_*）。
-3. **仅当**歧义真实影响 Done-when：调 \`ask_supervisor\`；**超时/失败**（timed_out / degrade）时不要干等，写 summary status=question，并把同样的问题放进 questions。
-4. 改完调 \`submit_for_review\`（务必带 usage_prompt）：
+3. **仅当**歧义真实影响 Done-when：调 `ask_supervisor`；**超时/失败**（timed_out / degrade）时不要干等，写 summary status=question，并把同样的问题放进 questions。
+4. 改完调 `submit_for_review`（务必带 usage_prompt）：
    - 返回 PASS → 写 summary status=done 并停止。
-   - 返回 HOLD + rework_mode=inplace → **本票内**按 findings 逐条修完，再 \`submit_for_review\` 一次（不要提前关票）。
-   - 返回 HOLD + rework_mode=fresh → 本票写 status=done，notes 必须含 \`rework_fresh\`；**broker 会立刻另开一张 findings-first 修复票并重跑 gate**，这不是 slice 完成。
+   - 返回 HOLD + rework_mode=inplace → **本票内**按 findings 逐条修完，再 `submit_for_review` 一次（不要提前关票）。
+   - 返回 HOLD + rework_mode=fresh → 本票写 status=done，notes 必须含 `rework_fresh`；**broker 会立刻另开一张 findings-first 修复票并重跑 gate**，这不是 slice 完成。
    - 工具不可用/超时（degrade=close_ticket）→ 视为普通完成，写 status=done，交给 broker 兜底 gate。
-5. 写关票摘要到：「${SUMMARY_OUT}」
+5. 写关票摘要到：「@@SUMMARY_OUT@@」
    摘要必须短，并在文末含 **一个** 机器可读 fenced json 块，键固定：
-\`\`\`json
+```json
 {
   "status": "done|blocked|question",
   "changed_files": ["相对路径…"],
@@ -182,9 +196,9 @@ build_prompt_foreman() {
     {"finding": "…或 tier+issue 摘要", "change": "file:line 或路径+符号", "status": "fixed|deferred|wontfix", "reason": "未改时必填"}
   ]
 }
-\`\`\`
-   **有 gate findings 的 pack（fix/rework/reply）**：必须逐条写 \`finding_resolutions\`；
-   未修 P0/P1 时只能写 status=blocked/question，或继续 inplace 再 \`submit_for_review\`，**禁止** status=done 假装收口。
+```
+   **有 gate findings 的 pack（fix/rework/reply）**：必须逐条写 `finding_resolutions`；
+   未修 P0/P1 时只能写 status=blocked/question，或继续 inplace 再 `submit_for_review`，**禁止** status=done 假装收口。
 6. status=done 表示你认为可交 gate；blocked/question 则不要假装完成。
    有未解决 P0/P1 却写 done：broker 不会当干净完成，会另开修复票或降级，白费一轮。
 7. 写完摘要后停止。
@@ -193,10 +207,16 @@ build_prompt_foreman() {
 若 Done-when 要求 PR：gate PASS（或 pack 允许）后经 `dsh-trial-pr` 开 PR，stdout 的 PR URL 写入 summary notes。
 Done when: design_pack_read +（按 pack 完成或明确 blocked/question）+（PASS 后的 done / HOLD-inplace 修完并复提 / HOLD-fresh 的 done+rework_fresh+finding_resolutions / ask 超时的 question）+（若要求 PR 则已用 dsh-trial-pr 开出或确认已有 open PR）+ summary 含机器块 + 有 findings 时逐条 finding_resolutions + room_joined=false。
 PROMPT
+)"
+  _render_prompt "$_tpl" \
+    '@@CWD@@' "$CWD" \
+    '@@PACK_BASENAME@@' "$PACK_BASENAME" \
+    '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
 }
 
 build_prompt_gate() {
-  cat <<PROMPT
+  local _tpl
+  _tpl="$(cat <<'PROMPT'
 你是 Route C 设计审查中票（gate / design-gate 风格）。**禁止 join 任何 team-room**，禁止一切 room_*。
 本票只读审查：对照 pack 内 acceptance + 工头摘要 + diff，做 **delta-only / 分层** 审查。不要改业务源码。
 
@@ -207,14 +227,14 @@ build_prompt_gate() {
 - 禁止「口头 PASS 但 findings 含 P0/P1」；禁止把缺测/缺边界当成 P2。
 
 强制步骤：
-1. design_pack_read path=「${PACK_BASENAME}」（gate pack：原 pack 引用、acceptance、工头摘要、diff）。
+1. design_pack_read path=「@@PACK_BASENAME@@」（gate pack：原 pack 引用、acceptance、工头摘要、diff）。
 2. 只审 delta；逐条对照 acceptance，列出 unmet_acceptance。
    若本 pack 是 **delta / fix pack**（含 prior_findings 或前轮 findings）：
    **只复审** ① 上轮 prior findings 是否已修，② 新 diff 是否引入回归；**不要**重审整仓或重复提出已修项。
 3. Findings 分层：P0 阻塞 / P1 应修（含缺单测、缺 acceptance 要求的边界）/ P2 nits。
-4. 把审查结论写入：「${SUMMARY_OUT}」
+4. 把审查结论写入：「@@SUMMARY_OUT@@」
    必须含短文 + **一个** 机器可读 fenced json：
-\`\`\`json
+```json
 {
   "verdict": "PASS|HOLD",
   "unmet_acceptance": ["未满足的 acceptance 原文或摘要"],
@@ -222,25 +242,30 @@ build_prompt_gate() {
     {"tier": "P0|P1|P2", "file": "路径或-", "issue": "问题", "fix_hint": "改法提示"}
   ]
 }
-\`\`\`
+```
 5. 写完 verdict 文件后停止；不要 Approve/gh；不要改 src。
 
 硬禁：room_*；改业务仓；push / gh / dsh-trial-pr；打印 API key。
 Done when: design_pack_read + verdict 文件落盘含机器块 + room_joined=false。
 PROMPT
+)"
+  _render_prompt "$_tpl" \
+    '@@PACK_BASENAME@@' "$PACK_BASENAME" \
+    '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
 }
 
 build_prompt_supervisor_plan() {
-  cat <<PROMPT
+  local _tpl
+  _tpl="$(cat <<'PROMPT'
 你是 dsh 试用**监理**短票（supervisor-plan）。**禁止 join 任何 team-room**，禁止 room_*。不要改业务 src。
 
-读 design_pack_read path=「${PACK_BASENAME}」（Goal brief）。然后：
+读 design_pack_read path=「@@PACK_BASENAME@@」（Goal brief）。然后：
 1. 拆 **1..max_slices** 个最小 slice（max_slices 见 brief pack frontmatter，缺省 1）；每个 slice 写一个有界 pack（相对名见 brief 的 suggested_pack，或自定 <slice>.pack.md）。
-2. Pack 必须经文件写入：$DSH_HOME/supervisor/thin-state/packs/<name>.pack.md（可用 write/edit；禁止 bash cat 大段灌上下文）。
+2. Pack 必须经文件写入：@@DSH_HOME@@/supervisor/thin-state/packs/<name>.pack.md（可用 write/edit；禁止 bash cat 大段灌上下文）。
 3. Pack 的 Steps/Done when 须可执行、可验收；**不要**故意留歧义。仅当实现歧义**真实影响** Done-when（缺参/冲突/不可验证）时，才要求工头用 ask_supervisor；文案风格等无关紧要的细节自行合理默认并写进 pack。
-4. 更新或创建 Goal 状态文件：$DSH_HOME/supervisor/thin-state/goals/<goal_id>.json （goal_id 见 brief）。
-5. 关票摘要写到：「${SUMMARY_OUT}」，文末 **一个** fenced json（多 slice 用 emit_chains）：
-\`\`\`json
+4. 更新或创建 Goal 状态文件：@@DSH_HOME@@/supervisor/thin-state/goals/<goal_id>.json （goal_id 见 brief）。
+5. 关票摘要写到：「@@SUMMARY_OUT@@」，文末 **一个** fenced json（多 slice 用 emit_chains）：
+```json
 {
   "action": "emit_chains",
   "goal": "<goal_id>",
@@ -250,19 +275,25 @@ build_prompt_supervisor_plan() {
   "goal_status": "running",
   "notes": "一两句"
 }
-\`\`\`
+```
 （单 slice 仍兼容旧版 `action=emit_chain` + 顶层 slice/pack/acceptance；broker 两种都接受。）
 硬禁：room_*；push / gh / dsh-trial-pr；打印 API key；不要自己开 impl/gate。
 Done when: pack 落盘 + summary 机器块 emit_chains + room_joined=false。
 PROMPT
+)"
+  _render_prompt "$_tpl" \
+    '@@PACK_BASENAME@@' "$PACK_BASENAME" \
+    '@@SUMMARY_OUT@@' "$SUMMARY_OUT" \
+    '@@DSH_HOME@@' "$DSH_HOME"
 }
 
 build_prompt_supervisor_answer() {
-  cat <<PROMPT
+  local _tpl
+  _tpl="$(cat <<'PROMPT'
 你是 dsh 试用**监理**短票（supervisor-answer）。**禁止 join 任何 team-room**，禁止 room_*。不要改业务 src。
 
-读 design_pack_read path=「${PACK_BASENAME}」（含工头问题）。给出**简明可执行**裁决（一两段内），写入摘要：「${SUMMARY_OUT}」，文末：
-\`\`\`json
+读 design_pack_read path=「@@PACK_BASENAME@@」（含工头问题）。给出**简明可执行**裁决（一两段内），写入摘要：「@@SUMMARY_OUT@@」，文末：
+```json
 {
   "action": "chain_reply",
   "slice": "<slice_id>",
@@ -270,18 +301,23 @@ build_prompt_supervisor_answer() {
   "goal_status": "running",
   "notes": "可选"
 }
-\`\`\`
+```
 硬禁：room_*；push / gh / dsh-trial-pr；空泛回复；打印 API key。
 Done when: summary 含 chain_reply + answer 非空。
 PROMPT
+)"
+  _render_prompt "$_tpl" \
+    '@@PACK_BASENAME@@' "$PACK_BASENAME" \
+    '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
 }
 
 build_prompt_supervisor_close() {
-  cat <<PROMPT
+  local _tpl
+  _tpl="$(cat <<'PROMPT'
 你是 dsh 试用**监理**短票（supervisor-close）。**禁止 join 任何 team-room**，禁止 room_*。
 
-读 design_pack_read path=「${PACK_BASENAME}」（chain 终态摘要）。若 PASS：把 Goal 状态文件标为 done；写摘要：「${SUMMARY_OUT}」，文末：
-\`\`\`json
+读 design_pack_read path=「@@PACK_BASENAME@@」（chain 终态摘要）。若 PASS：把 Goal 状态文件标为 done；写摘要：「@@SUMMARY_OUT@@」，文末：
+```json
 {
   "action": "goal_done",
   "goal": "<goal_id>",
@@ -290,7 +326,7 @@ build_prompt_supervisor_close() {
   "slices": ["<slice_id>"],
   "pr_url": "若 Done-when 要求 PR 则填 URL，否则空"
 }
-\`\`\`
+```
 若 Goal Done-when 要求对 main 开 PR 且 impl 未开：可用受控包装补开（仍禁改业务 src）：
 `dsh-trial-pr push-and-pr --repo <fengrunda/knowledge-hub|fengrunda/memory-as-training> --cwd <repo> --branch <feature> --title "…" --body "…"`
 仍禁 force / merge / 其他仓 / 裸 `git push` / 裸 `gh`。PR URL 写入 report 与机器块 pr_url。
@@ -298,6 +334,10 @@ build_prompt_supervisor_close() {
 硬禁：room_*；改业务 src；裸 push/gh；force/merge；打印 API key / GH_TOKEN。
 Done when: goals JSON 已更新 +（若要求 PR 则已有 open PR URL）+ summary 机器块。
 PROMPT
+)"
+  _render_prompt "$_tpl" \
+    '@@PACK_BASENAME@@' "$PACK_BASENAME" \
+    '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
 }
 
 if [[ -n "$PROMPT_FILE" ]]; then
@@ -314,6 +354,26 @@ else
     *) echo "unknown --prompt-mode: $PROMPT_MODE" >&2; exit 2 ;;
   esac
 fi
+
+if [[ "$PRINT_PROMPT" -eq 1 ]]; then
+  # Print-only: build the prompt but touch nothing on disk and never call ask.
+  printf '%s\n' "$PROMPT"
+  exit 0
+fi
+
+[[ -x "$ASK_BIN" || -f "$ASK_BIN" ]] || { echo "missing ask: $ASK_BIN" >&2; exit 2; }
+
+mkdir -p "$(dirname "$LOG")" "$THIN_STATE/summaries"
+
+INF_ROLE="$ROLE"
+if [[ -z "$INF_ROLE" ]]; then
+  case "$TICKET" in
+    gate-*|gate_*|review-*|review_*|pr-gate-*) INF_ROLE=gate ;;
+    supervisor-*|supervisor_*|sup-*|sup_*) INF_ROLE=supervisor ;;
+    impl-*|impl_*|fix-*|fix_*|dev-*|dev_*) INF_ROLE=impl ;;
+  esac
+fi
+[[ -n "$INF_ROLE" ]] && ensure_role_pack_bridge "$INF_ROLE"
 
 ARGS=(--profile "$PROFILE" --ticket "$TICKET" --cwd "$CWD" --prompt "$PROMPT" --new)
 [[ -n "$ROLE" ]] && ARGS+=(--role "$ROLE")

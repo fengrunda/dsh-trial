@@ -95,6 +95,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -1892,6 +1893,10 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
             gate_log=gate_log,
         ),
     )
+    # T1: fingerprint the reviewed content *before* the spawn so the verdict can
+    # be recorded against the exact tree the gate looked at.
+    review_goal_id = str((goal or {}).get("goal") or "")
+    review_fp = _impl_fingerprint(Path(cwd))
     profile = T.map_profile((goal or {}).get("gate_profile") or (goal or {}).get("profile") or default_profile)
     gec = run_open_slice(
         ticket=gate_ticket,
@@ -1913,6 +1918,13 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
     )
     gparsed = _parse_gate_verdict(gate_summary)
     gblock = enforce_gate_verdict(gparsed["block"])
+    # T1: remember this tree's verdict so the chain Gate段 (and any later review
+    # of identical content) never pays for a second gate.
+    _record_review(
+        review_goal_id, slice_id, Path(cwd), review_fp,
+        verdict=gblock.get("verdict"), gate_ticket=gate_ticket,
+        gate_summary=gate_summary,
+    )
     mode, answer = TM.decide_and_answer_review(
         ask=ask, gate_block=gblock, gate_ticket=gate_ticket, limits=lim,
     )
@@ -2062,6 +2074,101 @@ def _unique_review_tag(slice_id: str, label: str, *, delta: bool = False) -> str
     """The (possibly ``-2``/``-3`` suffixed) tag ``_unique_review_names`` picked."""
     _pack_name, summary_name = _unique_review_names(slice_id, label, delta=delta)
     return _gate_review_tag(slice_id, summary_name)
+
+
+# ---------------------------------------------------------------------------
+# T1 review ledger — one gate verdict per (goal, slice, workspace content)
+# ---------------------------------------------------------------------------
+def _impl_fingerprint(cwd: Path) -> str:
+    """Content fingerprint (tree sha) of ``cwd``, or ``""`` when unknowable.
+
+    A throwaway index (``GIT_INDEX_FILE``) keeps the repository's real index
+    untouched: ``read-tree HEAD`` → ``add -A`` → ``write-tree`` fingerprints
+    committed, uncommitted and untracked content alike. Any failure — not a
+    repo, no HEAD, git missing — yields ``""`` (callers treat that as "unknown").
+    """
+    try:
+        if not Path(cwd).is_dir():
+            return ""
+        fd, idx = tempfile.mkstemp(prefix="trial-broker-idx-")
+        os.close(fd)
+    except OSError:
+        return ""
+    env = {**os.environ, "GIT_INDEX_FILE": idx}
+    try:
+        out = ""
+        for argv in (["read-tree", "HEAD"], ["add", "-A"], ["write-tree"]):
+            proc = subprocess.run(
+                ["git", *argv], cwd=str(cwd), env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode != 0:
+                return ""
+            out = proc.stdout
+        return out.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    finally:
+        try:
+            os.unlink(idx)
+        except OSError:
+            pass
+
+
+def _review_ledger_path() -> Path:
+    """Ledger sits next to ``SUMMARIES`` (resolved per call so tests can patch)."""
+    return SUMMARIES.parent / "review-ledger.json"
+
+
+def _review_key(goal_id, slice_id, cwd, fp) -> str:
+    return f"{goal_id}|{slice_id}|{os.path.realpath(str(cwd))}|{fp}"
+
+
+def _lookup_review(goal_id, slice_id, cwd, fp) -> dict | None:
+    """Ledger record for this exact workspace content, or ``None`` if unknown."""
+    if not fp:
+        return None
+    try:
+        body = json.loads(_review_ledger_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    rec = (body.get("reviews") or {}).get(_review_key(goal_id, slice_id, cwd, fp))
+    if not isinstance(rec, dict):
+        return None
+    summary = str(rec.get("gate_summary") or "")
+    if not summary or not Path(summary).is_file():
+        return None
+    return rec
+
+
+def _record_review(goal_id, slice_id, cwd, fp, *, verdict, gate_ticket, gate_summary) -> None:
+    """Remember a PASS/HOLD verdict for this workspace content (best effort)."""
+    v = str(verdict or "").strip().upper()
+    if not fp or v not in (VERDICT_PASS, VERDICT_HOLD):
+        return
+    path = _review_ledger_path()
+    body: dict = {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            body = loaded
+    except (OSError, ValueError):
+        body = {}
+    reviews = body.get("reviews")
+    if not isinstance(reviews, dict):
+        reviews = {}
+    reviews[_review_key(goal_id, slice_id, cwd, fp)] = {
+        "verdict": v,
+        "gate_ticket": str(gate_ticket or ""),
+        "gate_summary": str(gate_summary or ""),
+    }
+    body["reviews"] = reviews
+    try:
+        _atomic_write_json(path, body)
+    except OSError:  # bookkeeping must never break a review
+        pass
 
 
 def build_delta_gate_pack(
@@ -4941,45 +5048,70 @@ def run_chain_rounds(
         # T2 resume: a gate summary already on disk is this round's verdict.
         # Re-opening the gate ticket would overwrite evidence and double-count.
         reuse_gate = bool(resume) and gate_summary.is_file()
+        # T1 dedup: this workspace content was already reviewed mid-ticket
+        # (submit_for_review). Reuse that verdict instead of paying for a second
+        # gate on identical code; resume keeps its own summary-based reuse.
+        dedup_rec: dict | None = None
+        gate_fp = ""
         if not resume:
             # F1: never overwrite a verdict already on disk — r<N> becomes
             # r<N>-2, r<N>-3 … instead (resume keeps the original name).
             gate_summary_name = _unique_review_names(slice_id, f"r{round_n}")[1]
             gate_summary = SUMMARIES / f"{gate_summary_name}.md"
+            gate_fp = _impl_fingerprint(cwd)
+            dedup_rec = _lookup_review(goal_id, slice_id, cwd, gate_fp)
         gate_label = _gate_review_tag(slice_id, gate_summary_name)
-        try:
-            gate_pack = build_gate_pack(
-                slice_id=slice_id,
-                round_n=round_n,
-                original_pack_name=original_pack,
-                acceptance=job.get("acceptance") or chain.get("acceptance"),
-                foreman_block=block,
-                foreman_summary_text=parsed["text"],
-                cwd=cwd,
-                label=gate_label,
+        if dedup_rec is not None:
+            # No pack, no spawn: the recorded verdict is this round's verdict.
+            gate_ticket = str(dedup_rec.get("gate_ticket") or gate_ticket)
+            gate_summary = Path(str(dedup_rec.get("gate_summary")))
+            gate_log = ARTIFACT_ROOT / f"{gate_ticket}.log"
+            round_rec["gate_dedup_of"] = gate_ticket
+            print(
+                f"[trial-broker] chain {slice_id} r{round_n}: gate dedup — "
+                f"impl already reviewed by {gate_ticket}",
+                flush=True,
             )
-        except ValueError as e:
-            chain["state"] = "failed"
-            chain["error"] = f"gate pack build: {e}"
-            _write_chain(chain)
-            _terminal_outbox(job, chain, dest, ok=False)
-            return 1
+        else:
+            try:
+                gate_pack = build_gate_pack(
+                    slice_id=slice_id,
+                    round_n=round_n,
+                    original_pack_name=original_pack,
+                    acceptance=job.get("acceptance") or chain.get("acceptance"),
+                    foreman_block=block,
+                    foreman_summary_text=parsed["text"],
+                    cwd=cwd,
+                    label=gate_label,
+                )
+            except ValueError as e:
+                chain["state"] = "failed"
+                chain["error"] = f"gate pack build: {e}"
+                _write_chain(chain)
+                _terminal_outbox(job, chain, dest, ok=False)
+                return 1
 
-        round_rec["gate_pack"] = gate_pack
-        if reuse_gate:
+            round_rec["gate_pack"] = gate_pack
+        if reuse_gate or dedup_rec is not None:
             _adopt_misplaced_summary(gate_summary)
-            gec = int(round_rec.get("gate_exit") or 0)
-            gate_art = dict(round_rec.get("gate_artifacts") or {})
-            gpeak = round_rec.get("gate_peak")
-            gsteps = round_rec.get("gate_steps")
+            if dedup_rec is not None:
+                gec = 0
+                gate_art = {"dedup_of": gate_ticket}
+                gpeak = gsteps = None
+            else:
+                gec = int(round_rec.get("gate_exit") or 0)
+                gate_art = dict(round_rec.get("gate_artifacts") or {})
+                gpeak = round_rec.get("gate_peak")
+                gsteps = round_rec.get("gate_steps")
             gparsed = _parse_gate_verdict(gate_summary)
             gblock = enforce_gate_verdict(gparsed["block"])
             gparsed["block"] = gblock
-            print(
-                f"[trial-broker] chain {slice_id} resume r{round_n}: gate summary "
-                f"on disk ({gate_summary.name}); gate ticket not re-opened",
-                flush=True,
-            )
+            if dedup_rec is None:
+                print(
+                    f"[trial-broker] chain {slice_id} resume r{round_n}: gate summary "
+                    f"on disk ({gate_summary.name}); gate ticket not re-opened",
+                    flush=True,
+                )
         else:
             gec = run_open_slice(
                 ticket=gate_ticket,
@@ -5030,6 +5162,13 @@ def run_chain_rounds(
                 except OSError:
                     pass
         verdict = gblock.get("verdict")
+        if not resume and dedup_rec is None:
+            # T1: a verdict freshly earned on this tree is reusable — a later
+            # review of identical content (or a mid-ticket submit) reuses it.
+            _record_review(
+                goal_id, slice_id, cwd, gate_fp,
+                verdict=verdict, gate_ticket=gate_ticket, gate_summary=gate_summary,
+            )
         round_rec.update({
             "gate_ticket": gate_ticket,
             "gate_exit": gec,

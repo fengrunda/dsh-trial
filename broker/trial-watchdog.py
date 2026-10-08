@@ -312,6 +312,69 @@ def _arg_value(argv: list[str], flag: str) -> str | None:
     return None
 
 
+def read_heartbeat(path: Path | None = None) -> dict:
+    """Parsed broker heartbeat JSON; ``{}`` when missing or unreadable.
+
+    An unreadable heartbeat is *not* an error here: the age-based checks own
+    liveness, so callers just see "no slots published".
+    """
+    p = path or HEARTBEAT
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _known_goal_ids() -> list[str]:
+    out: list[str] = []
+    for g in _read_goals():
+        gid = str(g.get("goal") or "")
+        if gid and gid not in out:
+            out.append(gid)
+    return out
+
+
+def _proc_goal_id(pid: int, known: list[str], environ: bytes | None = None) -> str:
+    """Goal a work pid belongs to: env first, cmdline ``--ticket`` as fallback.
+
+    ``environ`` (the raw NUL-delimited block) is injectable for tests.
+    """
+    raw = environ
+    if raw is None:
+        try:
+            raw = Path(f"/proc/{int(pid)}/environ").read_bytes()
+        except (OSError, ValueError):
+            raw = b""
+    try:
+        for chunk in raw.decode("utf-8", "replace").split("\0"):
+            if chunk.startswith("DSH_TRIAL_GOAL="):
+                gid = chunk.split("=", 1)[1].strip()
+                if gid:
+                    return gid
+    except (UnicodeDecodeError, ValueError):
+        pass
+    ticket = _arg_value(_read_proc_cmdline(pid), "--ticket") or ""
+    if ticket:
+        for gid in known:
+            if gid and (gid in ticket or ticket in gid):
+                return gid
+    return "*"
+
+
+def work_pid_goals(
+    pids: list[int] | None = None, *, now: float | None = None
+) -> dict[str, list[int]]:
+    """``goal id -> [pid]`` for live work processes; unattributable pids -> ``"*"``."""
+    pids = list_work_pids() if pids is None else list(pids)
+    known = _known_goal_ids()
+    _ = now  # accepted for symmetry with the other collectors
+    out: dict[str, list[int]] = {}
+    for pid in pids:
+        out.setdefault(_proc_goal_id(pid, known), []).append(pid)
+    return out
+
+
 def _proc_children(pid: int) -> list[int]:
     out: list[int] = []
     try:
@@ -544,6 +607,63 @@ def _pending_jobs() -> bool:
     return False
 
 
+def _pending_goals_and_unattributed() -> tuple[set[str], bool]:
+    """``(goal ids, had_unattributed_job)`` for inbox/processing job JSON.
+
+    A non-goal file (broken JSON, non-dict, empty/``?`` goal) is not evidence
+    *against* any single Goal — it is exactly the legacy "there is some pending
+    work, no per-Goal claim" case, so it is reported separately and keeps the
+    conservative old behaviour.
+    """
+    goals: set[str] = set()
+    unattributed = False
+    for d in (INBOX, PROCESSING):
+        try:
+            files = list(d.glob("*.json"))
+        except OSError:
+            continue
+        for p in files:
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                unattributed = True
+                continue
+            gid = str(doc.get("goal") or "").strip() if isinstance(doc, dict) else ""
+            if gid and gid != "?":
+                goals.add(gid)
+            else:
+                unattributed = True
+    return goals, unattributed
+
+
+def _pending_goal_ids() -> set[str]:
+    """Goal ids carried by inbox/processing job JSON (non-goal files skipped)."""
+    return _pending_goals_and_unattributed()[0]
+
+
+def _running_goal_ids(now: float | None = None) -> list[str]:
+    out: list[str] = []
+    for g in _read_goals():
+        status = str(g.get("status") or "").lower()
+        if status not in RUNNING_GOAL_STATES:
+            continue
+        gid = str(g.get("goal") or "")
+        if gid and gid not in out:
+            out.append(gid)
+    return out
+
+
+def _heartbeat_goal_ids(heartbeat: dict | None) -> set[str]:
+    out: set[str] = set()
+    for row in (heartbeat or {}).get("slots") or []:
+        if not isinstance(row, dict):
+            continue
+        gid = str(row.get("goal") or "").strip()
+        if gid:
+            out.add(gid)
+    return out
+
+
 def _read_goals(goals_dir: Path | None = None) -> list[dict]:
     root = goals_dir or GOALS
     out: list[dict] = []
@@ -592,11 +712,17 @@ def collect_stall_events(
     *,
     broker_pids: list[int] | None = None,
     work_pids: list[int] | None = None,
+    heartbeat: dict | None = None,
+    goal_pids: dict | None = None,
 ) -> list[dict]:
-    """All currently-detected stall events (no notify, no dedup)."""
+    """All currently-detected stall events (no notify, no dedup).
+
+    ``heartbeat`` / ``goal_pids`` default to a live read; inject them in tests.
+    """
     now = time.time() if now is None else now
     broker_pids = list_broker_pids() if broker_pids is None else broker_pids
     work_pids = list_work_pids() if work_pids is None else work_pids
+    hb = read_heartbeat() if heartbeat is None else heartbeat
     pid = read_pidfile()
     live = bool(broker_pids) or pid_alive(pid)
     events: list[dict] = []
@@ -610,6 +736,13 @@ def collect_stall_events(
         ))
     else:
         age = heartbeat_age(HEARTBEAT, now)
+        # A slots-publishing broker owns per-Goal liveness in the heartbeat: a
+        # live work process no longer excuses a stale beat (it may belong to a
+        # different Goal). Legacy heartbeats keep the old work-pid exemption.
+        if age is not None and "slots" in hb:
+            stale = age > heartbeat_timeout()
+        else:
+            stale = age is not None and age > heartbeat_timeout() and not work_pids
         if age is None:
             if not work_pids:
                 events.append(_stalled_event(
@@ -618,33 +751,52 @@ def collect_stall_events(
                     "broker heartbeat file missing",
                     "检查 trial broker 主循环是否启动 / 重启 broker",
                 ))
-        elif age > heartbeat_timeout() and not work_pids:
+        elif stale:
             events.append(_stalled_event(
                 "heartbeat_stale",
                 "*",
                 f"broker heartbeat stale {age:.0f}s > {heartbeat_timeout():.0f}s "
-                "and no live open-slice/ask process",
+                + (
+                    "with live work process(es) not excusing it"
+                    if work_pids
+                    else "and no live open-slice/ask process"
+                ),
                 "重启 trial broker；检查 processing / 是否有僵死票",
             ))
 
-    # Condition 3: thin-state still active but no live ticket.
-    goals = _read_goals()
-    busy = _pending_jobs() or bool(work_pids)
-    if not busy:
-        for g in goals:
-            status = str(g.get("status") or "").lower()
-            if status not in RUNNING_GOAL_STATES:
-                continue
-            age = _goal_age_sec(g, now)
-            if age is None or age <= goal_stall_timeout():
-                continue
-            gid = str(g.get("goal") or "?")
-            events.append(_stalled_event(
-                f"goal_no_ticket:{gid}",
-                gid,
-                f"thin-state goal status={status} for {age:.0f}s with no live ticket",
-                "检查 processing / 是否需重启 broker 或 salvage",
-            ))
+    # Condition 3: a running Goal with no live ticket that belongs to it.
+    # Evaluated per Goal: one Goal's worker must never excuse another's.
+    gmap = work_pid_goals(work_pids, now=now) if goal_pids is None else goal_pids
+    unowned = bool(gmap.get("*"))
+    pending, pending_unattributed = _pending_goals_and_unattributed()
+    has_slots = "slots" in hb
+    hb_age = heartbeat_age(HEARTBEAT, now)
+    hb_goals = _heartbeat_goal_ids(hb)
+    hb_fresh = hb_age is not None and hb_age <= heartbeat_timeout()
+    for g in _read_goals():
+        status = str(g.get("status") or "").lower()
+        if status not in RUNNING_GOAL_STATES:
+            continue
+        age = _goal_age_sec(g, now)
+        if age is None or age <= goal_stall_timeout():
+            continue
+        gid = str(g.get("goal") or "?")
+        if gmap.get(gid):
+            continue  # a live work pid carries this Goal's env/cmdline
+        if gid in hb_goals and hb_fresh:
+            continue  # published in the broker's slots on a fresh beat
+        if gid in pending:
+            continue  # a job for this Goal is queued/processing
+        if pending_unattributed:
+            continue  # a job nobody could attribute to a Goal is pending
+        if unowned and not has_slots:
+            continue  # legacy heartbeat: an unattributable worker may be it
+        events.append(_stalled_event(
+            f"goal_no_ticket:{gid}",
+            gid,
+            f"thin-state goal status={status} for {age:.0f}s with no live ticket",
+            "检查 processing / 是否需重启 broker 或 salvage",
+        ))
     return events
 
 
@@ -938,6 +1090,8 @@ def run_once(
     grace_active = grace_is_active(now_mono, freeze, prior, grace_sec)
 
     events = collect_stall_events(now, broker_pids=broker_pids, work_pids=work_pids)
+    heartbeat = read_heartbeat()
+    goal_pids = work_pid_goals(work_pids, now=now)
     if grace_active:
         events = [e for e in events if not is_clock_related_stall(e)]
     events += freeze_events
@@ -977,6 +1131,8 @@ def run_once(
         "suppressed": suppressed,
         "freeze": freeze,
         "grace_active": grace_active,
+        "slots": list(heartbeat.get("slots") or []),
+        "goal_pids": goal_pids,
     }
 
 

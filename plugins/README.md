@@ -6,7 +6,7 @@
 |----|------|------|
 | `dsh-trial-desk` | `plugins/dsh-trial-desk` | **人工入口**：Goal / chain / chain-reply 写入 trial inbox；读 broker/thin-state。装进 `web`（或 `dsh web` 用的 `acp-lite`）。desk ≠ broker |
 | `dsh-role-bridge` | `plugins/dsh-role-bridge` | 票中角色桥：`send_to_role` / `ask_supervisor` / `submit_for_review`（写/poll mailbox） |
-| `dsh-eager-offload` | `plugins/dsh-eager-offload` | 工具结果超限时提前 spill 到 `$DSH_HOME/offload` |
+| `dsh-eager-offload` | `plugins/dsh-eager-offload` | 工具结果超限时提前 spill 到 `$DSH_HOME/offload`（已同步 box 开发树实际安装版；其中 ageMask 在当前 dsh 上无效） |
 
 ## 安装（本地路径）
 

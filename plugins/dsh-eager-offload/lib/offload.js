@@ -27,6 +27,12 @@ export const DEFAULT_PREVIEW_TAIL_BYTES = 1024
  */
 export const DEFAULT_OFFLOAD_READ_MAX_INLINE_BYTES = 16384
 
+/** Age-based clearing is opt-in: product profiles keep every tool_result in full. */
+export const DEFAULT_AGE_MASK_ENABLED = false
+
+/** Newest N tool_result messages kept verbatim once age-mask is enabled. */
+export const DEFAULT_AGE_MASK_KEEP_RECENT_N = 8
+
 /** Marker embedded in every replacement notice (loop / composition detection). */
 export const OFFLOAD_MARK = 'dsh-eager-offload:'
 
@@ -81,6 +87,8 @@ function requireNonNegInt(n, label, fallback) {
  *   previewHeadBytes: number,
  *   previewTailBytes: number,
  *   offloadReadMaxInlineBytes: number,
+ *   ageMaskEnabled: boolean,
+ *   ageMaskKeepRecentN: number,
  *   excludeTools: Set<string>,
  *   toolOverrides: Map<string, { inlineMaxBytes?: number }>,
  * }}
@@ -103,6 +111,19 @@ export function normalizeConfig(config = {}, opts = {}) {
     source.offloadReadMaxInlineBytes,
     'offloadReadMaxInlineBytes',
     DEFAULT_OFFLOAD_READ_MAX_INLINE_BYTES,
+  )
+  const ageMaskEnabled =
+    source.ageMaskEnabled === undefined || source.ageMaskEnabled === null
+      ? DEFAULT_AGE_MASK_ENABLED
+      : source.ageMaskEnabled === true || source.ageMaskEnabled === false
+        ? source.ageMaskEnabled
+        : (() => {
+            throw new TypeError('dsh-eager-offload: ageMaskEnabled must be a boolean')
+          })()
+  const ageMaskKeepRecentN = requireNonNegInt(
+    source.ageMaskKeepRecentN,
+    'ageMaskKeepRecentN',
+    DEFAULT_AGE_MASK_KEEP_RECENT_N,
   )
 
   const excludeTools = new Set()
@@ -132,6 +153,8 @@ export function normalizeConfig(config = {}, opts = {}) {
     previewHeadBytes,
     previewTailBytes,
     offloadReadMaxInlineBytes,
+    ageMaskEnabled,
+    ageMaskKeepRecentN,
     excludeTools,
     toolOverrides,
   }
@@ -433,4 +456,167 @@ export async function maybeOffload(input) {
     toolName,
     callId: input.callId,
   })
+}
+
+/* ------------------------------------------------------------------ *
+ * Age-based clearing (history-wide, applies to tool_result messages) *
+ * ------------------------------------------------------------------ */
+
+/** Extract an already-offloaded path from a replacement notice, if present. */
+const OFFLOAD_PATH_RE = /dsh-eager-offload:[^\n]*?path=([^\s)]+)/
+
+/**
+ * Recover the offload file path cited by an earlier byte-offload replacement.
+ * Returns undefined for untouched text (no marker) — callers then spill lazily.
+ *
+ * @param {string} text
+ * @returns {string | undefined}
+ */
+export function offloadedPathFromText(text) {
+  if (typeof text !== 'string' || !text.includes(OFFLOAD_MARK)) return undefined
+  const m = OFFLOAD_PATH_RE.exec(text)
+  return m ? m[1] : undefined
+}
+
+/**
+ * Whether a message is a tool_result carrying only plain-text blocks.
+ * Non-text blocks (images/files) make the message ineligible: masking would
+ * lose content the plugin cannot re-materialise.
+ *
+ * @param {any} message
+ * @returns {boolean}
+ */
+export function isPlainTextToolResult(message) {
+  if (!message || message.source?.kind !== 'tool') return false
+  // Error results carry actionable diagnostics; never age them out.
+  if (message.content?.some?.((b) => b?.type === 'tool-result' && b.isError)) return false
+  const blocks = message.content
+  if (!Array.isArray(blocks) || blocks.length === 0) return false
+  for (const block of blocks) {
+    if (block?.type !== 'tool-result') return false
+    if (!Array.isArray(block.content)) return false
+    for (const inner of block.content) {
+      if (inner?.type !== 'text' || typeof inner.text !== 'string') return false
+    }
+  }
+  return true
+}
+
+/**
+ * Collect the plain text of a tool_result message (concatenated inner texts).
+ * @param {any} message
+ * @returns {string | undefined}
+ */
+export function toolResultText(message) {
+  if (!isPlainTextToolResult(message)) return undefined
+  let text = ''
+  for (const block of message.content) for (const inner of block.content) text += inner.text
+  return text
+}
+
+/**
+ * Build the placeholder that replaces an aged-out tool_result.
+ * Always cites a re-readable path; never re-embeds the full text.
+ *
+ * @param {{ path?: string, bytes: number, reason: 'offloaded' | 'dropped' }} info
+ * @returns {string}
+ */
+export function formatAgeMaskPlaceholder(info) {
+  const bytes = info.bytes
+  if (info.path) {
+    return `(${OFFLOAD_MARK} age-masked bytes=${bytes} path=${info.path} — old tool result cleared; read that path for the full text)`
+  }
+  return `(${OFFLOAD_MARK} age-masked bytes=${bytes} — old tool result cleared; re-run the tool or read the session log for the full text)`
+}
+
+/**
+ * Rewrite one tool_result message's text, rebuilding the frozen chain.
+ * @param {any} message
+ * @param {string} replacement
+ * @returns {any}
+ */
+function withReplacedText(message, replacement) {
+  return {
+    ...message,
+    content: message.content.map((block) => ({
+      ...block,
+      content: [{ type: 'text', text: replacement }],
+    })),
+  }
+}
+
+/**
+ * Clear text from all but the newest `keepRecentN` tool_result messages.
+ *
+ * Pure with respect to `messages`: returns a new array (the originals are
+ * deep-frozen). Only plain-text, non-error tool results are eligible. Entries
+ * already carrying an offload path reuse it; untouched entries are spilled once
+ * via `save` (injectable for tests) so the full text stays re-readable.
+ *
+ * @param {any[]} messages
+ * @param {{ ageMaskEnabled?: boolean, ageMaskKeepRecentN?: number, offloadRoot?: string }} cfg
+ * @param {{
+ *   sessionId?: string,
+ *   save?: (req: { offloadRoot: string, sessionId: string, toolName: string, callId?: string, content: string }) => Promise<{ path: string, bytes: number }>,
+ * }} [opts]
+ * @returns {Promise<{ messages: any[], masked: number, spilled: number, pathReused: number, placeholderOnly: number }>}
+ */
+export async function maskOldToolResults(messages, cfg = {}, opts = {}) {
+  const unchanged = { messages, masked: 0, spilled: 0, pathReused: 0, placeholderOnly: 0 }
+  if (cfg.ageMaskEnabled !== true) return unchanged
+  if (!Array.isArray(messages) || messages.length === 0) return unchanged
+
+  const keepRecentN = requireNonNegInt(cfg.ageMaskKeepRecentN, 'ageMaskKeepRecentN', DEFAULT_AGE_MASK_KEEP_RECENT_N)
+
+  const eligible = []
+  for (let i = 0; i < messages.length; i++) {
+    const text = toolResultText(messages[i])
+    if (text !== undefined) eligible.push({ index: i, text })
+  }
+
+  const cut = eligible.length - keepRecentN
+  if (cut <= 0) return unchanged
+
+  const save = opts.save ?? saveOffloadFile
+  const next = messages.slice()
+  let masked = 0
+  let spilled = 0
+  let pathReused = 0
+  let placeholderOnly = 0
+
+  for (let e = 0; e < cut; e++) {
+    const { index, text } = eligible[e]
+    const bytes = Buffer.byteLength(text, 'utf8')
+    let path = offloadedPathFromText(text)
+
+    if (path) {
+      pathReused++
+    } else if (opts.sessionId !== undefined) {
+      try {
+        const saved = await save({
+          offloadRoot: cfg.offloadRoot,
+          sessionId: opts.sessionId,
+          toolName: messages[index]?.source?.toolName ?? 'tool',
+          callId: messages[index]?.source?.callId,
+          content: text,
+        })
+        path = saved.path
+        spilled++
+      } catch {
+        // Offload failure must never block the step: degrade to a bare placeholder.
+        path = undefined
+        placeholderOnly++
+      }
+    } else {
+      placeholderOnly++
+    }
+
+    next[index] = withReplacedText(
+      messages[index],
+      formatAgeMaskPlaceholder({ path, bytes }),
+    )
+    masked++
+  }
+
+  return { messages: next, masked, spilled, pathReused, placeholderOnly }
 }

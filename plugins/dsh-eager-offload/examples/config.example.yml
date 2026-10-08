@@ -7,6 +7,10 @@
     previewHeadBytes: 1536
     previewTailBytes: 1024
     offloadReadMaxInlineBytes: 16384
+    # Age-based clearing (opt-in; product profiles keep this false/absent).
+    # Keeps the newest N tool results verbatim; older ones become placeholders.
+    ageMaskEnabled: false
+    ageMaskKeepRecentN: 8
     excludeTools: []
     toolOverrides:
       bash:

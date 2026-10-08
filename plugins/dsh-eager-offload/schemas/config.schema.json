@@ -31,6 +31,17 @@
       "default": 16384,
       "description": "When read targets a path under offloadRoot: allow this much inline; above → in-place truncate (no second offload file)."
     },
+    "ageMaskEnabled": {
+      "type": "boolean",
+      "default": false,
+      "description": "Opt-in age-based clearing on agent/pre-step. When true, all but the newest ageMaskKeepRecentN plain-text tool results are replaced by a short placeholder carrying a re-readable path. Independent of, and never weakens, the byte-based offload above. Product profiles leave this false."
+    },
+    "ageMaskKeepRecentN": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 8,
+      "description": "Number of newest tool_result messages kept in full when ageMaskEnabled. Older ones become placeholders. 0 = clear every tool result."
+    },
     "excludeTools": {
       "type": "array",
       "items": { "type": "string" },

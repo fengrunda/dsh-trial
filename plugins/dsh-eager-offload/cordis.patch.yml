@@ -13,6 +13,10 @@
         # previewTailBytes: 1024
         # Cap for read of paths under offloadRoot (in-place truncate, no new file)
         # offloadReadMaxInlineBytes: 16384
+        # Age-based clearing on agent/pre-step (default false = off everywhere).
+        # Keep newest N tool results; older ones -> placeholder w/ re-readable path.
+        # ageMaskEnabled: false
+        # ageMaskKeepRecentN: 8
         # excludeTools: []
         # toolOverrides:
         #   bash:

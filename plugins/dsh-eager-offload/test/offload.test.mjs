@@ -9,10 +9,13 @@ import {
   composeInPlaceTruncate,
   composeReplacement,
   flattenPlainText,
+  formatAgeMaskPlaceholder,
   headTailPreview,
   isUnderOffloadRoot,
+  maskOldToolResults,
   maybeOffload,
   normalizeConfig,
+  offloadedPathFromText,
   readFilePathFromArgs,
   saveOffloadFile,
   sessionDirName,
@@ -219,4 +222,173 @@ test('toolOverrides tighten bash only', async () => {
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+/* ------------------------- age-based clearing ------------------------- */
+
+/** Build a frozen-ish tool_result message like dsh-session produces. */
+function toolMsg(text, { toolName = 'bash', callId = 'c1', isError = false } = {}) {
+  return {
+    id: `m-${callId}`,
+    role: 'user',
+    source: { kind: 'tool', callId, toolName },
+    content: [
+      {
+        type: 'tool-result',
+        toolCallId: callId,
+        isError,
+        content: [{ type: 'text', text }],
+      },
+    ],
+  }
+}
+
+/** 10 tool results, each uniquely identifiable. */
+function history(n = 10) {
+  return Array.from({ length: n }, (_, i) => toolMsg(`RESULT_${i}_BODY`, { callId: `c${i}` }))
+}
+
+function textOf(msg) {
+  return msg.content[0].content[0].text
+}
+
+test('age mask keeps newest N full and replaces older ones', async () => {
+  const cfg = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 3 }, { dshHome: '/tmp/x' })
+  const msgs = history(10)
+  const r = await maskOldToolResults(msgs, cfg, { sessionId: 's', save: async () => ({ path: '/p/x.txt', bytes: 1 }) })
+
+  assert.equal(r.masked, 7)
+  // newest 3 untouched (identity preserved)
+  for (const i of [7, 8, 9]) {
+    assert.equal(r.messages[i], msgs[i])
+    assert.equal(textOf(r.messages[i]), `RESULT_${i}_BODY`)
+  }
+  // older 7 -> placeholder carrying a path; byte count reflects the dropped text
+  for (const i of [0, 1, 2, 3, 4, 5, 6]) {
+    const body = `RESULT_${i}_BODY`
+    assert.equal(
+      textOf(r.messages[i]),
+      formatAgeMaskPlaceholder({ path: '/p/x.txt', bytes: Buffer.byteLength(body, 'utf8') }),
+    )
+    assert.ok(textOf(r.messages[i]).includes('path=/p/x.txt'))
+  }
+})
+
+test('age mask defaults: disabled is a no-op, default N is 8', async () => {
+  const off = normalizeConfig({}, { dshHome: '/tmp/x' })
+  assert.equal(off.ageMaskEnabled, false)
+  assert.equal(off.ageMaskKeepRecentN, 8)
+
+  const msgs = history(10)
+  let saves = 0
+  const r = await maskOldToolResults(msgs, off, { sessionId: 's', save: async () => (saves++, { path: '/p', bytes: 1 }) })
+  assert.equal(r.messages, msgs) // same reference: nothing ran
+  assert.equal(r.masked, 0)
+  assert.equal(saves, 0)
+
+  const on = normalizeConfig({ ageMaskEnabled: true }, { dshHome: '/tmp/x' })
+  const r2 = await maskOldToolResults(history(10), on, { sessionId: 's', save: async () => (saves++, { path: '/p/x.txt', bytes: 1 }) })
+  assert.equal(r2.masked, 2) // 10 - 8
+  assert.equal(saves, 2)
+})
+
+test('age mask N=0 clears every tool result; N>=count is a no-op', async () => {
+  const zero = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 0 }, { dshHome: '/tmp/x' })
+  const r0 = await maskOldToolResults(history(4), zero, { sessionId: 's', save: async () => ({ path: '/p/x.txt', bytes: 1 }) })
+  assert.equal(r0.masked, 4)
+
+  const big = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 99 }, { dshHome: '/tmp/x' })
+  const msgs = history(4)
+  const r1 = await maskOldToolResults(msgs, big, { sessionId: 's', save: async () => ({ path: '/p', bytes: 1 }) })
+  assert.equal(r1.messages, msgs)
+  assert.equal(r1.masked, 0)
+})
+
+test('age mask rejects non-boolean ageMaskEnabled and bad N', () => {
+  assert.throws(() => normalizeConfig({ ageMaskEnabled: 'yes' }), /ageMaskEnabled/)
+  assert.throws(() => normalizeConfig({ ageMaskKeepRecentN: -1 }), /ageMaskKeepRecentN/)
+})
+
+test('age mask reuses existing offload path and never re-spills', async () => {
+  const cfg = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 1 }, { dshHome: '/tmp/x' })
+  const priorNotice = composeReplacement('Z'.repeat(9000), {
+    inlineMaxBytes: 400,
+    previewHeadBytes: 100,
+    previewTailBytes: 60,
+    path: '/already/offloaded.txt',
+    toolName: 'bash',
+    callId: 'old',
+  })
+  const msgs = [toolMsg(priorNotice, { callId: 'old' }), toolMsg('NEWEST', { callId: 'new' })]
+
+  let saves = 0
+  const r = await maskOldToolResults(msgs, cfg, { sessionId: 's', save: async () => (saves++, { path: '/should/not/be/used', bytes: 1 }) })
+
+  assert.equal(r.pathReused, 1)
+  assert.equal(r.spilled, 0)
+  assert.equal(saves, 0) // no second file
+  const out = textOf(r.messages[0])
+  assert.ok(out.includes('/already/offloaded.txt')) // original path preserved
+  assert.ok(!out.includes('/should/not/be/used'))
+  assert.ok(!out.includes('Z'.repeat(50))) // full text not re-embedded
+})
+
+test('age mask spills untouched old entries once and stays re-readable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'eager-offload-age-'))
+  try {
+    const cfg = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 1 }, { dshHome: '/tmp/x', offloadRoot: root })
+    const body = 'FULL_OLD_BODY\n'.repeat(20)
+    const r = await maskOldToolResults([toolMsg(body, { callId: 'old' }), toolMsg('NEW')], cfg, { sessionId: 'sess-age' })
+
+    assert.equal(r.spilled, 1)
+    const out = textOf(r.messages[0])
+    const path = offloadedPathFromText(out)
+    assert.ok(path, 'placeholder must carry a re-readable path')
+    assert.equal(await readFile(path, 'utf8'), body) // recoverable
+    assert.ok(Buffer.byteLength(out, 'utf8') < Buffer.byteLength(body, 'utf8'))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('age mask spill failure degrades to bare placeholder without throwing', async () => {
+  const cfg = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 1 }, { dshHome: '/tmp/x' })
+  const r = await maskOldToolResults([toolMsg('BODY', { callId: 'old' }), toolMsg('NEW')], cfg, {
+    sessionId: 's',
+    save: async () => { throw new Error('disk full') },
+  })
+  assert.equal(r.placeholderOnly, 1)
+  assert.equal(r.spilled, 0)
+  assert.match(textOf(r.messages[0]), /age-masked/)
+  assert.equal(offloadedPathFromText(textOf(r.messages[0])), undefined)
+})
+
+test('age mask never clears isError results or non-text blocks', async () => {
+  const cfg = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 1 }, { dshHome: '/tmp/x' })
+  const errMsg = toolMsg('BOOM', { callId: 'e', isError: true })
+  const imgMsg = {
+    id: 'm-img',
+    role: 'user',
+    source: { kind: 'tool', callId: 'i', toolName: 'read' },
+    content: [{ type: 'tool-result', toolCallId: 'i', content: [{ type: 'image', data: 'x' }] }],
+  }
+  const msgs = [errMsg, imgMsg, toolMsg('NEWEST', { callId: 'n' })]
+  let saves = 0
+  const r = await maskOldToolResults(msgs, cfg, { sessionId: 's', save: async () => (saves++, { path: '/p', bytes: 1 }) })
+  assert.equal(r.masked, 0)
+  assert.equal(saves, 0)
+  assert.equal(textOf(r.messages[0]), 'BOOM')
+})
+
+test('age mask ignores non-tool messages and rebuilds (does not mutate) frozen input', async () => {
+  const cfg = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 1 }, { dshHome: '/tmp/x' })
+  const user = { id: 'u1', role: 'user', content: [{ type: 'text', text: 'hi' }] }
+  const old = Object.freeze(toolMsg('OLD_BODY', { callId: 'o' }))
+  const msgs = [user, old, toolMsg('NEW')]
+  const r = await maskOldToolResults(msgs, cfg, { sessionId: 's', save: async () => ({ path: '/p/x.txt', bytes: 1 }) })
+
+  assert.equal(r.messages[0], user) // untouched, same ref
+  assert.notEqual(r.messages[1], old) // rebuilt
+  assert.equal(textOf(old), 'OLD_BODY') // original not mutated
+  assert.equal(r.messages.length, 3)
 })

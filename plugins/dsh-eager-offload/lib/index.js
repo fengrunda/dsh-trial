@@ -10,6 +10,12 @@
  * the offload root are truncated in place (no second file) to break
  * read→offload→read loops.
  *
+ * Optional age-based clearing (`ageMaskEnabled`) additionally runs on
+ * `agent/pre-step` and replaces all but the newest `ageMaskKeepRecentN`
+ * plain-text tool results with a short placeholder. It is a second, independent
+ * lever: it never widens or replaces the byte-based offload above, it only
+ * clears results that are already small enough to have escaped it.
+ *
  * Named exports only (`apply` / `inject` / `name`) — `export default apply`
  * breaks Cordis inject metadata (see dsh-design-pack).
  *
@@ -18,6 +24,7 @@
 
 import {
   flattenPlainText,
+  maskOldToolResults,
   maybeOffload,
   normalizeConfig,
 } from './offload.js'
@@ -92,9 +99,43 @@ export function apply(ctx, config = {}) {
     { prepend: true },
   )
 
+  // Age-based clearing needs a HISTORY-WIDE view: `tools/post-execute` only ever
+  // sees the one new result. `agent/pre-step` is the waterfall that runs once per
+  // model request and is handed the full proposed `messages` array, so it is the
+  // only place where "keep the newest N tool_results, clear the older ones" can
+  // be decided. It is also the right LAYER: ACP resends the whole history every
+  // step, so masking here bounds every request without touching the durable
+  // session surface (replay/UI keep the full text).
+  if (cfg.ageMaskEnabled) {
+    ctx.on(
+      'agent/pre-step',
+      async ({ agent, messages }, next) => {
+        const decision = await next()
+        if (decision?.kind !== 'enter') return decision
+        try {
+          const result = await maskOldToolResults(decision.messages ?? messages, cfg, {
+            sessionId: agent?.session?.header?.id,
+          })
+          if (result.masked === 0) return decision
+          ctx.logger?.debug?.(
+            `dsh-eager-offload age-mask: masked=${result.masked} keepRecentN=${cfg.ageMaskKeepRecentN} ` +
+              `pathReused=${result.pathReused} spilled=${result.spilled} placeholderOnly=${result.placeholderOnly}`,
+          )
+          return { ...decision, messages: result.messages }
+        } catch (error) {
+          // Masking is an optimisation; never block the step on it.
+          ctx.logger?.warn?.(`dsh-eager-offload age-mask skipped: ${error?.message ?? error}`)
+          return decision
+        }
+      },
+      { prepend: true },
+    )
+  }
+
   ctx.logger?.info?.(
     `dsh-eager-offload mounted: offloadRoot=${cfg.offloadRoot} inlineMaxBytes=${cfg.inlineMaxBytes} ` +
       `previewHead=${cfg.previewHeadBytes} previewTail=${cfg.previewTailBytes} ` +
-      `offloadReadMaxInline=${cfg.offloadReadMaxInlineBytes}`,
+      `offloadReadMaxInline=${cfg.offloadReadMaxInlineBytes} ` +
+      `ageMask=${cfg.ageMaskEnabled ? `on(keep=${cfg.ageMaskKeepRecentN})` : 'off'}`,
   )
 }

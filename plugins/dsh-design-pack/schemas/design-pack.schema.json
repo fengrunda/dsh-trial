@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dsh-design-pack/slice-meta",
+  "title": "Design pack front-matter (optional YAML) + Markdown body",
+  "description": "Human/agent convention for medium-ticket open packs. Body is Markdown; optional YAML front-matter may carry these fields.",
+  "type": "object",
+  "required": ["slice_id", "goal", "done_when"],
+  "additionalProperties": true,
+  "properties": {
+    "slice_id": { "type": "string", "minLength": 1 },
+    "role": {
+      "type": "string",
+      "enum": ["hub-foreman", "engine-foreman", "design-gate", "executor", "other"]
+    },
+    "goal": { "type": "string", "minLength": 1 },
+    "done_when": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "contrast_paths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Specs/ADR/Ports paths to read on demand — not entire repos"
+    },
+    "forbidden": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "e.g. Knowledge Hub business src/"
+    },
+    "parent_index": {
+      "type": "string",
+      "description": "Path to thin supervisor index entry"
+    },
+    "summary_out": {
+      "type": "string",
+      "description": "Where to write close summary (outbox / thin-state/summaries)"
+    },
+    "max_bytes_hint": {
+      "type": "integer",
+      "minimum": 1024,
+      "default": 12288
+    }
+  }
+}

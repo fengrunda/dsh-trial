@@ -1,0 +1,46 @@
+{
+  "name": "dsh-design-pack",
+  "version": "0.1.1-dev",
+  "private": true,
+  "description": "Dev scaffold: bounded design-pack read tool for medium dsh tickets (open-with-pack). Not installed into product broker profiles.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./pack": "./lib/pack.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/pack.js",
+    "cordis.patch.yml",
+    "schemas",
+    "examples",
+    "skill",
+    "test",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/pack.test.mjs",
+    "check": "node --check lib/pack.js && node --check lib/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "design-pack",
+    "medium-ticket"
+  ],
+  "license": "MIT"
+}

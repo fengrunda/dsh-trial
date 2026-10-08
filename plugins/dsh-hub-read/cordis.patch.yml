@@ -1,0 +1,13 @@
+# Dev-only bundle patch for dsh-hub-read.
+# Do NOT merge into broker-khub-prod profiles until parent/user approves.
+# Read-only thin bridge to knowledge-hub dsh_read_wire (bank pinned to dsh-dev).
+- insert:
+    - id: hub-read
+      name: dsh-hub-read
+      config:
+        # Absolute path to the knowledge-hub checkout.
+        # hubRepoRoot: /workspace/hermes-work/knowledge-hub
+        # Python interpreter for the wire subprocess.
+        # pythonBin: python3
+        # hub_neighborhood_read stays default-off unless explicitly enabled.
+        # neighborhoodEnabled: false

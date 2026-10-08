@@ -1,0 +1,43 @@
+{
+  "name": "dsh-hub-read",
+  "version": "0.1.0-dev",
+  "private": true,
+  "description": "Dev scaffold: thin read-only Cordis bridge exposing knowledge-hub dsh_read_wire tools (hub_browse / hub_resolve; hub_neighborhood_read default-off) to dsh profiles. Read-only; bank pinned to dsh-dev.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./wire": "./lib/wire.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/wire.js",
+    "cordis.patch.yml",
+    "test",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/wire.test.mjs",
+    "check": "node --check lib/wire.js && node --check lib/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "knowledge-hub",
+    "read-only"
+  ],
+  "license": "MIT"
+}

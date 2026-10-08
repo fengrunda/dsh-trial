@@ -1,0 +1,11 @@
+# Dev-only bundle patch for dsh-design-pack.
+# Do NOT merge into broker-khub-prod profiles until parent/user approves.
+# Install sketch (pending): file: or link: dependency + bundles entry, then dump-config.
+- insert:
+    - id: design-pack
+      name: dsh-design-pack
+      config:
+        # Absolute or DSH_HOME-relative root that may contain pack files.
+        # packRoot: packs
+        # Soft reject above this UTF-8 byte size (default 12288).
+        # maxPackBytes: 12288

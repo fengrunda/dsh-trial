@@ -91,7 +91,13 @@ OPEN_SLICE_LOG_DIR = Path(
 HOMES_ROOT = Path(
     os.environ.get("DSH_HOMES_ROOT") or (Path.home() / ".dsh-homes")
 )
+# T1/T2 slot-isolated role homes (mirrors trial-broker.py's SLOT_HOMES_ROOT):
+# ``<HOMES_ROOT>/trial-slots/slot-<n>/{impl,gate,supervisor}``.
+SLOT_HOMES_ROOT = Path(
+    os.environ.get("DSH_TRIAL_SLOT_HOMES_ROOT") or (HOMES_ROOT / "trial-slots")
+)
 SESSION_PROJCACHE_SESSIONS = Path("storages") / "session_projcache" / "sessions"
+_ROLE_HOMES = ("impl", "gate", "supervisor")
 
 # open-slice logs carry a small header (``=== run ===``, ``DSH_HOME=``,
 # ``sessionId=``) written once at start; the rest of the file stays static until
@@ -435,12 +441,51 @@ def _path_exists(path: Path) -> bool:
         return False
 
 
+def session_search_roots(*, exists: bool = True) -> list[Path]:
+    """Every candidate ACP role home, legacy first then slot-isolated.
+
+    ``HOMES_ROOT/{impl,gate,supervisor}`` followed by
+    ``SLOT_HOMES_ROOT/slot-*/{impl,gate,supervisor}`` ordered by slot number.
+    With ``exists`` only directories that are really there are returned (the
+    legacy behaviour these call sites relied on); ``exists=False`` returns the
+    candidates regardless, which is what a log header without ``DSH_HOME=``
+    needs. Best effort: unreadable roots are skipped.
+    """
+    roots = [HOMES_ROOT / role for role in _ROLE_HOMES]
+
+    def _slot_num(path: Path) -> int:
+        try:
+            return int(path.name.split("-", 1)[1])
+        except (IndexError, ValueError):
+            return 1 << 30
+
+    slots: list[Path] = []
+    try:
+        entries = list(SLOT_HOMES_ROOT.glob("slot-*"))
+    except OSError:
+        entries = []
+    for slot_root in sorted(entries, key=_slot_num):
+        slots.extend(slot_root / role for role in _ROLE_HOMES)
+    roots.extend(slots)
+
+    if not exists:
+        return roots
+    out: list[Path] = []
+    for root in roots:
+        try:
+            if root.is_dir():
+                out.append(root)
+        except OSError:
+            continue
+    return out
+
+
 def _newest_session_json() -> Path | None:
     """Newest (mtime) session json under the ACP homes, or None."""
     best: Path | None = None
     best_mtime: int | None = None
-    for sub in ("impl", "gate", "supervisor"):
-        root = HOMES_ROOT / sub / SESSION_PROJCACHE_SESSIONS
+    for home in session_search_roots():
+        root = home / SESSION_PROJCACHE_SESSIONS
         try:
             entries = list(root.glob("*.json"))
         except OSError:
@@ -460,8 +505,9 @@ def _session_json_from_log(log_path: Path) -> list[Path]:
 
     Reads at most the first ~64 KiB (any OS error → ``[]``). ``sessionId=``
     lines are collected distinct with the newest last (an ask may run several
-    sessions); ``DSH_HOME=`` selects the role home, otherwise every
-    ``HOMES_ROOT/{impl,gate,supervisor}`` candidate that exists is kept. A log
+    sessions); ``DSH_HOME=`` selects the role home, otherwise every candidate
+    role home from :func:`session_search_roots` (legacy ``HOMES_ROOT`` roles and
+    slot-isolated ones) that holds the session json is kept. A log
     without a ``sessionId=`` line (or without a readable header) yields ``[]``.
     """
     try:
@@ -489,8 +535,8 @@ def _session_json_from_log(log_path: Path) -> list[Path]:
     else:
         candidates = []
         for sid in ids:
-            for role in ("impl", "gate", "supervisor"):
-                path = HOMES_ROOT / role / SESSION_PROJCACHE_SESSIONS / f"{sid}.json"
+            for home in session_search_roots(exists=False):
+                path = home / SESSION_PROJCACHE_SESSIONS / f"{sid}.json"
                 if _path_exists(path):
                     candidates.append(path)
 
@@ -510,7 +556,8 @@ def discover_session_outputs(work_pids: list[int]) -> dict[str, list[Path]]:
     the ACP session json each log header points at (a static log is normal for
     a long prompt, the session json is rewritten while the agent works), then
     open fds of the pid and its descendants (``*/sessions/*.json`` / ``*.log``),
-    then the newest session json under ``HOMES_ROOT`` as a per-key fallback
+    then the newest session json under the searched ACP homes (legacy
+    ``HOMES_ROOT`` roles + slot homes) as a per-key fallback
     (only for a key that has a log but no resolvable session json) or as the
     global fallback when nothing exists yet.
     All OS errors are swallowed; a vanished pid contributes nothing.
@@ -544,7 +591,7 @@ def discover_session_outputs(work_pids: list[int]) -> dict[str, list[Path]]:
                     seen.add(str(sess))
                     uniq.append(sess)
         # Per-key fallback: a blank/unreadable log header (no resolved session
-        # json) still tracks the newest HOMES_ROOT session while it is written.
+        # json) still tracks the newest ACP session while it is written.
         has_json = any(str(c).endswith(".json") for c in uniq)
         log_exists = any(
             str(c).endswith(".log") and _path_exists(c) for c in uniq
@@ -934,18 +981,39 @@ def collect_session_idle_events(
     work_pids: list[int],
     now_mono: float,
     state: dict | None = None,
+    goal_pids: dict[str, list[int]] | None = None,
 ) -> tuple[list[dict], dict]:
     """Detect live tickets whose ACP session/output has gone idle.
 
     Idle is ``now_mono - since_mono`` for an unchanged output signature; a new
     key, a changed signature or a monotonic regression resets the baseline.
     Returns ``(events, new_session_idle_state)``; discovery is injectable via
-    :func:`discover_session_outputs`.
+    :func:`discover_session_outputs`. A ``pid:``/``fallback:`` key is owned by
+    the Goal its work pid is attributed to (``goal_pids``, computed when not
+    injected, mirroring :func:`collect_stall_events`); an unattributable or
+    unknown pid keeps the legacy ``"*"``/key rule.
     """
     state = dict(state) if isinstance(state, dict) else {}
     if not work_pids:
         return [], {}
     outputs = discover_session_outputs(work_pids)
+    pid_goals = work_pid_goals(work_pids) if goal_pids is None else goal_pids
+
+    def owner_goal(key: str) -> str:
+        """Goal a discovered key belongs to; legacy key rule when unknown."""
+        if key.startswith("pid:"):
+            try:
+                pid = int(key.split(":", 1)[1])
+            except (IndexError, ValueError):
+                pid = -1
+            for gid, pids in pid_goals.items():
+                if pid != -1 and pid in pids and gid and gid != "*":
+                    return gid
+            return "*"
+        if key.startswith("fallback:"):
+            return "*"
+        return key
+
     thr = session_idle_timeout()
     pids_txt = ",".join(str(p) for p in sorted(work_pids))
     events: list[dict] = []
@@ -973,7 +1041,7 @@ def collect_session_idle_events(
             continue
         idle = float(now_mono) - float(prev_since)
         if idle > thr:
-            goal = "*" if key.startswith(("pid:", "fallback:")) else key
+            goal = owner_goal(key)
             events.append(_stalled_event(
                 f"session_idle:{key}",
                 goal,
@@ -1096,7 +1164,7 @@ def run_once(
         events = [e for e in events if not is_clock_related_stall(e)]
     events += freeze_events
     idle_events, idle_state = collect_session_idle_events(
-        work_pids, now_mono, prior.get("session_idle") or {}
+        work_pids, now_mono, prior.get("session_idle") or {}, goal_pids
     )
     events += idle_events
 

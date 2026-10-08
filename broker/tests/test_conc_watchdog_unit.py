@@ -85,6 +85,18 @@ def _keys(events) -> list[str]:
     return [str(e.get("reason_key") or "") for e in events]
 
 
+def _write_log_header(tmp_path: Path, home: Path | None, sid: str | None) -> Path:
+    """Open-slice log carrying the ``DSH_HOME=`` / ``sessionId=`` header lines."""
+    log = tmp_path / "open-slice.log"
+    lines = ["=== run ==="]
+    if home is not None:
+        lines.append(f"DSH_HOME={home}")
+    if sid is not None:
+        lines.append(f"sessionId={sid}")
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return log
+
+
 # --- collect_stall_events now takes the heartbeat / pid map as parameters -----
 
 def test_collect_stall_events_uses_injected_heartbeat_not_the_file(tmp_path):
@@ -397,3 +409,61 @@ def test_clock_stall_classifier_covers_goal_no_ticket_and_stale_heartbeat():
     assert wd.is_clock_related_stall({"reason_key": "goal_no_ticket:g-9b2e4d"}) is True
     assert wd.is_clock_related_stall({"reason_key": "heartbeat_stale"}) is True
     assert wd.is_clock_related_stall({"reason_key": "no_broker_process"}) is False
+
+
+# --- T3b: ACP sessions live in slot-isolated homes too ------------------------
+
+def test_session_json_under_slot_home_is_discovered(tmp_path):
+    """A log whose session json lives in ``SLOT_HOMES_ROOT/slot-N/<role>``."""
+    patch, _ = _patch_state(tmp_path)
+    slots = tmp_path / "slot-homes"
+    with patch, mock.patch.object(wd, "SLOT_HOMES_ROOT", slots):
+        sess = slots / "slot-2" / "gate" / wd.SESSION_PROJCACHE_SESSIONS / "abc.json"
+        sess.parent.mkdir(parents=True, exist_ok=True)
+        sess.write_text("{}", encoding="utf-8")
+        # No legacy HOMES_ROOT role home holds it: only the slot home can match.
+        with mock.patch.object(wd, "_newest_session_json", return_value=None):
+            assert wd._session_json_from_log(_write_log_header(tmp_path, None, "abc")) == [sess]
+            with mock.patch.object(wd, "_read_proc_cmdline", return_value=[]), \
+                    mock.patch.object(wd, "_descendant_pids", return_value=[]), \
+                    mock.patch.object(wd, "_fd_targets", return_value=[str(sess)]):
+                out = wd.discover_session_outputs([222])
+    assert out["pid:222"] == [sess]
+
+
+# --- T3b: a session-idle event belongs to the Goal that owns the pid ----------
+
+def test_session_idle_event_goal_is_the_owning_goal(tmp_path, monkeypatch):
+    """``pid:`` keys are attributed through ``work_pid_goals``, not ``"*"``."""
+    monkeypatch.setenv("TRIAL_WATCHDOG_SESSION_IDLE_SEC", "60")
+    patch, _ = _patch_state(tmp_path)
+    with patch:
+        out = wd.OPEN_SLICE_LOG_DIR / "pid-222.log"
+        out.write_text("x", encoding="utf-8")
+        with mock.patch.object(
+            wd, "discover_session_outputs", return_value={"pid:222": [out]}
+        ), mock.patch.object(wd, "work_pid_goals", return_value={"g-7f3a1c": [222]}):
+            wd.collect_session_idle_events([222], 0.0, {})
+            events, _ = wd.collect_session_idle_events(
+                [222], 100.0, {"pid:222": {"sig": wd.output_signature([out]), "since_mono": 0.0}}
+            )
+    assert _keys(events) == ["session_idle:pid:222"]  # reason_key unchanged
+    assert events[0]["goal"] == "g-7f3a1c"
+
+
+def test_session_idle_event_goal_falls_back_to_star_without_attribution(tmp_path, monkeypatch):
+    """An unattributable pid keeps the legacy ``"*"`` Goal."""
+    monkeypatch.setenv("TRIAL_WATCHDOG_SESSION_IDLE_SEC", "60")
+    patch, _ = _patch_state(tmp_path)
+    with patch:
+        out = wd.OPEN_SLICE_LOG_DIR / "pid-333.log"
+        out.write_text("x", encoding="utf-8")
+        with mock.patch.object(
+            wd, "discover_session_outputs", return_value={"pid:333": [out]}
+        ), mock.patch.object(wd, "work_pid_goals", return_value={"*": [333]}):
+            wd.collect_session_idle_events([333], 0.0, {})
+            events, _ = wd.collect_session_idle_events(
+                [333], 100.0, {"pid:333": {"sig": wd.output_signature([out]), "since_mono": 0.0}}
+            )
+    assert _keys(events) == ["session_idle:pid:333"]
+    assert events[0]["goal"] == "*"

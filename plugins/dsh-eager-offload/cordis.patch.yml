@@ -14,7 +14,8 @@
         # Cap for read of paths under offloadRoot (in-place truncate, no new file)
         # offloadReadMaxInlineBytes: 16384
         # contextClear: compaction-coupled clearing of old tool results
-        # (default false/absent = off; acp / acp-lite stay off). T2/T3.
+        # (default false/absent = off; acp / acp-lite stay off).
+        # T2 tool-result clearing implemented; T3 write/edit collapsing pending.
         # contextClear:
         #   enabled: false                 # master switch (default false)
         #   mode: compaction-coupled        # 'off' | 'compaction-coupled'

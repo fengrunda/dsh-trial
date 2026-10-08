@@ -44,7 +44,8 @@ export const DEFAULT_AGE_MASK_KEEP_RECENT_N = 8
 export const OFFLOAD_MARK = 'dsh-eager-offload:'
 
 /**
- * `contextClear` defaults (T1 skeleton; wiring lands in T2/T3). Compaction-coupled
+ * `contextClear` defaults (T2 tool-result clearing implemented; T3 write/edit
+ * step collapsing pending). Compaction-coupled
  * clearing only: right after `compaction-basic` summarises, the old tool results
  * kept in its retained tail are cleared via a persistent surfaceOp `replace`.
  * Opt-in per profile: acp / acp-lite leave it unconfigured, i.e. disabled.
@@ -550,19 +551,24 @@ export function composeInPlaceTruncate(fullText, opts) {
 /**
  * Persist full text under `<offloadRoot>/<sessionHash>/<id>-<tool>.txt`.
  *
+ * `req.name` (already filesystem-safe) pins the base name for deterministic
+ * callers such as context-clear; when omitted a random hex id is used.
+ *
  * @param {{
  *   offloadRoot: string,
  *   sessionId: string,
  *   toolName: string,
  *   callId?: string,
  *   content: string,
+ *   name?: string,
  * }} req
  * @returns {Promise<{ path: string, bytes: number }>}
  */
 export async function saveOffloadFile(req) {
   const dir = join(req.offloadRoot, sessionDirName(req.sessionId))
   await mkdir(dir, { recursive: true, mode: 0o700 })
-  const id = randomBytes(6).toString('hex')
+  const requested = typeof req.name === 'string' && req.name.length > 0 ? safeSegment(req.name) : undefined
+  const id = requested ?? randomBytes(6).toString('hex')
   const name = `${id}-${safeSegment(req.toolName)}.txt`
   const path = join(dir, name)
   // Exclusive create — collide → retry once with new id (extremely unlikely).

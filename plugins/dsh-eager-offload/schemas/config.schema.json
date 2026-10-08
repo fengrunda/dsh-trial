@@ -46,7 +46,7 @@
       "type": "object",
       "default": {},
       "additionalProperties": false,
-      "description": "Compaction-coupled clearing of old tool results (opt-in; default off). Only acts in the pre-step right after compaction-basic summarises, clearing old tool results kept in the retained tail via a persistent surfaceOp replace. acp / acp-lite leave this unconfigured => disabled. Implementation lands in T2/T3.",
+      "description": "Compaction-coupled clearing of old tool results (opt-in; default off). Only acts in the pre-step right after compaction-basic summarises, clearing old tool results kept in the retained tail via a persistent surfaceOp replace. acp / acp-lite leave this unconfigured => disabled. Tool-result clearing (T2) is implemented; write/edit step collapsing (T3) is pending.",
       "properties": {
         "enabled": {
           "type": "boolean",
@@ -79,7 +79,7 @@
             "tailBytes": { "type": "integer", "minimum": 0, "default": 240 },
             "failTailBytes": { "type": "integer", "minimum": 0, "default": 600 }
           },
-          "description": "Head/tail byte budgets for the placeholder left in place of a cleared result."
+          "description": "Head/tail byte budgets for the placeholder left in place of a cleared result. failTailBytes applies when the text ends with a non-zero [exit code: N] marker."
         },
         "collapseWriteSteps": {
           "type": "object",

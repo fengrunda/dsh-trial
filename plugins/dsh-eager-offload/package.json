@@ -7,12 +7,14 @@
   "main": "./lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./context-clear": "./lib/context-clear.js",
     "./offload": "./lib/offload.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
+    "lib/context-clear.js",
     "lib/offload.js",
     "cordis.patch.yml",
     "schemas",
@@ -22,7 +24,7 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --check lib/offload.js && node --check lib/index.js"
+    "check": "node --check lib/offload.js && node --check lib/context-clear.js && node --check lib/index.js"
   },
   "dsh": {
     "bundle": {

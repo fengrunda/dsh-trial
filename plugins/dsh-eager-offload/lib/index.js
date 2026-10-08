@@ -15,7 +15,8 @@
  * the full history, so nothing was ever masked. The config keys are still
  * accepted (and a one-time warning is logged) so existing profiles load. The
  * replacement is `contextClear` (compaction-coupled, persistent surfaceOp
- * `replace`); T1 only adds and validates its config — wiring lands in T2/T3.
+ * `replace`): T2 wires the tool-result clearing; collapsing oversized
+ * write/edit steps (T3) is still pending.
  *
  * Named exports only (`apply` / `inject` / `name`) — `export default apply`
  * breaks Cordis inject metadata (see dsh-design-pack).
@@ -23,6 +24,7 @@
  * @module dsh-eager-offload
  */
 
+import { clearAfterCompaction } from './context-clear.js'
 import { flattenPlainText, maybeOffload, normalizeConfig } from './offload.js'
 
 /** Cordis row / logger channel id. */
@@ -94,6 +96,54 @@ export function apply(ctx, config = {}) {
     },
     { prepend: true },
   )
+
+  // contextClear (T2): compaction-coupled clearing of old tool results. The
+  // listener is registered only when enabled, and prepended so it is outermost
+  // in the `agent/pre-step` waterfall: after `next()` returns, compaction-basic
+  // (and any inner listener) has already committed its summary + checkpoint, so
+  // the fresh surface can be cleared before the step starts. The returned
+  // decision is always passed through unchanged.
+  if (cfg.contextClear.enabled && cfg.contextClear.mode === 'compaction-coupled') {
+    let warnedMissingMeter = false
+    ctx.on(
+      'agent/pre-step',
+      async ({ agent }, next) => {
+        const decision = await next()
+        if (decision?.kind !== 'enter') return decision
+        try {
+          const tokenMeter = ctx.get?.('tokenMeter')
+          if (tokenMeter === undefined) {
+            if (!warnedMissingMeter) {
+              warnedMissingMeter = true
+              ctx.logger?.warn?.(
+                'dsh-eager-offload: contextClear is enabled but the tokenMeter service is ' +
+                  'unavailable; skipping tool-result clearing',
+              )
+            }
+            return decision
+          }
+          const session = agent?.session
+          const result = await clearAfterCompaction(session, {
+            cfg,
+            tokenMeter,
+            logger: ctx.logger,
+            sessionId: session?.header?.id,
+          })
+          if (result.triggered) {
+            ctx.logger?.info?.(
+              `context-clear: cleared=${result.cleared} bytes ${result.bytesBefore}->${result.bytesAfter}`,
+            )
+          }
+        } catch (error) {
+          ctx.logger?.warn?.(
+            `dsh-eager-offload: context-clear failed: ${String(error)}; continuing the turn`,
+          )
+        }
+        return decision
+      },
+      { prepend: true },
+    )
+  }
 
   // ageMask is deprecated and intentionally NOT registered: `agent/pre-step`
   // only ever receives this step's newly claimed user messages, never the full

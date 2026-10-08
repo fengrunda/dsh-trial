@@ -123,7 +123,7 @@ test('normalizeConfig still loads legacy ageMaskEnabled:true (deprecated, retain
   assert.equal(cfg.contextClear.enabled, false)
 })
 
-test('apply never registers agent/pre-step and warns once when ageMaskEnabled', () => {
+test('apply warns once when deprecated ageMaskEnabled is set and keeps contextClear off', () => {
   const events = []
   const warns = []
   const infos = []
@@ -132,13 +132,13 @@ test('apply never registers agent/pre-step and warns once when ageMaskEnabled', 
       on: (event, handler, opts) => events.push({ event, handler, opts }),
       logger: { warn: (m) => warns.push(m), info: (m) => infos.push(m) },
     },
-    { ageMaskEnabled: true, contextClear: { enabled: true } },
+    { ageMaskEnabled: true },
   )
 
   assert.deepEqual(events.map((e) => e.event), ['tools/post-execute'])
   assert.equal(warns.filter((w) => /ageMaskEnabled is deprecated/.test(w)).length, 1)
   assert.ok(warns[0].includes('use contextClear'))
-  assert.ok(infos.some((m) => m.includes('contextClear=on(compaction-coupled,keep=8)')))
+  assert.ok(infos.some((m) => m.includes('contextClear=off')))
 
   const warnsOff = []
   const infosOff = []

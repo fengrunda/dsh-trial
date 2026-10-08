@@ -8,7 +8,8 @@
     previewTailBytes: 1024
     offloadReadMaxInlineBytes: 16384
     # contextClear: compaction-coupled clearing of old tool results (opt-in).
-    # DEFAULT OFF — acp / acp-lite leave it unconfigured. Wiring lands in T2/T3.
+    # DEFAULT OFF — acp / acp-lite leave it unconfigured.
+    # T2 (tool-result clearing) implemented; T3 (write/edit step collapsing) pending.
     # contextClear:
     #   enabled: false                     # master switch (default false)
     #   mode: compaction-coupled            # 'off' | 'compaction-coupled'

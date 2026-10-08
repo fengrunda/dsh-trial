@@ -116,6 +116,9 @@ _ENV_OVERRIDES = {
     "TRIAL_ARTIFACT_ROOT": _TMP_HOME / "trial-broker-artifacts",
     "DSH_HOMES_ROOT": _TMP_HOME / "dsh-homes",
     "TRIAL_WATCHDOG_LOG_DIR": _TMP_HOME / "watchdog-logs",
+    # Belt-and-braces: the completion-notify hook must never spawn the real
+    # khub-board-refresh from inside the suite.
+    "DSH_BOARD_REFRESH": "0",
 }
 for _key, _path in _ENV_OVERRIDES.items():
     os.environ[_key] = str(_path)

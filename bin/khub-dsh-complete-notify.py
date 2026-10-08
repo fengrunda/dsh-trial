@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -22,6 +23,12 @@ from pathlib import Path
 
 DEFAULT_CONFIG = Path("/home/box/.dsh/supervisor/khub-complete-webhook.json")
 BOX_SECRETS = Path("/home/box/sand-data/box-secrets.json")
+
+# Board-refresh hook (fire-and-forget). The refresh script itself is never run
+# for real by unit tests: tests point DSH_BOARD_REFRESH_BIN at a stub/fake.
+DEFAULT_BOARD_REFRESH_BIN = "/home/box/.local/bin/khub-board-refresh"
+BOARD_REFRESH_DELAY_SEC = 20
+BOARD_REFRESH_REASON_MAX = 120
 
 # Patchable indirections so unit tests never touch the real clock or sleep.
 _sleep = time.sleep
@@ -116,6 +123,55 @@ def _payload_meta(payload: dict) -> dict:
         "status": payload.get("status"),
         "ticket": payload.get("ticket"),
     }
+
+
+def _maybe_refresh_board(payload_meta_or_payload) -> bool:
+    """Fire-and-forget board refresh; return True only if the spawn was started.
+
+    Accepts either the payload that is actually sent or ``_payload_meta(payload)``
+    (both carry ``kind`` / ``goal`` / ``ticket``).
+
+    Skipped when ``DSH_BOARD_REFRESH == "0"``, when running under pytest
+    (``PYTEST_CURRENT_TEST`` is set), or when the refresh script is missing / not
+    executable. The child is detached and never waited on; spawn failures are
+    swallowed.
+    """
+    if (os.environ.get("DSH_BOARD_REFRESH") or "").strip() == "0":
+        return False
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+
+    bin_path = (os.environ.get("DSH_BOARD_REFRESH_BIN") or "").strip() \
+        or DEFAULT_BOARD_REFRESH_BIN
+    if not os.access(bin_path, os.X_OK):
+        return False
+
+    src = payload_meta_or_payload if isinstance(payload_meta_or_payload, dict) else {}
+
+    def _field(name: str) -> str:
+        value = src.get(name)
+        text = "" if value is None else str(value).strip()
+        return text or "-"
+
+    kind = _field("kind")
+    goal = _field("goal")
+    ticket = _field("ticket")
+    target = goal if goal != "-" else ticket
+    reason = f"dsh-notify:{kind}:{target}"[:BOARD_REFRESH_REASON_MAX]
+    argv = [bin_path, "--delay", str(BOARD_REFRESH_DELAY_SEC), "--reason", reason]
+
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _log_rec(meta: dict, event: str, http, attempt: int, ok: bool, error, **extra) -> dict:
@@ -256,6 +312,10 @@ def main() -> int:
         print(json.dumps({"url": url, "payload": payload}, ensure_ascii=False, indent=2))
         append_send_log(_log_rec(_payload_meta(payload), "dry_run", None, 0, True, None))
         return 0
+
+    # Async, best-effort: kick the board refresh off *before* the webhook so it
+    # happens whether or not this notification succeeds.
+    _maybe_refresh_board(payload)
 
     key = _load_key()
     # Accept either raw token or already "Bearer …"

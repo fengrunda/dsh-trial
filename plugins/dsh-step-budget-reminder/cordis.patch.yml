@@ -3,6 +3,6 @@
 - insert:
     - id: step-budget-reminder
       name: dsh-step-budget-reminder
-      config:
+      config: {}
         # budget: 30        # explicit budget; wins over DSH_STEP_BUDGET
         # secondFactor: 1.5 # multiplier for the escalated reminder

@@ -65,15 +65,18 @@ function appendContext(ours, theirs) {
 /**
  * Install the listeners.
  * @param ctx - plugin context; listeners are scoped to it and disposed with it.
- * @param config - `{ budget?: number, secondFactor?: number }`.
+ * @param config - `{ budget?: number, secondFactor?: number }`. A missing,
+ *   `null`, or non-object config (e.g. an empty `config:` block in YAML
+ *   parses to `null`) is treated as `{}` rather than throwing.
  */
-function apply(ctx, config = {}) {
-	const budget = parseBudget(process.env, config);
+function apply(ctx, config) {
+	const cfg = config !== null && typeof config === "object" ? config : {};
+	const budget = parseBudget(process.env, cfg);
 	const secondFactor =
-		typeof config.secondFactor === "number" &&
-		Number.isFinite(config.secondFactor) &&
-		config.secondFactor > 1
-			? config.secondFactor
+		typeof cfg.secondFactor === "number" &&
+		Number.isFinite(cfg.secondFactor) &&
+		cfg.secondFactor > 1
+			? cfg.secondFactor
 			: DEFAULT_SECOND_FACTOR;
 
 	/** Per-agent counters; only the root agent is tracked. */

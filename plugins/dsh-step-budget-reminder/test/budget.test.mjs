@@ -211,3 +211,32 @@ test('apply: delegated agents (parentAgent) are not counted', async () => {
     assert.equal(result.additionalContexts, undefined)
   }
 })
+
+test('parseBudget: null/undefined/non-object config tolerates and falls back to env', () => {
+  assert.equal(parseBudget({ DSH_STEP_BUDGET: '30' }, null), 30)
+  assert.equal(parseBudget({ DSH_STEP_BUDGET: '30' }, undefined), 30)
+  assert.equal(parseBudget({ DSH_STEP_BUDGET: '30' }, 'budget'), 30)
+  assert.equal(parseBudget({}, null), 0)
+})
+
+test('apply: null/undefined config does not throw and env budget still applies', async () => {
+  const previous = process.env.DSH_STEP_BUDGET
+  process.env.DSH_STEP_BUDGET = '4'
+  try {
+    for (const config of [null, undefined]) {
+      const ctx = fakeCtx()
+      apply(ctx, config) // an empty YAML `config:` parses to null — must not throw
+      const agent = rootAgent(`root-${String(config)}`)
+      for (let step = 1; step <= 3; step += 1) {
+        const quiet = await runStep(ctx, agent)
+        assert.equal(quiet.additionalContexts, undefined)
+      }
+      const due = await runStep(ctx, agent)
+      assert.equal(due.additionalContexts.length, 1)
+      assert.match(due.additionalContexts[0].content[0].text, /已到步数预算（4\/4）/)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.DSH_STEP_BUDGET
+    else process.env.DSH_STEP_BUDGET = previous
+  }
+})

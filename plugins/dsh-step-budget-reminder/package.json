@@ -1,0 +1,23 @@
+{
+  "name": "dsh-step-budget-reminder",
+  "version": "0.1.0-dev",
+  "private": true,
+  "description": "Soft step-budget reminder: nudges a root agent to wrap up at the step budget and again at 1.5x. Never stops the loop.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./budget": "./lib/budget.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "cordis.patch.yml", "test", "README.zh.md"],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check lib/budget.js && node --check lib/index.js"
+  },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "engines": { "node": "^22.19.0 || >=24.0.0" },
+  "peerDependencies": { "@deepseek-ai/cordis": "^4.0.2" },
+  "license": "MIT"
+}

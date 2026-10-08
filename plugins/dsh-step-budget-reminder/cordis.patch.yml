@@ -1,0 +1,8 @@
+# Soft step-budget reminder. Advisory only: it injects a notice, never a stop.
+# Budget source: config.budget > DSH_STEP_BUDGET > none (inert).
+- insert:
+    - id: step-budget-reminder
+      name: dsh-step-budget-reminder
+      config:
+        # budget: 30        # explicit budget; wins over DSH_STEP_BUDGET
+        # secondFactor: 1.5 # multiplier for the escalated reminder

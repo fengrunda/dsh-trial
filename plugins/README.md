@@ -38,4 +38,4 @@ dsh plugin --profile acp-lite-trial add -w "$(pwd)/plugins/dsh-eager-offload"
 - 路径：`/workspace/dsh-trial-plugins`——本仓的 **detached worktree**，固定在 tag `plugins-pin-<YYYYMMDD><x>` 上（`git -C /workspace/dsh-trial-plugins describe --tags` 查当前 pin）。
 - 用途：profile 软链（`~/.dsh/profiles/<p>/node_modules/<plugin>`）指向 `/workspace/dsh-trial-plugins/plugins/<plugin>`，**不要**指向会随合并变化的运行工作区 `/workspace/dsh-trial`，也不要再指向 `/workspace/dsh-plugins/` 开发树。
 - 升级：在主仓打新 tag → `git -C /workspace/dsh-trial-plugins checkout --detach <new-tag>` → 重启使用该插件的 dsh 进程（profile `patchReload: startup`）。回滚：checkout 回旧 tag 再重启。
-- 2026-10-08：已建好；目前只有 `web` 的 `dsh-trial-desk` 指向它，其余 profile 仍指 `/workspace/dsh-plugins/` 开发树，待上线窗口统一切换。
+- 2026-10-08：已建好，当前 pin = `plugins-pin-20261008c`（含 eager-offload contextClear，默认关）。目前只有 `web` 的 `dsh-trial-desk` 指向它（`~/.dsh/profiles/web/package.json` / `pnpm-lock.yaml` 的 link 也已改到这里，旧值备份为 `*.bak-20261008-desklink`），其余 profile 仍指 `/workspace/dsh-plugins/` 开发树，待上线窗口统一切换。

@@ -14,6 +14,7 @@ Usage:
                 [--cwd ABS] [--role gate|impl|supervisor] [--final] [--keep-open]
                 [--log PATH] [--summary-name NAME]
                 [--prompt-mode baseline|foreman|gate|supervisor-plan|supervisor-answer|supervisor-close] [--prompt-file PATH]
+                [--reasoning-effort off|low|high|max] [--step-budget N]
                 [--print-prompt]
 
 Defaults:
@@ -55,6 +56,8 @@ SUMMARY_NAME=""
 PROMPT_MODE="baseline"
 PROMPT_FILE=""
 PRINT_PROMPT=0
+REASONING_EFFORT=""
+STEP_BUDGET=""
 ASK_BIN="${DSH_ACP_ASK:-$DSH_HOME/bin/dsh-acp-ask.py}"
 
 while [[ $# -gt 0 ]]; do
@@ -70,6 +73,8 @@ while [[ $# -gt 0 ]]; do
     --summary-name) SUMMARY_NAME="${2:-}"; shift 2 ;;
     --prompt-mode) PROMPT_MODE="${2:-}"; shift 2 ;;
     --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
+    --reasoning-effort) REASONING_EFFORT="${2:-}"; shift 2 ;;
+    --step-budget) STEP_BUDGET="${2:-}"; shift 2 ;;
     --print-prompt) PRINT_PROMPT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
@@ -377,6 +382,10 @@ fi
 
 ARGS=(--profile "$PROFILE" --ticket "$TICKET" --cwd "$CWD" --prompt "$PROMPT" --new)
 [[ -n "$ROLE" ]] && ARGS+=(--role "$ROLE")
+# Non-empty only: when unset, dsh-acp-ask.py falls back to DSH_REASONING_EFFORT /
+# DSH_STEP_BUDGET from the environment itself.
+[[ -n "$REASONING_EFFORT" ]] && ARGS+=(--reasoning-effort "$REASONING_EFFORT")
+[[ -n "$STEP_BUDGET" ]] && ARGS+=(--step-budget "$STEP_BUDGET")
 if [[ "$KEEP_OPEN" -eq 1 ]]; then
   ARGS+=(--keep-open)
 else

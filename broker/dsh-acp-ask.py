@@ -215,6 +215,60 @@ def _build_env() -> dict[str, str]:
     return env
 
 
+EFFORT_ALIASES = {"medium": "high", "xhigh": "max", "none": "off"}
+EFFORT_VALUES = ("off", "low", "high", "max")
+
+
+def normalize_effort(v: str | None) -> str | None:
+    """Map a user-supplied reasoning effort to an ACP-accepted value.
+
+    The DeepSeek adapter knows only off/low/high/max (``medium`` is rejected as
+    an unknown reasoning effort); the public API documents medium→high and
+    xhigh→max. Empty/unset means "do not set the option".
+    """
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if not s:
+        return None
+    s = EFFORT_ALIASES.get(s, s)
+    if s not in EFFORT_VALUES:
+        raise ValueError(f"unknown reasoning effort {v!r}; use off|low|high|max")
+    return s
+
+
+def parse_step_budget(v: str | int | None) -> int:
+    """Positive step budget, or 0 when unset/empty/non-numeric/non-positive."""
+    if v is None:
+        return 0
+    s = str(v).strip()
+    if not s:
+        return 0
+    try:
+        n = int(s)
+    except ValueError:
+        return 0
+    return n if n > 0 else 0
+
+
+def apply_session_options(client, session_id: str, effort: str | None) -> None:
+    """Apply per-session ACP options once, right after new/resume.
+
+    A rejected option must never sink the ticket: warn on stderr and continue.
+    """
+    if not effort:
+        return
+    try:
+        client.session_set_config_option(session_id, "reasoning_effort", effort)
+    except Exception as e:
+        print(
+            f"warning: reasoning_effort={effort} not applied: {e}",
+            file=sys.stderr,
+        )
+        return
+    print(f"reasoning_effort={effort}", file=sys.stderr)
+
+
 def _split_prompts_blob(blob: str) -> list[str]:
     parts: list[str] = []
     cur: list[str] = []
@@ -385,6 +439,26 @@ class AcpClient:
             raise RuntimeError(f"ACP session/new failed: {msg or errs[:8]}")
         return msg["result"]["sessionId"]
 
+    def session_set_config_option(
+        self, session_id: str, config_id: str, value: str
+    ) -> None:
+        rid = self._next_id()
+        self.send(
+            {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": session_id,
+                    "configId": config_id,
+                    "value": value,
+                },
+            }
+        )
+        msg, errs = self.wait_for(lambda m: m.get("id") == rid, timeout=30)
+        if not msg or "error" in msg:
+            raise RuntimeError(f"ACP session/set_config_option failed: {msg or errs[:8]}")
+
     def session_list(self, cwd: str | None = None) -> dict[str, Any]:
         rid = self._next_id()
         params: dict[str, Any] = {}
@@ -537,7 +611,34 @@ def main(argv: list[str] | None = None) -> int:
         default="acp",
         help="dsh profile name (default: acp; use acp-lite for plugin/scaffold/context trials)",
     )
+    ap.add_argument(
+        "--reasoning-effort",
+        default=os.environ.get("DSH_REASONING_EFFORT") or None,
+        help="ACP reasoning_effort for the session (off|low|high|max; medium→high, xhigh→max)",
+    )
+    ap.add_argument(
+        "--step-budget",
+        default=None,
+        help="positive step budget exported to the dsh child as DSH_STEP_BUDGET (default: env)",
+    )
     args = ap.parse_args(argv)
+
+    try:
+        effort = normalize_effort(args.reasoning_effort)
+    except ValueError as e:
+        print(f"--reasoning-effort: {e}", file=sys.stderr)
+        return 2
+    if args.step_budget in (None, ""):
+        # env value: 0 / empty / garbage all mean "do not set the budget"
+        step_budget = parse_step_budget(os.environ.get("DSH_STEP_BUDGET"))
+    else:
+        step_budget = parse_step_budget(args.step_budget)
+        if not step_budget:
+            print(
+                f"--step-budget: expected a positive integer, got {args.step_budget!r}",
+                file=sys.stderr,
+            )
+            return 2
 
     # Role → DSH_HOME before building child env / reading tickets
     dsh_home_was_set = "DSH_HOME" in os.environ
@@ -657,6 +758,8 @@ def main(argv: list[str] | None = None) -> int:
         dsh_bin=dsh_bin,
         env=env,
         profile=profile,
+        reasoning_effort=effort,
+        step_budget=step_budget,
     )
 
 
@@ -674,8 +777,21 @@ def _run_prompts(
     dsh_bin: str | None = None,
     env: dict[str, str] | None = None,
     profile: str = "acp",
+    reasoning_effort: str | None = None,
+    step_budget: int = 0,
 ) -> int:
     env = env or _build_env()
+    if reasoning_effort is None:
+        try:
+            reasoning_effort = normalize_effort(os.environ.get("DSH_REASONING_EFFORT"))
+        except ValueError as e:
+            print(f"warning: ignoring DSH_REASONING_EFFORT: {e}", file=sys.stderr)
+            reasoning_effort = None
+    if not step_budget:
+        step_budget = parse_step_budget(os.environ.get("DSH_STEP_BUDGET"))
+    if step_budget > 0:
+        env["DSH_STEP_BUDGET"] = str(step_budget)
+        print(f"step_budget={step_budget}", file=sys.stderr)
     dsh_bin = dsh_bin or env.get("DSH_BIN") or DEFAULT_DSH
     mcp_servers = mcp_servers or []
     profile = profile or "acp"
@@ -702,6 +818,8 @@ def _run_prompts(
                     sid = client.session_new(cwd, mcp_servers)
         else:
             sid = client.session_new(cwd, mcp_servers)
+
+        apply_session_options(client, sid, reasoning_effort)
 
         if print_session_id or ticket:
             print(f"sessionId={sid}", file=sys.stderr)

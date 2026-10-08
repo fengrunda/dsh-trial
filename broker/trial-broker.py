@@ -797,7 +797,7 @@ def load_job(path: Path) -> dict:
             raise ValueError(f"max_rounds out of range: {max_rounds}")
         return {
             **base,
-            "slice": str(slice_id),
+            "slice": _safe_slice_id(slice_id),
             "pack": str(pack),
             "acceptance": data.get("acceptance") or "",
             "profile": profile,
@@ -813,7 +813,7 @@ def load_job(path: Path) -> dict:
             raise ValueError(f"chain-reply missing slice/answer: {path}")
         return {
             **base,
-            "slice": str(slice_id),
+            "slice": _safe_slice_id(slice_id),
             "answer": str(answer),
         }
 
@@ -1817,9 +1817,11 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
     lim = T.resolve_limits(goal=goal) if goal else T.load_global_limits()
     round_n = int(ask.get("round") or (goal or {}).get("review_seq") or 1)
     if goal is not None:
-        goal["review_seq"] = int(goal.get("review_seq") or 0) + 1
-        round_n = goal["review_seq"]
-        _write_goal(goal)
+        # T2: *reserve* the round here, but only persist it once the gate pack
+        # exists on disk (below). Bumping before the pack meant a pack that
+        # failed to build still spent a round on every 2 s watcher retry
+        # (r30 → r37 and the next real ticket jumped to r38).
+        round_n = int(goal.get("review_seq") or 0) + 1
 
     # Build a gate pack: delta-only when prior findings exist on goal/chain
     prior_findings = []
@@ -1865,14 +1867,28 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                 cwd=cwd_path,
                 label=rev_label,
             )
-    except ValueError as e:
+    except Exception as e:  # a bad slice id (e.g. "/") must never burn a round
         T.write_ask_answer(ask_id, f"[error] gate pack: {e}", supervisor_ticket="(error)")
         # overwrite with structured fail
         (MAILBOX / "answers" / f"{ask_id}.json").write_text(
             json.dumps({"ask_id": ask_id, "status": "done", "ok": False, "error": str(e), "verdict": "HOLD",
                         "rework_mode": "fresh", "instruction": "pack error — end ticket"}, ensure_ascii=False, indent=2) + "\n"
         )
+        # archive pending, exactly like the precheck path — otherwise the
+        # watcher re-processes the same ask every tick, forever.
+        try:
+            arch = MAILBOX / "archive"
+            arch.mkdir(parents=True, exist_ok=True)
+            if path.is_file():
+                path.rename(arch / f"{ask_id}.pending.json")
+        except OSError:
+            pass
         return
+
+    # T2: the pack is on disk, so the round is real — persist it now.
+    if goal is not None:
+        goal["review_seq"] = round_n
+        _write_goal(goal)
 
     gate_ticket = f"gate-trial-{slice_id}-rev{round_n}"
     # derived from the pack we actually wrote, so summary_out and summary_name
@@ -2121,7 +2137,9 @@ def _review_ledger_path() -> Path:
 
 
 def _review_key(goal_id, slice_id, cwd, fp) -> str:
-    return f"{goal_id}|{slice_id}|{os.path.realpath(str(cwd))}|{fp}"
+    # T2: ``None`` and ``""`` describe the same (unknown) goal — normalise so
+    # they cannot produce two different ledger keys for one review.
+    return f"{str(goal_id or '')}|{slice_id}|{os.path.realpath(str(cwd))}|{fp}"
 
 
 def _lookup_review(goal_id, slice_id, cwd, fp) -> dict | None:
@@ -3134,6 +3152,31 @@ def _write_goal(state: dict) -> Path:
 
 
 
+_SAFE_SLICE_MAX = 80
+
+
+def _safe_slice_id(raw) -> str:
+    """Filesystem-safe slice id — a slice *title* is never a path.
+
+    The incident: an orphan ask carried a slice title containing ``/``
+    (``status/report 从 broker 心跳显示并发（slots/queued）``) and the broker
+    used it verbatim as a slice id; ``build_gate_pack`` then tried to write into
+    a non-existent sub-directory and raised ``FileNotFoundError`` *after* the
+    review round had already been counted. Every character that can split a path
+    component (``/``, ``\\``, ``:``, NUL, other control chars, whitespace)
+    becomes ``-``; runs of ``-`` collapse; leading/trailing ``-._`` are dropped;
+    the id is cut to 80 characters and is never empty. Idempotent, and a normal
+    id (``s1``, ``engine-proposal-persistence-s1``) is returned unchanged.
+    """
+    s = "".join(
+        "-" if (ch in "/\\:\x00" or ch.isspace() or ord(ch) < 32 or ord(ch) == 127) else ch
+        for ch in str(raw or "")
+    )
+    s = re.sub(r"-{2,}", "-", s)
+    s = s[:_SAFE_SLICE_MAX].strip("-._")
+    return s or "slice"
+
+
 def _infer_slice_from_ticket(ticket: str) -> str | None:
     """Pull a real slice id out of impl/gate/supervisor ticket names.
 
@@ -3186,17 +3229,16 @@ def _resolve_ask_slice_id(
     for raw in candidates:
         s = str(raw or "").strip()
         if s and s != "slice":
-            return s
+            return _safe_slice_id(s)
     for ticket in (ask.get("ticket"), frm.get("ticket")):
         inferred = _infer_slice_from_ticket(str(ticket or ""))
         if inferred:
-            return inferred
+            return _safe_slice_id(inferred)
     for raw in candidates:
         s = str(raw or "").strip()
         if s:
-            return s
-    fb = str(fallback or "").strip()
-    return fb or "slice"
+            return _safe_slice_id(s)
+    return _safe_slice_id(str(fallback or "").strip())
 
 
 def _misplaced_summary_roots() -> list[Path]:

@@ -102,6 +102,13 @@ def load_global_limits() -> dict:
             if isinstance(data, dict):
                 out = dict(DEFAULT_LIMITS)
                 out.update({k: data[k] for k in DEFAULT_LIMITS if k in data})
+                # Per-role tables are not part of DEFAULT_LIMITS; pass through
+                # only these two dict-valued keys (bad types are dropped) and
+                # keep ignoring every other unknown key.
+                for key in ("reasoning_effort_by_role", "step_budget_by_role"):
+                    table = data.get(key)
+                    if isinstance(table, dict):
+                        out[key] = dict(table)
                 return _migrate_legacy_prompt_wall(data, out)
         except (OSError, json.JSONDecodeError):
             pass
@@ -143,10 +150,10 @@ def max_concurrent_goals(limits: dict | None = None) -> int:
 
 # T6: per-role reasoning effort / step budget for spawned tickets. Both are
 # handed to the tool layer as env (DSH_REASONING_EFFORT / DSH_STEP_BUDGET).
-# NOTE: DeepSeek really only has low/high/max today — an emitted "medium" is
-# treated as "high" downstream, so this table saves nothing yet; to genuinely
-# lower a role's effort, change that role to "low".
-DEFAULT_REASONING_EFFORT_BY_ROLE = {"supervisor": "medium", "impl": "medium", "gate": "high"}
+# NOTE: DeepSeek really only has low/high/max today — "medium" is not a real
+# level and is treated as "high" downstream. So supervisor/impl default to
+# "low" to actually save effort, while gate stays at "high".
+DEFAULT_REASONING_EFFORT_BY_ROLE = {"supervisor": "low", "impl": "low", "gate": "high"}
 
 # Soft reminder only (>0 enables the plugin hint); never a hard kill.
 DEFAULT_STEP_BUDGET_BY_ROLE = {"supervisor": 30, "impl": 80, "gate": 60}

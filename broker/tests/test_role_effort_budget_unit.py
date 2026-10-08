@@ -8,6 +8,7 @@ Covers:
 """
 
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -27,9 +28,9 @@ T = tb.T
 # defaults / unknown role
 # ---------------------------------------------------------------------------
 def test_defaults_by_role():
-    assert T.role_reasoning_effort("supervisor", {}) == "medium"
+    assert T.role_reasoning_effort("supervisor", {}) == "low"
     assert T.role_step_budget("supervisor", {}) == 30
-    assert T.role_reasoning_effort("impl", {}) == "medium"
+    assert T.role_reasoning_effort("impl", {}) == "low"
     assert T.role_step_budget("impl", {}) == 80
     assert T.role_reasoning_effort("gate", {}) == "high"
     assert T.role_step_budget("gate", {}) == 60
@@ -43,8 +44,8 @@ def test_unknown_role_gets_nothing():
 
 def test_defaults_match_module_tables():
     assert T.DEFAULT_REASONING_EFFORT_BY_ROLE == {
-        "supervisor": "medium",
-        "impl": "medium",
+        "supervisor": "low",
+        "impl": "low",
         "gate": "high",
     }
     assert T.DEFAULT_STEP_BUDGET_BY_ROLE == {"supervisor": 30, "impl": 80, "gate": 60}
@@ -60,7 +61,7 @@ def test_limits_override_only_named_role_and_key():
     }
     assert T.role_reasoning_effort("impl", limits) == "low"
     assert T.role_reasoning_effort("gate", limits) == "high"  # untouched default
-    assert T.role_reasoning_effort("supervisor", limits) == "medium"
+    assert T.role_reasoning_effort("supervisor", limits) == "low"
     assert T.role_step_budget("gate", limits) == 40
     assert T.role_step_budget("impl", limits) == 80  # untouched default
     assert T.role_step_budget("supervisor", limits) == 30
@@ -72,7 +73,7 @@ def test_bad_step_budget_values_fall_back_to_zero():
         assert T.role_step_budget("impl", limits) == 0, bad
     # a non-dict table is ignored entirely
     assert T.role_step_budget("impl", {"step_budget_by_role": "nope"}) == 80
-    assert T.role_reasoning_effort("impl", {"reasoning_effort_by_role": 7}) == "medium"
+    assert T.role_reasoning_effort("impl", {"reasoning_effort_by_role": 7}) == "low"
 
 
 def test_blank_effort_override_yields_none():
@@ -90,11 +91,11 @@ def test_spawn_env_gate_sets_high_and_60(monkeypatch):
     assert env["DSH_STEP_BUDGET"] == "60"
 
 
-def test_spawn_env_impl_sets_medium_and_80(monkeypatch):
+def test_spawn_env_impl_sets_low_and_80(monkeypatch):
     monkeypatch.setattr(T, "load_global_limits", lambda: {})
     env = tb._spawn_env("impl", ticket="impl-t6-r1")
     assert env["DSH_TICKET"] == "impl-t6-r1"
-    assert env["DSH_REASONING_EFFORT"] == "medium"
+    assert env["DSH_REASONING_EFFORT"] == "low"
     assert env["DSH_STEP_BUDGET"] == "80"
 
 
@@ -123,7 +124,7 @@ def test_spawn_env_unknown_role_clears_inherited(monkeypatch):
 def test_spawn_env_supervisor_defaults(monkeypatch):
     monkeypatch.setattr(T, "load_global_limits", lambda: {})
     env = tb._spawn_env("supervisor")
-    assert env["DSH_REASONING_EFFORT"] == "medium"
+    assert env["DSH_REASONING_EFFORT"] == "low"
     assert env["DSH_STEP_BUDGET"] == "30"
 
 
@@ -132,3 +133,41 @@ def test_load_global_limits_never_raises_on_missing_file(monkeypatch, tmp_path):
     monkeypatch.setattr(T, "LIMITS_PATH", tmp_path / "absent.json")
     assert T.role_reasoning_effort("gate") == "high"
     assert T.role_step_budget("gate") == 60
+
+
+# ---------------------------------------------------------------------------
+# load_global_limits: per-role tables survive the DEFAULT_LIMITS allow-list
+# ---------------------------------------------------------------------------
+def test_load_global_limits_keeps_role_tables(monkeypatch, tmp_path):
+    path = tmp_path / "limits.json"
+    path.write_text(
+        json.dumps(
+            {
+                "reasoning_effort_by_role": {"impl": "high"},
+                "step_budget_by_role": {"impl": 12},
+                "some_unknown_key": "still dropped",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(T, "LIMITS_PATH", path)
+    limits = T.load_global_limits()
+    assert limits["reasoning_effort_by_role"] == {"impl": "high"}
+    assert limits["step_budget_by_role"] == {"impl": 12}
+    assert "some_unknown_key" not in limits
+    assert T.role_reasoning_effort("impl", limits) == "high"
+    assert T.role_step_budget("impl", limits) == 12
+
+
+def test_load_global_limits_drops_non_dict_role_tables(monkeypatch, tmp_path):
+    path = tmp_path / "limits.json"
+    path.write_text(
+        json.dumps({"reasoning_effort_by_role": 7, "step_budget_by_role": "nope"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(T, "LIMITS_PATH", path)
+    limits = T.load_global_limits()
+    assert "reasoning_effort_by_role" not in limits
+    assert "step_budget_by_role" not in limits
+    assert T.role_reasoning_effort("impl", limits) == "low"
+    assert T.role_step_budget("impl", limits) == 80

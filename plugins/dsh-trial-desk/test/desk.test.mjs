@@ -346,3 +346,19 @@ test('dropJob without cwd fails validate and writes nothing', async () => {
     await rm(tmp, { recursive: true, force: true })
   }
 })
+
+test('apply tolerates null config (cordis.patch.yml `config:` with only comments)', () => {
+  const registered = []
+  apply(
+    { tools: { register: (t) => registered.push(t.name) }, logger: { info() {} } },
+    null,
+  )
+  assert.equal(registered.length, 4)
+  const cfg = normalizeConfig(null, { dshHome: '/tmp/desk-null', env: { ...ISOLATED_ENV } })
+  assert.equal(cfg.inboxRoot, join('/tmp/desk-null', 'supervisor', 'trial', 'inbox'))
+})
+
+test('bundle cordis.patch.yml gives trial-desk an object config', async () => {
+  const yml = await readFile(join(HERE, '..', 'cordis.patch.yml'), 'utf8')
+  assert.match(yml, /^\s+config: \{\}\s*$/m)
+})

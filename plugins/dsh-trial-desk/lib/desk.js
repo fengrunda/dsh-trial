@@ -91,7 +91,8 @@ function requirePositiveInt(n, label, fallback) {
  * @param {Record<string, unknown>} [config]
  * @param {{ dshHome?: string, home?: string, env?: NodeJS.ProcessEnv }} [opts]
  */
-export function normalizeConfig(config = {}, opts = {}) {
+export function normalizeConfig(config, opts = {}) {
+  config ??= {}
   const env = opts.env ?? config.env ?? process.env
   const dshHome = resolveDshHome({
     dshHome: config.dshHome ?? opts.dshHome,

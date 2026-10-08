@@ -31,8 +31,9 @@ export const inject = ['tools']
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {Record<string, unknown>} [config]
  */
-export function apply(ctx, config = {}) {
-  const cfg = normalizeConfig(config)
+export function apply(ctx, config) {
+  // `config:` with only commented keys in cordis.patch.yml composes to null.
+  const cfg = normalizeConfig(config ?? {})
   const tools = [
     createDropJobToolOptions(cfg),
     createValidateJobToolOptions(cfg),

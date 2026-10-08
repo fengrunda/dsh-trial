@@ -6,7 +6,7 @@
 - insert:
     - id: trial-desk
       name: dsh-trial-desk
-      config:
+      config: {}
         # Absolute, or relative to $DSH_HOME (default ~/.dsh when unset)
         # dshHome:            # default: $DSH_HOME or $DSH_GLOBAL_HOME or ~/.dsh
         # inboxRoot:          # default: $DSH_HOME/supervisor/trial/inbox

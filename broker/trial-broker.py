@@ -95,8 +95,10 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 from zoneinfo import ZoneInfo
 import threading
 import trial_lib as T
@@ -137,6 +139,10 @@ HEARTBEAT = Path(
 )
 OFFLOAD_GC = DSH_HOME / "bin" / "dsh-offload-gc.py"
 _LAST_OFFLOAD_GC_TS = 0.0
+# T1: several threads (main loop + one mailbox watcher per running slice) touch
+# the heartbeat file and the offload-GC timestamp concurrently.
+_HEARTBEAT_LOCK = threading.Lock()
+_OFFLOAD_GC_LOCK = threading.Lock()
 
 # Pack / diff caps (align with dsh-design-pack default 12288)
 MAX_PACK_BYTES = int(os.environ.get("TRIAL_MAX_PACK_BYTES", "12288"))
@@ -164,6 +170,343 @@ def _stamp() -> str:
     return _now().strftime("%Y%m%d-%H%M%S")
 
 
+# ---------------------------------------------------------------------------
+# T1 concurrency prerequisites: per-thread Goal/slot context, the active-Goal
+# registry, slot-isolated role homes and goal-tagged logging.
+#
+# T2 (scheduler: dispatch / queue / restart-resume / drain) builds on these;
+# this ticket only wires them in while the broker main loop stays serial.
+# ---------------------------------------------------------------------------
+SLOT_HOMES_ENV = "DSH_TRIAL_SLOT_HOMES_ROOT"
+# Default ~/.dsh-homes/trial-slots, derived from HOMES_ROOT so a test that
+# points DSH_HOMES_ROOT at a tmp tree stays fully isolated.
+SLOT_HOMES_ROOT = Path(os.environ.get(SLOT_HOMES_ENV) or (HOMES_ROOT / "trial-slots"))
+SLOT_ROLES = ("impl", "gate", "supervisor")
+
+_CTX = threading.local()
+
+
+def current_goal_id() -> str | None:
+    """Goal id bound to the calling thread (None in legacy single-ticket mode)."""
+    gid = getattr(_CTX, "goal", None)
+    return str(gid) if gid else None
+
+
+def current_slot() -> int | None:
+    """Slot number bound to the calling thread (None = legacy shared homes)."""
+    slot = getattr(_CTX, "slot", None)
+    if slot is None:
+        return None
+    try:
+        return int(slot)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_slot(slot: int | None = None, job: dict | None = None) -> int | None:
+    """Explicit slot > ``job["slot"]`` > thread context > None (legacy behaviour).
+
+    ``None`` means "do not set DSH_HOMES_ROOT": the old single-Goal layout.
+    """
+    if slot is None and isinstance(job, dict):
+        slot = job.get("slot")
+    if slot is None:
+        return current_slot()
+    try:
+        return int(slot)
+    except (TypeError, ValueError):
+        return None
+
+
+@contextmanager
+def goal_context(goal_id: str | None = None, slot: int | None = None) -> Iterator[None]:
+    """Bind ``(goal, slot)`` to the current thread; nested scopes inherit.
+
+    A child thread does *not* inherit thread-local state automatically, so
+    callers that start helper threads (mailbox watcher) re-enter this context
+    from the captured parent values.
+    """
+    prev = (getattr(_CTX, "goal", None), getattr(_CTX, "slot", None))
+    _CTX.goal = str(goal_id) if goal_id else None
+    if slot is not None:
+        _CTX.slot = resolve_slot(slot)
+    try:
+        yield
+    finally:
+        _CTX.goal, _CTX.slot = prev
+
+
+# goal_id -> {slot, cwd, ticket, started_at, phase, slices, current_slice}
+_ACTIVE_GOALS_LOCK = threading.RLock()
+ACTIVE_GOALS: dict[str, dict] = {}
+
+
+def register_active_goal(
+    goal_id: str,
+    *,
+    slot: int | None = None,
+    cwd: str | None = None,
+    ticket: str | None = None,
+    phase: str = "running",
+    slices: list[str] | None = None,
+    current_slice: str | None = None,
+) -> dict:
+    """Mark a Goal as live (idempotent; keeps the original ``started_at``)."""
+    gid = str(goal_id or "")
+    if not gid:
+        return {}
+    rec = {
+        "slot": resolve_slot(slot),
+        "cwd": str(cwd or ""),
+        "ticket": str(ticket or ""),
+        "started_at": _iso(),
+        "phase": str(phase or "running"),
+        "slices": [str(s) for s in (slices or [])],
+        "current_slice": str(current_slice or ""),
+    }
+    with _ACTIVE_GOALS_LOCK:
+        prev = ACTIVE_GOALS.get(gid) or {}
+        if prev.get("started_at"):
+            rec["started_at"] = prev["started_at"]
+        ACTIVE_GOALS[gid] = rec
+    print(
+        f"[trial-broker] active goal registered goal={gid} slot={rec['slot']} phase={rec['phase']}",
+        flush=True,
+    )
+    return dict(rec)
+
+
+def unregister_active_goal(goal_id: str) -> None:
+    gid = str(goal_id or "")
+    with _ACTIVE_GOALS_LOCK:
+        ACTIVE_GOALS.pop(gid, None)
+
+
+def update_active_goal(goal_id: str, **fields) -> dict | None:
+    """Patch a live Goal record (no-op + None when it is not registered)."""
+    gid = str(goal_id or "")
+    with _ACTIVE_GOALS_LOCK:
+        rec = ACTIVE_GOALS.get(gid)
+        if rec is None:
+            return None
+        rec.update(fields)
+        return dict(rec)
+
+
+def active_goals_snapshot() -> list[dict]:
+    """Copy of the registry, shaped for the heartbeat (per-Goal slot rows)."""
+    with _ACTIVE_GOALS_LOCK:
+        items = sorted(ACTIVE_GOALS.items())
+        return [
+            {
+                "slot": rec.get("slot"),
+                "goal": gid,
+                "cwd": rec.get("cwd"),
+                "ticket": rec.get("ticket"),
+                "phase": rec.get("phase"),
+                "started_at": rec.get("started_at"),
+                "slices": list(rec.get("slices") or []),
+                "current_slice": rec.get("current_slice") or "",
+            }
+            for gid, rec in items
+        ]
+
+
+def active_goal_count() -> int:
+    with _ACTIVE_GOALS_LOCK:
+        return len(ACTIVE_GOALS)
+
+
+@contextmanager
+def active_goal_scope(
+    goal_id: str,
+    *,
+    slot: int | None = None,
+    cwd: str | None = None,
+    ticket: str | None = None,
+    phase: str = "running",
+) -> Iterator[None]:
+    """Register the Goal for this job and unregister it only if we registered it.
+
+    Keeps a nested/overlapping goal-update job from dropping a Goal that its own
+    plan job still owns.
+    """
+    gid = str(goal_id or "")
+    owner = False
+    if gid:
+        with _ACTIVE_GOALS_LOCK:
+            owner = gid not in ACTIVE_GOALS
+        if owner:
+            register_active_goal(gid, slot=slot, cwd=cwd, ticket=ticket, phase=phase)
+    try:
+        yield
+    finally:
+        if owner:
+            unregister_active_goal(gid)
+
+
+_orig_print = print
+
+
+def goal_log_prefix() -> str:
+    """``[trial-broker][goal=<id|->][slot=<n|->]`` for the active thread context."""
+    slot = current_slot()
+    return f"[trial-broker][goal={current_goal_id() or '-'}][slot={slot if slot is not None else '-'}]"
+
+
+def print(*args, **kwargs):  # noqa: A001 - module-scoped logging wrapper (T1)
+    """Every broker log line carries ``goal=<id|->`` and ``slot=<n|->``.
+
+    ``print(..., file=...)`` (stderr / pid-file style output) bypasses the
+    wrapper untouched, so machine-readable or goal-less output is never
+    rewritten. Lines already starting with ``[trial-broker]`` get the context
+    inserted right after that prefix; any other line is prefixed wholesale.
+    """
+    if kwargs.get("file") is not None:
+        return _orig_print(*args, **kwargs)
+    prefix = goal_log_prefix()
+    if args and isinstance(args[0], str) and args[0].startswith("[trial-broker]"):
+        args = (prefix + args[0][len("[trial-broker]"):],) + tuple(args[1:])
+    else:
+        args = (prefix,) + tuple(args)
+    return _orig_print(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Slot-isolated role homes
+# ---------------------------------------------------------------------------
+def slot_homes_root(slot: int | None = None) -> Path:
+    """``$DSH_TRIAL_SLOT_HOMES_ROOT`` (default ``~/.dsh-homes/trial-slots``).
+
+    With ``slot`` given the per-slot root ``<root>/slot-<n>`` is returned. The
+    env var is read per call so tests can monkeypatch the root to a tmp dir.
+    """
+    base = Path(os.environ.get(SLOT_HOMES_ENV) or SLOT_HOMES_ROOT)
+    if slot is None:
+        return base
+    return base / f"slot-{int(slot)}"
+
+
+def slot_role_home(slot: int, role: str) -> Path:
+    return slot_homes_root(slot) / str(role)
+
+
+def slot_home_dirs() -> list[Path]:
+    """Existing ``slot-<n>`` roots, ordered by slot number (best effort)."""
+    base = slot_homes_root()
+    try:
+        if not base.is_dir():
+            return []
+    except OSError:
+        return []
+    found: list[tuple[int, Path]] = []
+    for p in base.glob("slot-*"):
+        try:
+            if not p.is_dir():
+                continue
+        except OSError:
+            continue
+        try:
+            num = int(p.name.split("-", 1)[1])
+        except (IndexError, ValueError):
+            num = 0
+        found.append((num, p))
+    found.sort(key=lambda t: (t[0], t[1].name))
+    return [p for _, p in found]
+
+
+def _ensure_symlink(link: Path, target: Path) -> bool:
+    """Idempotently point ``link`` at ``target``; never clobber real content.
+
+    An existing *correct* symlink is left untouched, an existing real
+    file/directory is never deleted or rewritten, and a stale symlink (wrong
+    target, no real content of its own) is re-pointed.
+    """
+    try:
+        if link.is_symlink():
+            try:
+                if link.resolve() == target.resolve():
+                    return True
+            except OSError:
+                pass
+            link.unlink()
+        elif link.exists():
+            return False  # real file/dir: keep it
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        return True
+    except OSError as e:
+        print(f"[trial-broker] WARN slot home symlink failed link={link} err={e}", flush=True)
+        return False
+
+
+def _role_profile_template(role: str) -> Path | None:
+    """Template ``profiles/`` for a slot role home.
+
+    The legacy role home ``HOMES_ROOT/<role>/profiles`` when it exists (it
+    carries ``node_modules`` plus the box's profile links), else the canonical
+    ``$DSH_HOME/profiles``.
+    """
+    for cand in (HOMES_ROOT / role / "profiles", DSH_HOME / "profiles"):
+        try:
+            if cand.is_dir():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def ensure_slot_homes(slot: int) -> Path:
+    """Idempotently materialise ``<slot root>/{impl,gate,supervisor}``.
+
+    Mirrors the legacy role-home layout while keeping the state that must not be
+    shared per slot: ``settings.yaml``/``.env``/``load-env.sh`` symlink to
+    ``$DSH_HOME``, ``profiles/*`` symlink to the template role home (real
+    directories such as ``node_modules`` are linked as-is),
+    ``supervisor/thin-state/{packs,summaries,chains,goals,index.json}`` symlink
+    to the canonical thin-state when present, and
+    ``sessions/``/``storages/``/``acp-tickets/``/``offload/`` stay real per-slot
+    directories — that is the isolation this buys.
+    """
+    root = slot_homes_root(int(slot))
+    canonical_ts = DSH_HOME / "supervisor" / "thin-state"
+    for role in SLOT_ROLES:
+        home = root / role
+        for name in ("sessions", "storages", "acp-tickets", "offload"):
+            (home / name).mkdir(parents=True, exist_ok=True)
+        for name in ("settings.yaml", ".env", "load-env.sh"):
+            src = DSH_HOME / name
+            try:
+                if src.exists():
+                    _ensure_symlink(home / name, src)
+            except OSError:
+                continue
+        template = _role_profile_template(role)
+        if template is not None:
+            profiles = home / "profiles"
+            profiles.mkdir(parents=True, exist_ok=True)
+            try:
+                entries = sorted(template.iterdir())
+            except OSError:
+                entries = []
+            for entry in entries:
+                try:
+                    target = entry.resolve()
+                except OSError:
+                    continue
+                _ensure_symlink(profiles / entry.name, target)
+        for name in ("packs", "summaries", "chains", "goals", "index.json"):
+            src = canonical_ts / name
+            try:
+                exists = src.exists()
+            except OSError:
+                exists = False
+            if exists:
+                (home / "supervisor" / "thin-state").mkdir(parents=True, exist_ok=True)
+                _ensure_symlink(home / "supervisor" / "thin-state" / name, src)
+    return root
+
+
 def _ensure_dirs() -> None:
     for d in (INBOX, OUTBOX, PROCESSING, FAILED, STATE_DIR, ARTIFACT_ROOT, CHAINS, PACKS, SUMMARIES, GOALS, MAILBOX):
         d.mkdir(parents=True, exist_ok=True)
@@ -174,6 +517,10 @@ def _write_heartbeat(pending: int = 0, *, extra: dict | None = None) -> None:
 
     Path: ``$TRIAL_BROKER_DIR/trial-broker.heartbeat.json`` (or
     ``$TRIAL_BROKER_HEARTBEAT``). Never raises.
+
+    T1: written under a lock via tmp+rename (several watcher threads write the
+    same file), and every beat carries the live ``slots`` snapshot plus
+    ``max_concurrent_goals`` so the T2 scheduler/watchdog can see who is running.
     """
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -186,10 +533,12 @@ def _write_heartbeat(pending: int = 0, *, extra: dict | None = None) -> None:
         }
         if extra:
             payload.update(extra)
-        HEARTBEAT.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-    except OSError:
+        # After `extra`: a watcher beat must never lose the slots it publishes.
+        payload["slots"] = active_goals_snapshot()
+        payload["max_concurrent_goals"] = T.max_concurrent_goals()
+        with _HEARTBEAT_LOCK:
+            _atomic_write_json(HEARTBEAT, payload)
+    except Exception:  # noqa: BLE001 - liveness must never take the broker down
         pass
 
 
@@ -590,16 +939,33 @@ def _quarantine_unexpected(path: Path, exc: Exception) -> None:
         )
 
 
+def all_role_homes(role: str | None = None) -> list[Path]:
+    """Every role home a ticket's session may live in.
+
+    Legacy ``$DSH_HOMES_ROOT/<role>`` homes first (unchanged precedence), then
+    each slot home ``<slot root>/slot-<n>/<role>``, then ``$DSH_HOME`` itself.
+    With slot isolation a ticket's session/ACP records are written under its
+    slot home, so every ticket→session lookup must search them all.
+    """
+    out: list[Path] = []
+    if role:
+        out.append(HOMES_ROOT / role)
+    for r in SLOT_ROLES:
+        h = HOMES_ROOT / r
+        if h not in out:
+            out.append(h)
+    for slot_root in slot_home_dirs():
+        for r in SLOT_ROLES:
+            h = slot_root / r
+            if h not in out:
+                out.append(h)
+    out.append(DSH_HOME)
+    return out
+
+
 def find_session(ticket: str, role: str | None) -> Path | None:
     candidates: list[Path] = []
-    role_homes: list[Path] = []
-    if role:
-        role_homes.append(HOMES_ROOT / role)
-    for r in ("impl", "gate", "supervisor"):
-        h = HOMES_ROOT / r
-        if h not in role_homes:
-            role_homes.append(h)
-    role_homes.append(DSH_HOME)
+    role_homes: list[Path] = all_role_homes(role)
 
     for home in role_homes:
         meta = home / "acp-tickets" / f"{ticket}.json"
@@ -669,7 +1035,7 @@ def find_session_from_log(log_path: Path) -> Path | None:
     if not m:
         return None
     sid = m.group(1)
-    for home in (HOMES_ROOT / "impl", HOMES_ROOT / "gate", HOMES_ROOT / "supervisor", DSH_HOME):
+    for home in all_role_homes():
         sessions = home / "sessions"
         if not sessions.is_dir():
             continue
@@ -765,6 +1131,8 @@ def _spawn_env(
     ticket: str | None = None,
     prompt_timeout_sec: int | None = None,
     prompt_idle_timeout_sec: int | None = None,
+    slot: int | None = None,
+    goal: str | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     if role:
@@ -800,9 +1168,123 @@ def _spawn_env(
         env["DSH_ACP_ASK"] = str(ask)
     if ticket:
         env["DSH_TICKET"] = str(ticket)
+    # Per-slot role home: open-slice.sh and dsh-acp-ask both select
+    # ``$DSH_HOMES_ROOT/<role>``, so one env var isolates sessions/ACP state.
+    # No slot (legacy single-Goal mode) leaves DSH_HOMES_ROOT untouched.
+    eff_slot = resolve_slot(slot)
+    if eff_slot is not None:
+        env["DSH_HOMES_ROOT"] = str(slot_homes_root(eff_slot))
+        env["DSH_TRIAL_SLOT"] = str(eff_slot)
+    gid = str(goal or current_goal_id() or "")
+    if gid:
+        env["DSH_TRIAL_GOAL"] = gid
     env.pop("NEW_API_KEY", None)
     _ = _redact_env(env)
     return env
+
+
+def goal_slice_ids(goal: dict | None) -> list[str]:
+    """Slice ids a Goal owns: ``current_slice`` plus planned/executed ``slices``."""
+    if not isinstance(goal, dict):
+        return []
+    out: list[str] = []
+
+    def _add(value) -> None:
+        sid = str(value or "").strip()
+        if sid and sid not in out:
+            out.append(sid)
+
+    _add(goal.get("current_slice"))
+    raw = goal.get("slices")
+    if isinstance(raw, dict):
+        raw = list(raw.keys())
+    if isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            if isinstance(item, dict):
+                _add(item.get("slice") or item.get("id"))
+            else:
+                _add(item)
+    return out
+
+
+def _slice_mentioned(slice_id: str, text: str) -> bool:
+    """Whole-token containment so slice ``s1`` does not match ``s10``."""
+    if not slice_id or not text:
+        return False
+    try:
+        return re.search(rf"(?<![0-9A-Za-z]){re.escape(slice_id)}(?![0-9A-Za-z])", text) is not None
+    except re.error:  # pragma: no cover - re.escape output is always valid
+        return slice_id in text
+
+
+def ask_belongs_to(ask: dict, *, ticket: str | None, goal: dict | None) -> bool:
+    """Pure ownership test: does this mailbox ask belong to ``(ticket, goal)``?
+
+    True when the ask names our ticket, when ``ask.slice`` is one of the goal's
+    slices (or its ``current_slice``), or when the ask ticket mentions one of
+    the goal's slice ids (``impl-trial-<slice>-r1``,
+    ``gate-trial-<slice>-rev2``, ``supervisor-answer-<slice>-ask1``).
+    """
+    if not isinstance(ask, dict):
+        return False
+    ask_ticket = str(ask.get("ticket") or "").strip()
+    ask_slice = str(ask.get("slice") or "").strip()
+    own_ticket = str(ticket or "").strip()
+    if own_ticket and ask_ticket and ask_ticket == own_ticket:
+        return True
+    goal_id = str((goal or {}).get("goal") or "").strip() if isinstance(goal, dict) else ""
+    slices = goal_slice_ids(goal)
+    if not slices and not goal_id:
+        return False
+    if ask_slice and ask_slice in slices:
+        return True
+    for sid in slices:
+        if _slice_mentioned(sid, ask_ticket) or _slice_mentioned(sid, ask_slice):
+            return True
+    return bool(goal_id and _slice_mentioned(goal_id, ask_ticket))
+
+
+def _ask_owned_by_other_active_goal(ask: dict, *, goal_id: str | None) -> bool:
+    mine = str(goal_id or "")
+    for rec in active_goals_snapshot():
+        gid = str(rec.get("goal") or "")
+        if not gid or gid == mine:
+            continue
+        other = {
+            "goal": gid,
+            "slices": list(rec.get("slices") or []),
+            "current_slice": rec.get("current_slice") or "",
+        }
+        if ask_belongs_to(ask, ticket=str(rec.get("ticket") or ""), goal=other):
+            return True
+    return False
+
+
+def ask_disposition(ask: dict, *, ticket: str | None, goal: dict | None) -> str:
+    """``"mine"`` | ``"other"`` | ``"orphan"`` for one pending ask (T1 routing)."""
+    if ask_belongs_to(ask, ticket=ticket, goal=goal):
+        return "mine"
+    gid = str((goal or {}).get("goal") or "") if isinstance(goal, dict) else ""
+    if _ask_owned_by_other_active_goal(ask, goal_id=gid):
+        return "other"
+    return "orphan"
+
+
+def watch_should_handle_ask(ask: dict, *, ticket: str | None, goal: dict | None) -> bool:
+    """Watcher-side ownership gate for :func:`_handle_pending_ask_file`.
+
+    Our own asks are always handled. An ask claimed by *another* active Goal is
+    left for its owner (concurrent Goals must not steal each other's
+    supervisor/gate asks). An orphan ask — one no active Goal claims — keeps the
+    old "handle everything" behaviour only while a single Goal (or a legacy
+    no-Goal ticket) is in flight.
+    """
+    disposition = ask_disposition(ask, ticket=ticket, goal=goal)
+    if disposition == "mine":
+        return True
+    if disposition == "other":
+        return False
+    return active_goal_count() <= 1
 
 
 def _handle_pending_ask_file(path: Path, *, default_profile: str, cwd: str, goal: dict | None) -> None:
@@ -1393,8 +1875,15 @@ def run_open_slice(
     log_path: Path,
     goal: dict | None = None,
     watch_mailbox: bool | None = None,
+    slot: int | None = None,
 ) -> int:
     profile = T.map_profile(profile)
+    # Slot: explicit arg > goal["slot"] > this thread's goal_context > None
+    # (legacy shared role homes, i.e. DSH_HOMES_ROOT is left alone).
+    goal_slot = (goal or {}).get("slot") if isinstance(goal, dict) else None
+    eff_slot = resolve_slot(slot if slot is not None else goal_slot)
+    if eff_slot is not None:
+        ensure_slot_homes(eff_slot)
     cmd = [
         str(OPEN_SLICE),
         "--ticket", ticket,
@@ -1415,6 +1904,8 @@ def run_open_slice(
         prompt_idle_timeout_sec=int(
             lim.get("prompt_idle_timeout_sec") or T.DEFAULT_LIMITS["prompt_idle_timeout_sec"]
         ),
+        slot=eff_slot,
+        goal=str((goal or {}).get("goal") or current_goal_id() or ""),
     )
     # Job timeout must exceed the prompt hard cap. A fixed 2400s backstop
     # used to cut the slice before a still-working agent finished.
@@ -1422,7 +1913,8 @@ def run_open_slice(
     job_timeout = gate_job_timeout_sec(lim)
     print(
         f"[trial-broker] spawn open-slice ticket={ticket} pack={pack_name} "
-        f"profile={profile} role={role} mode={prompt_mode} job_timeout={job_timeout}",
+        f"profile={profile} role={role} mode={prompt_mode} "
+        f"slot={eff_slot if eff_slot is not None else '-'} job_timeout={job_timeout}",
         flush=True,
     )
     if watch_mailbox is None:
@@ -1434,20 +1926,37 @@ def run_open_slice(
         # 插件侧同步等待超时须 ≥ 工具 timeoutSec ≤ ask_supervisor_timeout_sec；
         # ACP prompt：空闲 DSH_ACP_PROMPT_IDLE_TIMEOUT（默认 900，须 > ask 等待）有进展就重置；
         # 硬上限 DSH_ACP_PROMPT_TIMEOUT / prompt_timeout_sec（默认 3600）到点仍收口。
+        # A new thread does not inherit thread-local state: capture the parent
+        # (goal, slot) here and re-enter it inside the watcher, otherwise the
+        # logs and the ask-ownership filter would lose the Goal.
+        watch_goal = str((goal or {}).get("goal") or current_goal_id() or "") or None
+        watch_slot = eff_slot if eff_slot is not None else current_slot()
+
         def _watch():
-            while not stop.is_set():
-                _write_heartbeat(1)
-                for ap in T.list_pending_asks(MAILBOX):
-                    try:
-                        _handle_pending_ask_file(
-                            ap,
-                            default_profile=str((goal or {}).get("supervisor_profile") or "acp-lite"),
-                            cwd=cwd,
-                            goal=goal,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[trial-broker] mailbox watch error: {e}", flush=True)
-                stop.wait(2.0)
+            with goal_context(watch_goal, watch_slot):
+                while not stop.is_set():
+                    _write_heartbeat(1)
+                    for ap in T.list_pending_asks(MAILBOX):
+                        try:
+                            ask = T.load_ask(ap)
+                        except (OSError, json.JSONDecodeError) as e:
+                            print(f"[trial-broker] bad ask file {ap}: {e}", flush=True)
+                            continue
+                        # Ownership gate: with concurrent Goals each watcher only
+                        # serves its own asks; orphans keep the legacy behaviour.
+                        if not watch_should_handle_ask(ask, ticket=ticket, goal=goal):
+                            continue
+                        try:
+                            _handle_pending_ask_file(
+                                ap,
+                                default_profile=str((goal or {}).get("supervisor_profile") or "acp-lite"),
+                                cwd=cwd,
+                                goal=goal,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[trial-broker] mailbox watch error: {e}", flush=True)
+                    stop.wait(2.0)
+
         watcher = threading.Thread(target=_watch, name="mailbox-watch", daemon=True)
         watcher.start()
     try:
@@ -1535,7 +2044,8 @@ def _write_chain(state: dict) -> Path:
     slice_id = state["slice"]
     p = CHAINS / f"{slice_id}.json"
     state["updated_at"] = _iso()
-    p.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+    # tmp+rename: concurrent readers (and a second Goal) never see a half file.
+    _atomic_write_json(p, state)
     return p
 
 
@@ -2101,10 +2611,15 @@ def maybe_offload_gc(*, force: bool = False) -> dict | None:
     """Run offload GC at most once per hour (or force after a job)."""
     global _LAST_OFFLOAD_GC_TS
     now = time.time()
-    if not force and (now - _LAST_OFFLOAD_GC_TS) < 3600:
-        return None
+    # Check-and-claim under the lock: with concurrent Goals two threads must not
+    # both decide the hour is up (nor double-run the GC).
+    with _OFFLOAD_GC_LOCK:
+        if not force and (now - _LAST_OFFLOAD_GC_TS) < 3600:
+            return None
     if not OFFLOAD_GC.is_file():
         return {"skipped": True, "reason": "missing gc script"}
+    with _OFFLOAD_GC_LOCK:
+        _LAST_OFFLOAD_GC_TS = now
     try:
         cp = subprocess.run(
             [sys.executable, str(OFFLOAD_GC), "--days", os.environ.get("DSH_OFFLOAD_GC_DAYS", "3")],
@@ -2112,7 +2627,6 @@ def maybe_offload_gc(*, force: bool = False) -> dict | None:
             text=True,
             timeout=60,
         )
-        _LAST_OFFLOAD_GC_TS = now
         return {
             "rc": cp.returncode,
             "detail": (cp.stdout or cp.stderr or "")[-400:],
@@ -2214,7 +2728,8 @@ def _write_goal(state: dict) -> Path:
     goal_id = state["goal"]
     path = GOALS / f"{goal_id}.json"
     state["updated_at"] = _iso()
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+    # tmp+rename: the watcher threads and the main loop both read Goal state.
+    _atomic_write_json(path, state)
     return path
 
 
@@ -2828,6 +3343,7 @@ def run_supervisor_ticket(
     summary_name: str,
     prompt_mode: str,
     goal: dict | None = None,
+    slot: int | None = None,
 ) -> tuple[int, dict, Path]:
     """Open one supervisor short ticket; return (exit, artifacts, summary_path)."""
     log_path = ARTIFACT_ROOT / f"{ticket}.log"
@@ -2842,6 +3358,7 @@ def run_supervisor_ticket(
         log_path=log_path,
         goal=goal,
         watch_mailbox=False,
+        slot=slot,
     )
     summary_path = SUMMARIES / f"{summary_name}.md"
     art = write_artifacts(
@@ -3724,6 +4241,7 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
             log_path=impl_log,
             goal=goal_obj,
             watch_mailbox=True,
+            slot=resolve_slot(job=job),
         )
         # Agents sometimes write the summary under ~/.dsh-supervisor/...
         # (glued path). Adopt into canonical SUMMARIES before missing-check.
@@ -4089,6 +4607,7 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
             log_path=gate_log,
             goal=goal_obj,
             watch_mailbox=False,
+            slot=resolve_slot(job=job),
         )
         _adopt_misplaced_summary(gate_summary)
         gate_art = write_artifacts(
@@ -4240,13 +4759,65 @@ def run_chain_rounds(job: dict, chain: dict, dest: Path, *, start_round: int, st
 
 
 
-def _normalize_goal_slices(block: dict, job: dict, goal_id: str) -> list[dict]:
+def _slice_owned_by_other_goal(slice_id: str, goal_id: str) -> bool:
+    """True when *another* Goal already owns this slice id.
+
+    Collision sources (T1): an existing ``chains/<slice>.json`` whose ``goal``
+    field is not ours, or a live registry entry of another Goal listing the id
+    in its slices / current_slice. Slice ids are picked by the supervisor plan,
+    so two concurrent Goals can and do choose the same name.
+    """
+    sid = str(slice_id or "")
+    if not sid:
+        return False
+    mine = str(goal_id or "")
+    chain = _read_chain(sid)
+    if isinstance(chain, dict) and str(chain.get("goal") or "") != mine:
+        return True
+    for rec in active_goals_snapshot():
+        gid = str(rec.get("goal") or "")
+        if not gid or gid == mine:
+            continue
+        owned = [str(s) for s in (rec.get("slices") or [])]
+        if rec.get("current_slice"):
+            owned.append(str(rec["current_slice"]))
+        if sid in owned:
+            return True
+    return False
+
+
+def _rename_slice_pack(old_slice: str, old_pack: str, new_slice: str) -> str:
+    """Copy the slice pack to ``<new_slice>.pack.md`` and return that new name.
+
+    The original pack file is left in place (other Goals/slices may still use it).
+    """
+    new_name = f"{new_slice}.pack.md"
+    src = PACKS / Path(str(old_pack or "")).name if old_pack else None
+    if src is None or not src.is_file():
+        src = PACKS / f"{old_slice}.pack.md"
+    try:
+        if src.is_file():
+            PACKS.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, PACKS / new_name)
+    except OSError as e:
+        print(f"[trial-broker] WARN renamed-slice pack copy failed {src}: {e}", flush=True)
+    return new_name
+
+
+def _normalize_goal_slices(
+    block: dict, job: dict, goal_id: str, goal_state: dict | None = None
+) -> list[dict]:
     """Plan machine block → ordered slice specs (new emit_chains + legacy emit_chain).
 
     New: ``action=emit_chains`` with a non-empty ``slices`` list of
     ``{slice, pack, acceptance}`` objects. Legacy: ``action=emit_chain`` with
     top-level slice/pack/acceptance (wrapped as a one-element list). Job hints
     are the final fallback so a malformed plan still yields a runnable slice.
+
+    T1 collision guard: a planned slice id already owned by another Goal is
+    renamed to ``<goal_id>--<slice>`` (and its pack copied to
+    ``<new>.pack.md``), recorded on ``goal_state["slice_renames"]``. With no
+    collision the result is byte-for-byte the old one.
     """
     raw = block.get("slices")
     specs: list[dict] = []
@@ -4284,6 +4855,30 @@ def _normalize_goal_slices(block: dict, job: dict, goal_id: str) -> list[dict]:
             continue
         seen.add(spec["slice"])
         out.append(spec)
+    renames: list[dict] = []
+    taken: set[str] = set()
+    for spec in out:
+        old_slice = str(spec["slice"])
+        if old_slice in taken or not _slice_owned_by_other_goal(old_slice, goal_id):
+            taken.add(old_slice)
+            continue
+        new_slice = f"{goal_id}--{old_slice}" if goal_id else old_slice
+        if new_slice == old_slice:
+            taken.add(old_slice)
+            continue
+        spec["pack"] = _rename_slice_pack(old_slice, str(spec.get("pack") or ""), new_slice)
+        spec["slice"] = new_slice
+        taken.add(new_slice)
+        renames.append({"from": old_slice, "to": new_slice, "pack": spec["pack"], "at": _iso()})
+        print(
+            f"[trial-broker] slice id collision: {old_slice} -> {new_slice} (owned by another goal)",
+            flush=True,
+        )
+    if renames and isinstance(goal_state, dict):
+        existing = [e for e in (goal_state.get("slice_renames") or []) if isinstance(e, dict)]
+        known = {str(e.get("from") or "") for e in existing}
+        existing.extend(r for r in renames if str(r.get("from") or "") not in known)
+        goal_state["slice_renames"] = existing
     return out
 
 
@@ -4485,6 +5080,26 @@ def _execute_goal_slices(
 
 
 def run_goal_job(path: Path, job: dict) -> int:
+    """Goal entry point: register the live Goal + bind its (goal, slot) context.
+
+    T1 prerequisite for concurrency — the registry drives the ask-ownership
+    filter, the heartbeat ``slots`` list and (T2) the scheduler. The Goal is
+    unregistered on every exit path, including exceptions.
+    """
+    goal_id = str(job.get("goal") or "")
+    slot = resolve_slot(job=job)
+    with active_goal_scope(
+        goal_id,
+        slot=slot,
+        cwd=str(job.get("cwd") or ""),
+        ticket=str(job.get("ticket") or ""),
+        phase="planning",
+    ):
+        with goal_context(goal_id, slot):
+            return _run_goal_job_body(path, job)
+
+
+def _run_goal_job_body(path: Path, job: dict) -> int:
     """Hub drops Goal → dsh supervisor plans pack → inline chain (+ auto answer/close)."""
     dest = PROCESSING / f"{_stamp()}-{path.name}"
     shutil.move(str(path), str(dest))
@@ -4552,7 +5167,13 @@ def run_goal_job(path: Path, job: dict) -> int:
         # soft: try to recover fields anyway
         print(f"[trial-broker] WARN plan action={action!r}, trying field recovery", flush=True)
 
-    slice_specs = _normalize_goal_slices(block, job, goal_id)
+    slice_specs = _normalize_goal_slices(block, job, goal_id, goal_state)
+    if goal_state.get("slice_renames"):
+        # Persist the rename map before any slice runs so a resume/other Goal
+        # sees which ids this Goal actually took.
+        _write_goal(goal_state)
+    plan_slice_ids = [str(s.get("slice") or "") for s in slice_specs]
+    update_active_goal(goal_id, slices=plan_slice_ids, phase="running")
 
     # Enforce max_slices (goal-update overrides > job > global default).
     limits = T.resolve_limits(job=job, goal=goal_state)
@@ -4915,6 +5536,7 @@ def run_ticket_job(path: Path, job: dict) -> int:
             prompt_mode="baseline" if round_n == 1 else "foreman",
             log_path=log_path,
             goal=goal_obj,
+            slot=resolve_slot(job=job),
         )
         result = write_artifacts(
             {**job, "ticket": ticket, "role": role},
@@ -5149,7 +5771,7 @@ def _slice_specs_from_plan(goal: dict) -> list[dict]:
     has_one = bool(str(block.get("slice") or "").strip())
     if not has_list and not has_one:
         return []
-    return _normalize_goal_slices(block, {}, str(goal.get("goal") or ""))
+    return _normalize_goal_slices(block, {}, str(goal.get("goal") or ""), goal)
 
 
 def _classify_failed_goal_resume(goal: dict) -> dict:
@@ -5385,7 +6007,25 @@ def run_goal_update_job(path: Path, job: dict) -> int:
     A failed goal resumes only when the failure is a salvageable missing
     summary with gate PASS. That slice is not re-run; the next planned
     slice is. Other failed goals are rejected.
+
+    T1: binds the same (goal, slot) context as the plan job, registering the
+    Goal only when nobody else owns it so an update against a live Goal cannot
+    unregister that Goal's record on exit.
     """
+    goal_id = str(job.get("goal") or job.get("id") or "")
+    slot = resolve_slot(job=job)
+    with active_goal_scope(
+        goal_id,
+        slot=slot,
+        cwd=str(job.get("cwd") or ""),
+        ticket=str(job.get("ticket") or ""),
+        phase="updated",
+    ):
+        with goal_context(goal_id, slot):
+            return _run_goal_update_job_body(path, job)
+
+
+def _run_goal_update_job_body(path: Path, job: dict) -> int:
     dest = PROCESSING / f"{_stamp()}-{path.name}"
     shutil.move(str(path), str(dest))
     goal_id = str(job.get("goal") or job.get("id"))

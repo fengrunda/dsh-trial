@@ -33,3 +33,15 @@
 
 ## 今日用量结论
 全天约 110M token / ¥19.7（官方高峰价）。约 61% token、56% 费用来自底座运维票，其余是 Hub Goal（约 40M / ¥8.4）。费用里输出加推理占 55%，未命中占 24%，命中只占 21%。审计数据在 /tmp/tokaudit/attrib-1008/。
+
+## dsh-i-have-adhd 试装（2026-10-09）
+- 来源：github.com/yongshuai0314/dsh-i-have-adhd @ 4dd11e9e80921739f6cddc1df08f3ca204c223fa（v1.0.2，MIT；概念源自 ayghri/i-have-adhd，THIRD-PARTY-NOTICES 已保留原 MIT 文本）。本地 /workspace/dsh-plugins-3p/dsh-i-have-adhd。
+- 审查：通过。无 dependencies、无 scripts（无 install/postinstall/prepare），无网络/子进程/eval/动态 require；只写 $DSH_HOME/dsh-i-have-adhd/always-on 标志文件。patch 只 insert 插件本身，不碰 llm-pi-ai.providers。注入文本是纯输出风格规则（约 570 token），没有可疑指令。
+- 安装：只装进新 profile ~/.dsh/profiles/acp-lite-trial-adhd（从 acp-lite-trial 复制，package.json 加 link 依赖和 bundle）。用 pnpm 10（/usr/bin/pnpm）`install --ignore-scripts --config.node-linker=isolated`。不要用 ~/.local/bin 的 pnpm 12：它按 hoisted 重装 peers，session/prompt 会报 -32603 "reading 'prepare'"。`--dump-config` 跟 acp-lite-trial 比只多插件这一项。默认关。其他 profile、broker、limits.json 都没动。
+- 缺陷：三个开关工具（adhd_on/off/status）在当前 dsh 上注册失败（output schema type:'json' 不被接受），所以会话里没有开关。目前唯一的开法是建标志文件 ~/.dsh/dsh-i-have-adhd/always-on，删掉即关。这个文件在共享的 DSH_HOME 下，对所有装了该插件的 profile 都生效（--role 会换 DSH_HOME）。
+- 实测（deepseek-flash，low，同一汇报票，3 步，0 报错）：每步 prompt token（未命中+命中）：基线 acp-lite-trial 5632/6076/6767，总 19086；关 5632/5907/6575，总 18685；开 6205/6330/7014，总 20136。
+  - 关：第 1 步跟基线完全一样，没有注入，每步零额外 token。
+  - 开：每步多约 573 token，3 步总量多约 1.45k（约 +8%）。第 1 步因为区段插在 persona 后面、改了前缀，缓存全部未命中（0/6205）；后续步正常命中。
+- 效果：关的时候第 1 行是「「待办 / 待观察」5 行总结：」，接 1–5 编号，没有客套话。开的时候第 1 行是加粗结论「待办 7 条…最高优先级是第 1 条」，编号到 7 条，超了 5 行的要求；结尾多了「下一步（2 分钟内可做）…」和一句「想问一句吗：要不要我…分类？」。所以开了以后更长，还会盖过用户的格式要求。
+- 建议：默认关。只给汇报/摘要类角色试用（例如监理的 close/汇报），不给 impl 和 gate。插件没修好工具注册之前，不建议推到其他 profile。
+- 回退：删掉 ~/.dsh/profiles/acp-lite-trial-adhd 和 ~/.dsh/dsh-i-have-adhd/ 即可，其他 profile 没受影响。

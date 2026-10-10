@@ -20,7 +20,7 @@
 1. Hub 下一个真实 Goal 上核对：gate 每轮只派一次；票日志 reasoning_effort 为 low/low/high；压缩时有 contextClear 生效记录；两 Goal 并发。
 2. review 路径同一份代码重复提交仍会再审（账本只用于 chain 路径去重）。
 3. token 记账：监理 plan/close 未计入；指标用 peak×steps，应改实际累加。
-4. live 引擎切 d0a466c：等用户解冻；重启须带 /home/box/.local/state/memagent/graphiti-dashscope.env 三项。
+4. live 引擎已切 f31aa11（2026-10-10 19:10 CST）：旧 1db2fb4 → 新 f31aa112d9cccac12e3e5efe2ffa89a53dd9d3c4（= origin/main tip，含 G2/f31aa11）；health `{"status":"ok","redis":"pong"}`；127.0.0.1:8000 pid 1350979；OpenAPI 已有 /v1/gate/{check,decisions,commit,outcome}；经 khub-engine-with-llm-env（llm.env 含 Graphiti 三项，与 graphiti-dashscope.env 的 BASE_URL/MODEL 一致）。
 5. FYI：gate idle 超时、watchdog 误报 stalled。
 6. 遗留 worktree：wt-conc / wt-dedup / wt-limits / wt-notify 已合入，可删。mailbox 孤儿 ask t3c-gate-1 待归档；hub-logic goal review_seq 已到 55。
 7. web profile 的 desk 已修好（555578a），dsh web 当前未运行。
@@ -45,3 +45,4 @@
 - 效果：关的时候第 1 行是「「待办 / 待观察」5 行总结：」，接 1–5 编号，没有客套话。开的时候第 1 行是加粗结论「待办 7 条…最高优先级是第 1 条」，编号到 7 条，超了 5 行的要求；结尾多了「下一步（2 分钟内可做）…」和一句「想问一句吗：要不要我…分类？」。所以开了以后更长，还会盖过用户的格式要求。
 - 建议：默认关。只给汇报/摘要类角色试用（例如监理的 close/汇报），不给 impl 和 gate。插件没修好工具注册之前，不建议推到其他 profile。
 - 回退：删掉 ~/.dsh/profiles/acp-lite-trial-adhd 和 ~/.dsh/dsh-i-have-adhd/ 即可，其他 profile 没受影响。
+- Runda 拍板（经 Grok Bot 2026-10-10）：默认关；开关工具修好前不扩到其他 profile；现有 acp-lite-trial-adhd 留作回退参考，不推。

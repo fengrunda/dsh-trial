@@ -46,3 +46,14 @@
 - 建议：默认关。只给汇报/摘要类角色试用（例如监理的 close/汇报），不给 impl 和 gate。插件没修好工具注册之前，不建议推到其他 profile。
 - 回退：删掉 ~/.dsh/profiles/acp-lite-trial-adhd 和 ~/.dsh/dsh-i-have-adhd/ 即可，其他 profile 没受影响。
 - Runda 拍板（经 Grok Bot 2026-10-10）：默认关；开关工具修好前不扩到其他 profile；现有 acp-lite-trial-adhd 留作回退参考，不推。
+
+## 宿主默认租户切换（2026-10-10 19:32 Asia/Shanghai）
+- Hub/读侧宿主闸门默认租户已切到 `host-jinyinhua-qa`（先切环境，G3 另开）。
+- 改动文件：`~/.dsh/profiles/acp-hub-read/engine.env`
+  - 变量：`KNOWLEDGE_HUB_ENGINE_TENANT_ID` / `KNOWLEDGE_HUB_ENGINE_USER_ID` → `host-jinyinhua-qa`
+  - 变量：`KNOWLEDGE_HUB_ENGINE_TOKEN` → 平台测试令牌模式 `platform-test-<tenant>`（指向 host-jinyinhua-qa）
+  - `KNOWLEDGE_HUB_ENGINE_BASE_URL` 仍为 `http://127.0.0.1:8000`
+  - 备份：`engine.env.bak-20261010-host-jinyinhua-qa`
+- 扫描：其它 profile / llm.env / khub 启动脚本无额外「宿主默认租户」硬编码需改；`khub-engine-restore-packs` 的 dsh-dev 设计包入口保留；产品 wire `DEV_SCOPE_PLACEHOLDER`/`HUB_BANK=dsh-dev` 仍为设计仓占位（G3 再开）。
+- 验证：health ok+redis pong；`GET /v1/packs?tenant_id=host-jinyinhua-qa` 见 concept+relation 各 1（dop.host-jinyinhua-qa.concepts@0.1.0 / relations@0.1.0）；引擎 tip f31aa11，:8000 在听；未 reseed / 未动 GraphStore / 未降版本；无依赖该 env 的长驻 Hub 读侧进程，未重启。
+

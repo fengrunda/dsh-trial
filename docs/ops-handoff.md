@@ -20,7 +20,7 @@
 1. Hub 下一个真实 Goal 上核对：gate 每轮只派一次；票日志 reasoning_effort 为 low/low/high；压缩时有 contextClear 生效记录；两 Goal 并发。
 2. review 路径同一份代码重复提交仍会再审（账本只用于 chain 路径去重）。
 3. token 记账：监理 plan/close 未计入；指标用 peak×steps，应改实际累加。
-4. live 引擎已切 f31aa11（2026-10-10 19:10 CST）：旧 1db2fb4 → 新 f31aa112d9cccac12e3e5efe2ffa89a53dd9d3c4（= origin/main tip，含 G2/f31aa11）；health `{"status":"ok","redis":"pong"}`；127.0.0.1:8000 pid 1350979；OpenAPI 已有 /v1/gate/{check,decisions,commit,outcome}；经 khub-engine-with-llm-env（llm.env 含 Graphiti 三项，与 graphiti-dashscope.env 的 BASE_URL/MODEL 一致）。
+4. live 引擎已切 0c8f01f（2026-10-10 21:15 CST）：旧 f31aa112d9cccac12e3e5efe2ffa89a53dd9d3c4 → 新 0c8f01fe78bcbf1c6fc7b2a7716bb9ff4eb56654（= origin/main tip，G3a 审批令牌 #156）；health `{"status":"ok","redis":"pong"}`；127.0.0.1:8000 pid 1368974；OpenAPI 已有 /v1/gate/approvals/{proposal_id}/{approve,reject}（集合路径无 list；POST 缺 body→400 / 其它方法→405）；经 khub-engine-with-llm-env（llm.env 含 Graphiti 三项）。租户仍 host-jinyinhua-qa；未 reseed / 未动 GraphStore。
 5. FYI：gate idle 超时、watchdog 误报 stalled。
 6. 遗留 worktree：wt-conc / wt-dedup / wt-limits / wt-notify 已合入，可删。mailbox 孤儿 ask t3c-gate-1 待归档；hub-logic goal review_seq 已到 55。
 7. web profile 的 desk 已修好（555578a），dsh web 当前未运行。
@@ -55,5 +55,5 @@
   - `KNOWLEDGE_HUB_ENGINE_BASE_URL` 仍为 `http://127.0.0.1:8000`
   - 备份：`engine.env.bak-20261010-host-jinyinhua-qa`
 - 扫描：其它 profile / llm.env / khub 启动脚本无额外「宿主默认租户」硬编码需改；`khub-engine-restore-packs` 的 dsh-dev 设计包入口保留；产品 wire `DEV_SCOPE_PLACEHOLDER`/`HUB_BANK=dsh-dev` 仍为设计仓占位（G3 再开）。
-- 验证：health ok+redis pong；`GET /v1/packs?tenant_id=host-jinyinhua-qa` 见 concept+relation 各 1（dop.host-jinyinhua-qa.concepts@0.1.0 / relations@0.1.0）；引擎 tip f31aa11，:8000 在听；未 reseed / 未动 GraphStore / 未降版本；无依赖该 env 的长驻 Hub 读侧进程，未重启。
+- 验证：health ok+redis pong；`GET /v1/packs?tenant_id=host-jinyinhua-qa` 见 concept+relation 各 1（dop.host-jinyinhua-qa.concepts@0.1.0 / relations@0.1.0）；引擎 tip 0c8f01f，:8000 在听；未 reseed / 未动 GraphStore / 未降版本；无依赖该 env 的长驻 Hub 读侧进程，未重启。
 

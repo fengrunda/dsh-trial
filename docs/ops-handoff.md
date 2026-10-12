@@ -13,6 +13,14 @@
 - 巡检 routine「dsh trial 底座」**已恢复**（工作日 10:35 / 14:35 / 18:35 Asia/Shanghai）。观察焦点：质量链路（gate 单派 / reasoning low·low·high / contextClear / 双 Goal 并发）+ token。
 
 
+## 运维笔记（2026-10-12 15:00 Asia/Shanghai）
+- **hub-read 回指 dsh-dev**：`~/.dsh/profiles/acp-hub-read/engine.env` TENANT/USER→`dsh-dev`，token 模式 `platform-test-dsh-dev`，BASE_URL 仍 `http://127.0.0.1:8000`。备份 `engine.env.bak-20261012-145929-host-jinyinhua-qa`。
+- **trial 挂只读 Hub**：`acp-lite-trial` / `acp-trial` 整 profile 挂 `dsh-hub-read`（`hub_browse`/`hub_resolve`；neighborhood 关；无角色级挂载，impl 亦可见但只读）。软链 pin `dsh-trial-plugins`；`engineEnvFile` 共用 hub-read 的 engine.env。备份 `package.json`/`cordis.patch.yml` 的 `*.bak-20261012-145929-prehub`。未重声明完整 providers。
+- **冒烟**：dsh-dev `hub_browse` → 概念非空（例 ABox 等，count≈46）。design-docs@2026-10-04.1 concept+relation 在册，边 25/25 齐全 → **未**重跑 publish。产品 broker 未动。
+
+## 运维笔记（2026-10-12 14:58 Asia/Shanghai）
+- **Hub·引擎开发租户评估**：建议继续用 `dsh-dev`（design-docs@2026-10-04.1 concept+relation published/active，35/11/25 边齐全；token 模式 `platform-test-dsh-dev` 可用）。未新建 `hub-engine-dev`。`host-jinyinhua-qa` 未动（无 design-docs 混灌）。restore 优先 `publish_design_pack.py`；勿盲跑完整 `khub-engine-restore-packs`（其 jinyinhua 支路会 409）。产品 broker 未动。
+
 ## 运维笔记（2026-10-12 14:52 Asia/Shanghai）
 - **根因**：切回 `newapicy1/kimi-for-coding` 后 ACP `session/new` 报 `no adapter registered for provider "newapicy1"`。`~/.dsh/settings.yaml` 虽有 newapicy1，但 ACP 自定义路由不会像 deepseek-official 那样被 sdk 硬编码兜底；trial patch 未在 cordis 声明 `llm-pi-ai.providers.newapicy1` → adapter 未注册。切片未开。
 - **修复**（仅 trial，未动产品 profile/broker）：acp-lite-trial / acp-trial 的 `cordis.patch.yml` **最小**插入 `llm-pi-ai.providers.newapicy1`（仅该路由，勿整段重声明含 deepseek 的 providers，以免旧坑 inactive context）。备份 `*.bak-20261012-145006-prenewapi`。
@@ -68,6 +76,7 @@
 - Runda 拍板（经 Grok Bot 2026-10-10）：默认关；开关工具修好前不扩到其他 profile；现有 acp-lite-trial-adhd 留作回退参考，不推。
 
 ## 宿主默认租户切换（2026-10-10 19:32 Asia/Shanghai）
+> 已于 2026-10-12 15:00 回指 `dsh-dev`（见上方笔记）；下列为当时切到 host-jinyinhua-qa 的记录。
 - Hub/读侧宿主闸门默认租户已切到 `host-jinyinhua-qa`（先切环境，G3 另开）。
 - 改动文件：`~/.dsh/profiles/acp-hub-read/engine.env`
   - 变量：`KNOWLEDGE_HUB_ENGINE_TENANT_ID` / `KNOWLEDGE_HUB_ENGINE_USER_ID` → `host-jinyinhua-qa`

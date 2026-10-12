@@ -7237,7 +7237,11 @@ def _resume_goal_chain(goal: dict) -> int:
     return _settle_parent_goal_after_resume(goal_id, resume_job, slice_id, dest, rc)
 
 
-def run_job(path: Path) -> int:
+def run_job(path: Path, job: dict | None = None) -> int:
+    # Scheduler invokes every runner as (path, job). ``job`` is only the
+    # dispatch-time conflict-key snapshot; always reload so a malformed inbox
+    # file is quarantined here (see ``_job_for_dispatch``).
+    del job
     maybe_offload_gc(force=False)
     try:
         job = load_job(path)
@@ -7535,7 +7539,10 @@ def _start_job(running: dict, slot: int, *, label, path, job, dirs, goal_ids, ru
     def _work() -> None:
         try:
             with goal_context(goal_id, slot):
-                runner(path)
+                # Inbox ``run_job`` and resume ``resume_goal_job`` both take
+                # (path, job). A one-arg call TypeErrors resume and quarantines
+                # a live Goal (missing required argument: 'job').
+                runner(path, job)
         except BrokerDraining as e:
             # Drain, not failure: no goal rewrite, no processing move, no notify.
             print(f"[trial-broker] drain: {label} stopped before its next ticket ({e})", flush=True)

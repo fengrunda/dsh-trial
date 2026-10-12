@@ -176,7 +176,8 @@ class _Ctl:
     def wait_started(self, n: int, timeout: float = 5.0) -> bool:
         return _wait_for(lambda: len(self.order) >= n, timeout)
 
-    def run_job(self, path: Path) -> int:
+    def run_job(self, path: Path, job: dict | None = None) -> int:
+        del job
         name = path.name
         # Mirror the real broker: the job file moves to PROCESSING first.
         dest = tb.PROCESSING / name
@@ -208,14 +209,14 @@ class _Ctl:
         return 0
 
     def failing_run_job(self, fail_name: str):
-        def _run(path: Path) -> int:
+        def _run(path: Path, job: dict | None = None) -> int:
             if path.name == fail_name:
                 # The real broker moves the job out of INBOX before working.
                 dest = tb.PROCESSING / path.name
                 if path.exists():
                     shutil.move(str(path), str(dest))
                 raise RuntimeError("boom")
-            return self.run_job(path)
+            return self.run_job(path, job)
         return _run
 
 

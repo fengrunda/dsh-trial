@@ -1,7 +1,7 @@
 # dsh运维 交接（2026-10-12 14:47 Asia/Shanghai）
 
 ## 现状
-- 代码：/workspace/dsh-trial（fengrunda/dsh-trial），main = b71dd92（kimi 回切），已快进到工作区。
+- 代码：/workspace/dsh-trial（fengrunda/dsh-trial），main = 4b13682（含 handoff 巡检恢复），已快进到工作区。
 - 进程：trial-broker pid 1470231（`broker/trial-broker.py --poll 20`），trial-watchdog pid 1470279（`--loop --interval 60`）；pid 文件 ~/.dsh/broker-dsh-trial/trial-broker.pid / trial-watchdog.pid。DSH_HOME=/home/box/.dsh。
 - 状态 ~/.dsh/supervisor/{trial,thin-state}；配置 ~/.dsh/supervisor/trial/limits.json；日志 ~/.dsh/broker-dsh-trial/trial-broker.log；role homes ~/.dsh-homes/{supervisor,impl,gate}。
 - 并发：max_concurrent_goals=2，同 cwd 串行。线上两 Goal 并发尚未实测。

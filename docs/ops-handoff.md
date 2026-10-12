@@ -1,7 +1,7 @@
-# dsh运维 交接（2026-10-12 14:47 Asia/Shanghai）
+# dsh运维 交接（2026-10-12 14:52 Asia/Shanghai）
 
 ## 现状
-- 代码：/workspace/dsh-trial（fengrunda/dsh-trial），main = 4b13682（含 handoff 巡检恢复），已快进到工作区。
+- 代码：/workspace/dsh-trial（fengrunda/dsh-trial），main 见本提交；parent 185976c。本提交：newapicy1 adapter 修复笔记 + Hub salvage。
 - 进程：trial-broker pid 1470231（`broker/trial-broker.py --poll 20`），trial-watchdog pid 1470279（`--loop --interval 60`）；pid 文件 ~/.dsh/broker-dsh-trial/trial-broker.pid / trial-watchdog.pid。DSH_HOME=/home/box/.dsh。
 - 状态 ~/.dsh/supervisor/{trial,thin-state}；配置 ~/.dsh/supervisor/trial/limits.json；日志 ~/.dsh/broker-dsh-trial/trial-broker.log；role homes ~/.dsh-homes/{supervisor,impl,gate}。
 - 并发：max_concurrent_goals=2，同 cwd 串行。线上两 Goal 并发尚未实测。
@@ -13,11 +13,17 @@
 - 巡检 routine「dsh trial 底座」**已恢复**（工作日 10:35 / 14:35 / 18:35 Asia/Shanghai）。观察焦点：质量链路（gate 单派 / reasoning low·low·high / contextClear / 双 Goal 并发）+ token。
 
 
+## 运维笔记（2026-10-12 14:52 Asia/Shanghai）
+- **根因**：切回 `newapicy1/kimi-for-coding` 后 ACP `session/new` 报 `no adapter registered for provider "newapicy1"`。`~/.dsh/settings.yaml` 虽有 newapicy1，但 ACP 自定义路由不会像 deepseek-official 那样被 sdk 硬编码兜底；trial patch 未在 cordis 声明 `llm-pi-ai.providers.newapicy1` → adapter 未注册。切片未开。
+- **修复**（仅 trial，未动产品 profile/broker）：acp-lite-trial / acp-trial 的 `cordis.patch.yml` **最小**插入 `llm-pi-ai.providers.newapicy1`（仅该路由，勿整段重声明含 deepseek 的 providers，以免旧坑 inactive context）。备份 `*.bak-20261012-145006-prenewapi`。
+- **验证**：`dsh-acp-ask --profile acp-lite-trial` session/new + 极短票 → OK；`--role supervisor` → OK-SUP。provider+model=`newapicy1/kimi-for-coding`。无需重启 trial-broker（每票新 ACP 读 patch）。
+- **Hub salvage**：`hub-kg-my-memory-admin-v1` 已重投 inbox → processing（planning）；新 plan 票 sessionId 已出（仅 warning：kimi 无 reasoning_effort=low）。failed 留 salvage-note。
+
 ## 运维笔记（2026-10-12 14:47 Asia/Shanghai）
 - **轻量基线（只读）**：broker 1470231 / watchdog 1470279 LIVE；heartbeat slots=[] pending=0 max=2；无 running Goal；近日志无 429/新 ERROR（重启后干净）。Goals 74：done46 / failed13 / escalated7 / cancelled8；最近 `hub-logic-gate-g1-s0-adr-v1-r2` done PASS（10-08）。`review-ledger.json` 尚不存在。历史：mailbox watch ENOENT×53（不安全标题 pack）、同 Goal gate spawn×6（含 rev38）。
 
 ## 运维笔记（2026-10-12 14:42 Asia/Shanghai）
-- **trial 模型切回 kimi**：acp-lite-trial / acp-trial 的 acp + agent-default-model：`deepseek-official/deepseek-flash` → `newapicy1/kimi-for-coding`。`--dump-config` 已核。未重声明 `llm-pi-ai.providers`。NEWAPICY1_API_KEY 仍由 `load-env.sh` 注入，未写入文件。
+- **trial 模型切回 kimi**：acp-lite-trial / acp-trial 的 acp + agent-default-model：`deepseek-official/deepseek-flash` → `newapicy1/kimi-for-coding`。`--dump-config` 已核。**事后补丁**：须最小声明 `llm-pi-ai.providers.newapicy1`（见 14:52 笔记）。NEWAPICY1_API_KEY 仍由 `load-env.sh` 注入，未写入文件。
 - **settings.yaml**：`newapicy1.models` 恢复 `kimi-for-coding`（+ highspeed）；全局 `agent-default-model` 仍为 deepseek-official/deepseek-flash（产品 profile 未动）。备份：`settings.yaml.bak-20261012-144139-prekimi`、trial patch `*.bak-20261012-144139-prekimi`。
 - **压缩**：去掉 deepseek 专用 modelPolicies(0.06)；kimi 走 thresholdRatio 0.15 / retainRatio 0.05（~39k @ ~262k）。
 - **kimi 探测**：newapicy1 `kimi-for-coding` chat completions temperature=1 → HTTP 200。
@@ -42,7 +48,7 @@
 ## 规矩
 - 底座冻结几天：只修阻塞 Hub 的故障，其他优化攒着，等真实数据后一次做。
 - 底座代码改动交给 Cursor 云端代理（grok-4.7，reasoning_effort medium，fast false），出 PR；Grok 只写 Goal、看报告和测试结果，不读 diff。合入后由箱上 commit/push、空闲时重启、验证。
-- 不清 Redis/DB；key 在 /home/box/.dsh/.env（`source /home/box/.dsh/load-env.sh`），不打印、不找用户要；profile 改动需用户批准；profile patch 里不要重声明 llm-pi-ai.providers。
+- 不清 Redis/DB；key 在 /home/box/.dsh/.env（`source /home/box/.dsh/load-env.sh`），不打印、不找用户要；profile 改动需用户批准；trial patch 可最小声明 `llm-pi-ai.providers.newapicy1`（ACP 必需）；勿整段重声明与 settings 重叠的完整 providers（曾致 inactive context）。
 - 对 Hub 用中文；只报里程碑。
 
 ## 今日用量结论

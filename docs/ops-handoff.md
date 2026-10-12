@@ -1,7 +1,7 @@
-# dsh运维 交接（2026-10-12 14:42 Asia/Shanghai）
+# dsh运维 交接（2026-10-12 14:47 Asia/Shanghai）
 
 ## 现状
-- 代码：/workspace/dsh-trial（fengrunda/dsh-trial），main = 9b6cef9，已快进到工作区。
+- 代码：/workspace/dsh-trial（fengrunda/dsh-trial），main = b71dd92（kimi 回切），已快进到工作区。
 - 进程：trial-broker pid 1470231（`broker/trial-broker.py --poll 20`），trial-watchdog pid 1470279（`--loop --interval 60`）；pid 文件 ~/.dsh/broker-dsh-trial/trial-broker.pid / trial-watchdog.pid。DSH_HOME=/home/box/.dsh。
 - 状态 ~/.dsh/supervisor/{trial,thin-state}；配置 ~/.dsh/supervisor/trial/limits.json；日志 ~/.dsh/broker-dsh-trial/trial-broker.log；role homes ~/.dsh-homes/{supervisor,impl,gate}。
 - 并发：max_concurrent_goals=2，同 cwd 串行。线上两 Goal 并发尚未实测。
@@ -10,8 +10,11 @@
 - 步数软提醒（插件 dsh-step-budget-reminder，不硬停）：supervisor 30 / impl 80 / gate 60（step_budget_by_role）。
 - acp-trial / acp-lite-trial：压缩 thresholdRatio 0.15 / retainRatio 0.05（kimi ~39k）；精简工具（38→21 / 37→20）；contextClear {enabled, compaction-coupled, keepRecentResults 8, clearReasoning on}。插件软链指 pin worktree /workspace/dsh-trial-plugins（tag plugins-pin-20261008d = 79a9070，已 push）。产品 profile acp / acp-lite / acp-lite-offload / acp-hub-read 未改（压缩阈值实际约 150k）。
 - broker 今日修复：gate 去重账本 thin-state/review-ledger.json；标题安全化与 review_seq；续跑判断票是否真结束；watchdog 只计 broker 子进程；gate pack 独立命名；submit_for_review 前置 summary 检查；看板刷新钩子 ~/.dsh/bin/khub-dsh-complete-notify.py。
-- 巡检 routine「dsh trial 底座」已暂停。
+- 巡检 routine「dsh trial 底座」**已恢复**（工作日 10:35 / 14:35 / 18:35 Asia/Shanghai）。观察焦点：质量链路（gate 单派 / reasoning low·low·high / contextClear / 双 Goal 并发）+ token。
 
+
+## 运维笔记（2026-10-12 14:47 Asia/Shanghai）
+- **轻量基线（只读）**：broker 1470231 / watchdog 1470279 LIVE；heartbeat slots=[] pending=0 max=2；无 running Goal；近日志无 429/新 ERROR（重启后干净）。Goals 74：done46 / failed13 / escalated7 / cancelled8；最近 `hub-logic-gate-g1-s0-adr-v1-r2` done PASS（10-08）。`review-ledger.json` 尚不存在。历史：mailbox watch ENOENT×53（不安全标题 pack）、同 Goal gate spawn×6（含 rev38）。
 
 ## 运维笔记（2026-10-12 14:42 Asia/Shanghai）
 - **trial 模型切回 kimi**：acp-lite-trial / acp-trial 的 acp + agent-default-model：`deepseek-official/deepseek-flash` → `newapicy1/kimi-for-coding`。`--dump-config` 已核。未重声明 `llm-pi-ai.providers`。NEWAPICY1_API_KEY 仍由 `load-env.sh` 注入，未写入文件。
@@ -31,7 +34,7 @@
 1. Hub 下一个真实 Goal 上核对：gate 每轮只派一次；票日志 reasoning_effort 为 low/low/high；压缩时有 contextClear 生效记录；两 Goal 并发。
 2. review 路径同一份代码重复提交仍会再审（账本只用于 chain 路径去重）。
 3. token 记账：监理 plan/close 未计入；指标用 peak×steps，应改实际累加。
-4. live 引擎已切 a7c3914（2026-10-10 21:46 CST）：旧 0c8f01fe78bcbf1c6fc7b2a7716bb9ff4eb56654 → 新 a7c39149c52ccec1a61488085581c1961873afd3（= origin/main tip，G3a2 平台角色 HTTP #157）；health `{"status":"ok","redis":"pong"}`；127.0.0.1:8000 pid 1378373；`GET /v1/admin/platform-config?key=approver_roles` → 200（platform_id=platform-personal，value=[]）；经 khub-engine-with-llm-env。租户仍 host-jinyinhua-qa；未 reseed / 未动 GraphStore。
+4. live 引擎已切 5327988（2026-10-12 12:13 CST）：旧 9c114ca2c1f1ed0aea6acd926e66a151cbf2d63f → 新 5327988598f9edcdb77f1799ec6c3803a7548e2b（= origin/main tip，#163 个人版主体记忆 s1）；health `{"status":"ok","redis":"pong"}`；127.0.0.1:8000 pid 1459702；经 khub-engine-with-llm-env。租户仍 host-jinyinhua-qa；未 reseed / 未动 GraphStore 数据目录。
 5. FYI：gate idle 超时、watchdog 误报 stalled。
 6. 遗留 worktree：wt-conc / wt-dedup / wt-limits / wt-notify 已合入，可删。mailbox 孤儿 t3c-gate-1 已归档（2026-10-12）；hub-logic goal review_seq 已到 55。
 7. web profile 的 desk 已修好（555578a），dsh web 当前未运行。
@@ -66,5 +69,5 @@
   - `KNOWLEDGE_HUB_ENGINE_BASE_URL` 仍为 `http://127.0.0.1:8000`
   - 备份：`engine.env.bak-20261010-host-jinyinhua-qa`
 - 扫描：其它 profile / llm.env / khub 启动脚本无额外「宿主默认租户」硬编码需改；`khub-engine-restore-packs` 的 dsh-dev 设计包入口保留；产品 wire `DEV_SCOPE_PLACEHOLDER`/`HUB_BANK=dsh-dev` 仍为设计仓占位（G3 再开）。
-- 验证：health ok+redis pong；`GET /v1/admin/platform-config?key=approver_roles` → 200（value 空列表）；引擎 tip a7c3914，:8000 在听；租户仍 host-jinyinhua-qa；未 reseed / 未动 GraphStore / 未降版本。
+- 验证：health ok+redis pong；引擎 tip 9c114ca，:8000 pid 1430091；租户仍 host-jinyinhua-qa；design-docs@2026-10-04.1 published/present；未 reseed / 未动 GraphStore 数据目录 / 未降版本。
 

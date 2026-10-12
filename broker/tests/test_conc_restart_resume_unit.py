@@ -179,7 +179,8 @@ class _Ctl:
     def wait_started(self, n: int, timeout: float = 5.0) -> bool:
         return _wait_for(lambda: len(self.order) >= n, timeout)
 
-    def run_job(self, path: Path) -> int:
+    def run_job(self, path: Path, job: dict | None = None) -> int:
+        del job
         name = path.name
         # Mirror the real broker: the job file moves to PROCESSING first.
         dest = tb.PROCESSING / name
@@ -722,3 +723,43 @@ def test_scheduler_resume_items_take_slots_before_inbox(tmp_path):
 
         assert sched.rc == 0
         assert sorted(ctl.finished) == ["resume-a.json", "resume-b.json", "third.json"]
+
+
+# ---------------------------------------------------------------------------
+# 7. scheduler resume dispatch passes (path, job) — not runner(path)
+# ---------------------------------------------------------------------------
+def test_scheduler_resume_dispatch_passes_path_and_job(tmp_path):
+    """A one-arg ``runner(path)`` call quarantines the Goal.
+
+    ``resume_goal_job`` requires ``job``. The slot thread must pass the
+    processing-job dict already loaded by ``collect_resume_items``.
+    """
+    with _patched(tmp_path / "state") as dirs, _limits(tmp_path, {"max_concurrent_goals": 1}):
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        gid = "unit-resume-dispatch"
+        _seed_goal(dirs, gid, cwd, status="planning", slices=[], created_at="2024-01-01T00:00:00Z")
+        proc, seeded = _seed_processing_job(dirs, gid, cwd, name="proc-dispatch.json")
+
+        calls: list[tuple[Path, dict]] = []
+
+        def _capture(path: Path, job: dict) -> int:
+            calls.append((path, job))
+            return 0
+
+        with mock.patch.object(tb, "resume_goal_job", side_effect=_capture):
+            items = tb.collect_resume_items()
+            assert [it["goal"] for it in items] == [gid]
+            assert items[0]["runner"] is tb.resume_goal_job
+            assert items[0]["path"] == proc
+            with _Sched(interval=0.05, resume_items=items) as sched:
+                assert _wait_for(lambda: len(calls) == 1), calls
+            assert sched.rc == 0
+
+        assert calls[0][0] == proc
+        assert calls[0][1]["goal"] == gid
+        assert calls[0][1]["type"] == "goal"
+        assert calls[0][1]["brief"] == seeded["brief"]
+        failed = [p.name for p in dirs["failed"].iterdir()]
+        assert failed == [], failed
+        assert proc.is_file()

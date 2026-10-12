@@ -1,18 +1,29 @@
-# dsh运维 交接（2026-10-08 16:45 Asia/Shanghai）
+# dsh运维 交接（2026-10-12 14:42 Asia/Shanghai）
 
 ## 现状
 - 代码：/workspace/dsh-trial（fengrunda/dsh-trial），main = 9b6cef9，已快进到工作区。
-- 进程：trial-broker pid 771374（`broker/trial-broker.py --poll 20`），trial-watchdog pid 771419（`--loop --interval 60`）；pid 文件 ~/.dsh/broker-dsh-trial/trial-broker.pid / trial-watchdog.pid。DSH_HOME=/home/box/.dsh。
+- 进程：trial-broker pid 1470231（`broker/trial-broker.py --poll 20`），trial-watchdog pid 1470279（`--loop --interval 60`）；pid 文件 ~/.dsh/broker-dsh-trial/trial-broker.pid / trial-watchdog.pid。DSH_HOME=/home/box/.dsh。
 - 状态 ~/.dsh/supervisor/{trial,thin-state}；配置 ~/.dsh/supervisor/trial/limits.json；日志 ~/.dsh/broker-dsh-trial/trial-broker.log；role homes ~/.dsh-homes/{supervisor,impl,gate}。
 - 并发：max_concurrent_goals=2，同 cwd 串行。线上两 Goal 并发尚未实测。
-- 模型：所有 ACP profile 与 agent-default-model 均为官方 deepseek-official/deepseek-flash（DEEPSEEK_API_KEY），不走 newapi。
+- 模型：trial（acp-trial / acp-lite-trial）= newapicy1/kimi-for-coding（NEWAPICY1_API_KEY）；产品 acp / acp-lite / acp-hub-read / settings agent-default-model 仍为 deepseek-official/deepseek-flash。
 - 推理强度（limits.json reasoning_effort_by_role，默认同）：supervisor=low，impl=low，gate=high。DeepSeek 只有 low/high/max，medium=high。运维票用 `--reasoning-effort` 或 DSH_REASONING_EFFORT。
 - 步数软提醒（插件 dsh-step-budget-reminder，不硬停）：supervisor 30 / impl 80 / gate 60（step_budget_by_role）。
-- acp-trial / acp-lite-trial：压缩 thresholdRatio 0.06（≈60k）retain 20k；精简工具（38→21 / 37→20）；contextClear {enabled, compaction-coupled, keepRecentResults 8, clearReasoning on}。插件软链指 pin worktree /workspace/dsh-trial-plugins（tag plugins-pin-20261008d = 79a9070，已 push）。产品 profile acp / acp-lite / acp-lite-offload / acp-hub-read 未改（压缩阈值实际约 150k）。
+- acp-trial / acp-lite-trial：压缩 thresholdRatio 0.15 / retainRatio 0.05（kimi ~39k）；精简工具（38→21 / 37→20）；contextClear {enabled, compaction-coupled, keepRecentResults 8, clearReasoning on}。插件软链指 pin worktree /workspace/dsh-trial-plugins（tag plugins-pin-20261008d = 79a9070，已 push）。产品 profile acp / acp-lite / acp-lite-offload / acp-hub-read 未改（压缩阈值实际约 150k）。
 - broker 今日修复：gate 去重账本 thin-state/review-ledger.json；标题安全化与 review_seq；续跑判断票是否真结束；watchdog 只计 broker 子进程；gate pack 独立命名；submit_for_review 前置 summary 检查；看板刷新钩子 ~/.dsh/bin/khub-dsh-complete-notify.py。
 - 巡检 routine「dsh trial 底座」已暂停。
 
+
+## 运维笔记（2026-10-12 14:42 Asia/Shanghai）
+- **trial 模型切回 kimi**：acp-lite-trial / acp-trial 的 acp + agent-default-model：`deepseek-official/deepseek-flash` → `newapicy1/kimi-for-coding`。`--dump-config` 已核。未重声明 `llm-pi-ai.providers`。NEWAPICY1_API_KEY 仍由 `load-env.sh` 注入，未写入文件。
+- **settings.yaml**：`newapicy1.models` 恢复 `kimi-for-coding`（+ highspeed）；全局 `agent-default-model` 仍为 deepseek-official/deepseek-flash（产品 profile 未动）。备份：`settings.yaml.bak-20261012-144139-prekimi`、trial patch `*.bak-20261012-144139-prekimi`。
+- **压缩**：去掉 deepseek 专用 modelPolicies(0.06)；kimi 走 thresholdRatio 0.15 / retainRatio 0.05（~39k @ ~262k）。
+- **kimi 探测**：newapicy1 `kimi-for-coding` chat completions temperature=1 → HTTP 200。
+- **trial-broker 重启**（空闲 slots=0）：旧 pid 771374/771419 → 新 **1470231 / 1470279**。产品 broker 未动。
+- **watchdog resumed-after-freeze**：今日 10 次（CST 07:20–14:37），间隔约 17–98 min，符合宿主休眠/时钟跳变误报；broker heartbeat 正常、slots_busy=0、无 running Goal、无 dsh-acp-ask 僵尸。**可忽略**。
+- **salvage**：归档孤儿 `t3c-gate-1` + thin-state pending notify/question + impl home medium-bridge 残留 pending → `mailbox/archive/*.orphan-pending.json`。未清 Redis/DB。
+
 ## 回退
+- 模型回 deepseek：还原 trial cordis.patch.yml.bak-20261012-144139-prekimi（或手改 provider/model）；settings 可保留 kimi 模型条目。
 - 推理强度：改 limits.json（备份 limits.json.bak-20261008-low）。
 - contextClear：profile 里 enabled:false，或软链指回 plugins-pin-20261008c，或还原 cordis.patch.yml / package.json 的 .bak-20261008-ctxclear / -reasoning / -pre-compact60k。
 
@@ -22,7 +33,7 @@
 3. token 记账：监理 plan/close 未计入；指标用 peak×steps，应改实际累加。
 4. live 引擎已切 a7c3914（2026-10-10 21:46 CST）：旧 0c8f01fe78bcbf1c6fc7b2a7716bb9ff4eb56654 → 新 a7c39149c52ccec1a61488085581c1961873afd3（= origin/main tip，G3a2 平台角色 HTTP #157）；health `{"status":"ok","redis":"pong"}`；127.0.0.1:8000 pid 1378373；`GET /v1/admin/platform-config?key=approver_roles` → 200（platform_id=platform-personal，value=[]）；经 khub-engine-with-llm-env。租户仍 host-jinyinhua-qa；未 reseed / 未动 GraphStore。
 5. FYI：gate idle 超时、watchdog 误报 stalled。
-6. 遗留 worktree：wt-conc / wt-dedup / wt-limits / wt-notify 已合入，可删。mailbox 孤儿 ask t3c-gate-1 待归档；hub-logic goal review_seq 已到 55。
+6. 遗留 worktree：wt-conc / wt-dedup / wt-limits / wt-notify 已合入，可删。mailbox 孤儿 t3c-gate-1 已归档（2026-10-12）；hub-logic goal review_seq 已到 55。
 7. web profile 的 desk 已修好（555578a），dsh web 当前未运行。
 
 ## 规矩

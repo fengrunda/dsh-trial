@@ -87,6 +87,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -7517,6 +7518,38 @@ def _block_reason(dirs: set[str], goal_ids: set[str], running: dict) -> str | No
     return None
 
 
+def _runner_requires_job(runner) -> bool:
+    """True when ``runner(path)`` would TypeError for a missing ``job``.
+
+    Inbox dispatch uses ``run_job(path)`` (the worker reloads the file).
+    Restart resume stores ``resume_goal_job``, which already has the job
+    parsed by ``collect_resume_items`` and requires both arguments. Calling
+    that unary is what quarantines a live Goal on broker start.
+    """
+    try:
+        sig = inspect.signature(runner)
+    except (TypeError, ValueError):
+        return False
+    positional = [
+        p
+        for p in sig.parameters.values()
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if len(positional) < 2:
+        return False
+    return positional[1].default is inspect.Parameter.empty
+
+
+def _invoke_runner(runner, path: Path, job: dict):
+    """Call a slot runner with the arguments it declares."""
+    if _runner_requires_job(runner):
+        return runner(path, job)
+    return runner(path)
+
+
 def _start_job(running: dict, slot: int, *, label, path, job, dirs, goal_ids, runner) -> dict:
     """Reserve ``slot``, then run the job in its own thread."""
     rec = {
@@ -7535,7 +7568,7 @@ def _start_job(running: dict, slot: int, *, label, path, job, dirs, goal_ids, ru
     def _work() -> None:
         try:
             with goal_context(goal_id, slot):
-                runner(path)
+                _invoke_runner(runner, path, job)
         except BrokerDraining as e:
             # Drain, not failure: no goal rewrite, no processing move, no notify.
             print(f"[trial-broker] drain: {label} stopped before its next ticket ({e})", flush=True)

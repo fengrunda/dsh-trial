@@ -8,7 +8,9 @@ no ticket is ever paid for. State lives under a tmp dir (``_patched``) and
 conftest's guard fails any test that would resolve a real ``~/.dsh`` path.
 
 The chain/goal fixtures are seeded on disk exactly as a crashed broker leaves
-them, then ``resume_goal_job`` is called as the scheduler would.
+them. Direct ``resume_goal_job(path, job)`` covers ticket-boundary idempotency.
+Scheduler tests go through ``collect_resume_items`` → ``_start_job`` /
+``scheduler_loop``, which is the call that used to drop ``job``.
 
 Run: python3 -m pytest broker/tests/test_conc_restart_resume_unit.py -q
 """
@@ -722,3 +724,131 @@ def test_scheduler_resume_items_take_slots_before_inbox(tmp_path):
 
         assert sched.rc == 0
         assert sorted(ctl.finished) == ["resume-a.json", "resume-b.json", "third.json"]
+
+
+# ---------------------------------------------------------------------------
+# 7. scheduler call shape: resume runner gets the job collect already parsed
+# ---------------------------------------------------------------------------
+def test_invoke_runner_passes_job_only_when_required():
+    """Inbox stays path-only; resume_goal_job is the binary runner."""
+    unary_args: list[Path] = []
+    binary_args: list[tuple[Path, dict]] = []
+
+    def unary(path: Path) -> int:
+        unary_args.append(path)
+        return 7
+
+    def binary(path: Path, job: dict) -> int:
+        binary_args.append((path, job))
+        return 8
+
+    path = Path("proc.json")
+    job = {"goal": "unit-arity"}
+    assert tb._invoke_runner(unary, path, job) == 7
+    assert unary_args == [path]
+    assert tb._invoke_runner(binary, path, job) == 8
+    assert binary_args == [(path, job)]
+    assert tb._runner_requires_job(tb.resume_goal_job)
+    assert not tb._runner_requires_job(tb.run_job)
+
+
+@pytest.mark.parametrize("status", ["planning", "running", "closeout"])
+def test_start_job_passes_collected_job_for_resumable_status(tmp_path, status):
+    """``_start_job`` must call the resume runner as ``(path, job)``.
+
+    A unary call TypeErrors and ``_quarantine_unexpected`` moves the
+    processing job to failed/ while the Goal stays non-terminal.
+    """
+    gid = f"unit-arity-{status}"
+    seen: dict = {}
+
+    def spy(path: Path, job: dict) -> int:
+        seen["path"] = path
+        seen["job"] = dict(job)
+        return 0
+
+    with _patched(tmp_path / "state") as dirs:
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        state = _seed_goal(dirs, gid, cwd, status=status)
+        proc, _job = _seed_processing_job(dirs, gid, cwd, name=f"proc-{status}.json")
+        state["processing_job"] = str(proc)
+        (dirs["goals"] / f"{gid}.json").write_text(
+            json.dumps(state, ensure_ascii=False), encoding="utf-8"
+        )
+
+        with mock.patch.object(tb, "resume_goal_job", spy):
+            items = tb.collect_resume_items()
+        assert len(items) == 1, items
+        item = items[0]
+        assert item["runner"] is spy
+        assert item["path"] == proc
+        assert item["job"]["goal"] == gid
+
+        running: dict = {}
+        rec = tb._start_job(
+            running,
+            1,
+            label=item["label"],
+            path=item["path"],
+            job=item["job"],
+            dirs=item["dirs"],
+            goal_ids=item["goal_ids"],
+            runner=item["runner"],
+        )
+        rec["thread"].join(timeout=5)
+
+        assert rec["done"].is_set()
+        assert seen["path"] == proc
+        assert seen["job"]["goal"] == gid
+        assert seen["job"]["cwd"] == str(cwd)
+        assert proc.is_file(), "a successful resume handoff must not quarantine the job"
+        assert list(dirs["failed"].iterdir()) == []
+        assert tb._read_goal(gid)["status"] == status
+
+
+def test_scheduler_resumes_planning_goal_without_quarantine(tmp_path):
+    """Broker-start path: collect → scheduler_loop → real resume_goal_job.
+
+    Plan summary already on disk, so the plan ticket stays closed and the
+    first unfinished ticket (impl r1) runs. The processing job is not
+    moved to failed/.
+    """
+    gid, sid, pack = "unit-sched-resume", "unit-sched-resume-s1", "unit-sched-resume-s1.pack.md"
+    with _patched(tmp_path / "state") as dirs, _limits(
+        tmp_path, {"max_slices": 2, "max_rounds": 2, "max_concurrent_goals": 1}
+    ):
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        plan_path = dirs["summaries"] / f"goal-{gid}-plan.md"
+        slices = [{"slice": sid, "pack": pack, "acceptance": []}]
+        _write_summary(plan_path, _plan_block(gid, slices))
+        (dirs["packs"] / pack).write_text("# pack\n", encoding="utf-8")
+        state = _seed_goal(dirs, gid, cwd, status="planning", plan_summary=plan_path)
+        proc, _job = _seed_processing_job(dirs, gid, cwd)
+        state["processing_job"] = str(proc)
+        (dirs["goals"] / f"{gid}.json").write_text(
+            json.dumps(state, ensure_ascii=False), encoding="utf-8"
+        )
+
+        items = tb.collect_resume_items()
+        assert [it["goal"] for it in items] == [gid]
+        assert items[0]["runner"] is tb.resume_goal_job
+        assert items[0]["job"]["goal"] == gid
+
+        tickets = _Tickets(plan_slices=slices)
+        with _mocked_tickets(tickets), _Sched(interval=0.05, resume_items=items) as sched:
+            assert _wait_for(lambda: (tb._read_goal(gid) or {}).get("status") == "done"), (
+                tb._read_goal(gid),
+                tickets.calls,
+                list(dirs["failed"].iterdir()),
+            )
+
+        assert sched.rc == 0
+        assert tickets.count(f"supervisor-plan-{gid}") == 0, tickets.calls
+        assert tickets.count(f"impl-trial-{sid}-r1") == 1, tickets.calls
+        assert tickets.count(f"gate-trial-{sid}-r1") == 1, tickets.calls
+        assert tb._read_chain(sid)["state"] == "PASS"
+        assert list(dirs["failed"].iterdir()) == []
+        assert (dirs["outbox"] / proc.name).is_file()
+        assert not proc.is_file()

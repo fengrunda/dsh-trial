@@ -1912,10 +1912,55 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
         # (r30 → r37 and the next real ticket jumped to r38).
         round_n = int(goal.get("review_seq") or 0) + 1
 
+    # Gate round cap per slice: beyond max_gate_rounds there is no pack and no
+    # gate spawn — the ticket is escalated to the supervisor instead.
+    max_gate = int(lim.get("max_gate_rounds") or 2)
+    gate_rounds = (goal or {}).get("gate_rounds_by_slice") or {}
+    if goal is not None and int(gate_rounds.get(slice_id) or 0) >= max_gate:
+        instruction = (
+            f"gate 轮数已达 max_gate_rounds={max_gate}，停止 rework，"
+            "写 summary(status=blocked) 结束票，交监理"
+        )
+        (MAILBOX / "answers").mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(
+            MAILBOX / "answers" / f"{ask_id}.json",
+            {
+                "ask_id": ask_id,
+                "status": "done",
+                "ok": False,
+                "verdict": "HOLD",
+                "rework_mode": "escalate",
+                "escalate": True,
+                "instruction": instruction,
+            },
+        )
+        # archive pending, exactly like the precheck path
+        try:
+            arch = MAILBOX / "archive"
+            arch.mkdir(parents=True, exist_ok=True)
+            if path.is_file():
+                path.rename(arch / f"{ask_id}.pending.json")
+        except OSError:
+            pass
+        goal["escalate_reason"] = f"max_gate_rounds={max_gate} reached slice={slice_id}"
+        goal["gate_escalated"] = True
+        _write_goal(goal)
+        print(
+            f"[trial-broker] submit_for_review escalated {ask_id} "
+            f"slice={slice_id} gate_rounds>={max_gate}",
+            flush=True,
+        )
+        return
+
     # Build a gate pack: delta-only when prior findings exist on goal/chain
     prior_findings = []
     if goal:
         prior_findings = list(goal.get("last_gate_findings") or [])
+    # Incremental gate: once a slice has a last-reviewed SHA (or prior
+    # findings), every later review is a delta against that SHA.
+    last_reviewed_sha = ""
+    if goal:
+        last_reviewed_sha = str((goal.get("last_reviewed_sha") or {}).get(slice_id) or "")
     original_pack = str((goal or {}).get("current_pack") or ask.get("pack") or f"{slice_id}.pack.md")
     acceptance = (goal or {}).get("current_acceptance") or []
     foreman_block = {
@@ -1930,10 +1975,12 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
     # F1: the review gets its own label and never reuses a name whose verdict
     # already exists — a mid-ticket rev1 used to rewrite the chain round 1
     # pack/summary (`-gate-r1.*`) and lose that round's conclusion.
-    rev_label = _unique_review_tag(slice_id, f"rev{round_n}", delta=bool(prior_findings))
+    rev_label = _unique_review_tag(
+        slice_id, f"rev{round_n}", delta=bool(prior_findings or last_reviewed_sha)
+    )
     try:
-        if prior_findings:
-            # delta-only re-review pack
+        if prior_findings or last_reviewed_sha:
+            # delta-only re-review pack (base = last reviewed SHA when known)
             gate_pack = build_delta_gate_pack(
                 slice_id=slice_id,
                 round_n=round_n,
@@ -1944,6 +1991,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                 foreman_summary_text=str(ask.get("summary") or ""),
                 cwd=cwd_path,
                 label=rev_label,
+                base_sha=last_reviewed_sha or None,
             )
         else:
             gate_pack = build_gate_pack(
@@ -1977,6 +2025,8 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
     # T2: the pack is on disk, so the round is real — persist it now.
     if goal is not None:
         goal["review_seq"] = round_n
+        grbs = goal.setdefault("gate_rounds_by_slice", {})
+        grbs[slice_id] = int(grbs.get(slice_id) or 0) + 1
         _write_goal(goal)
 
     gate_ticket = f"gate-trial-{slice_id}-rev{round_n}"
@@ -2065,6 +2115,11 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                 bucket = m.setdefault(f"rework_{prm}", {"count": 0, "steps_sum": 0, "prompt_token_total": 0, "pass_after": 0})
                 bucket["pass_after"] = int(bucket.get("pass_after") or 0) + 1
             goal["last_gate_findings"] = []
+        # Incremental gate: remember the SHA this slice was last reviewed at,
+        # so the next submit_for_review diffs from here to HEAD.
+        reviewed_sha = (foreman_block or {}).get("commit") or _git_rev(cwd_path)
+        if reviewed_sha:
+            goal.setdefault("last_reviewed_sha", {})[slice_id] = str(reviewed_sha)
         peak, steps = _peak_prompt(gate_art.get("composition"))
         T.record_ticket_metric(goal, {
             "role": "gate",
@@ -2289,12 +2344,30 @@ def build_delta_gate_pack(
     foreman_summary_text: str,
     cwd: Path,
     label: str | None = None,
+    base_sha: str | None = None,
 ) -> str:
-    """Delta-only gate pack: prior findings + new diff + acceptance. No full original pack body."""
-    base = (foreman_block or {}).get("base") or ""
+    """Delta-only gate pack: prior findings + new diff + acceptance. No full original pack body.
+
+    ``base_sha`` (last reviewed SHA) takes priority over the foreman base so the
+    diff is exactly 上次已审 SHA...HEAD — the incremental slice of new work.
+    """
+    base = str(base_sha or "") or (foreman_block or {}).get("base") or ""
     commit = (foreman_block or {}).get("commit") or _git_rev(cwd)
     if not base:
         base = _git_rev(cwd, "HEAD~1") or ""
+    # Diff --stat summary first (same cwd as _git_diff; failure ignored).
+    diff_stat = ""
+    try:
+        if base:
+            stat_cmd = ["git", "diff", "--stat", f"{base}...{commit or 'HEAD'}"]
+        else:
+            stat_cmd = ["git", "diff", "--stat", "HEAD"]
+        _rs = subprocess.run(
+            stat_cmd, cwd=str(cwd), capture_output=True, text=True, timeout=30
+        )
+        diff_stat = (_rs.stdout or "") if _rs.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        diff_stat = ""
     diff = _git_diff(cwd, base if base else None, commit or "HEAD")
     diff, _ = _truncate_bytes(diff, MAX_DIFF_BYTES)
     findings_json = json.dumps(prior_findings or [], ensure_ascii=False, indent=2)
@@ -2317,9 +2390,14 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
 ## Acceptance (still apply)
 {acc_txt}
 
-## Prior findings only (re-check these; do not full-file review)
+## 上轮 FAIL 清单 (re-check these; do not full-file review)
 ```json
 {findings_json}
+```
+
+## Diff --stat (base...head)
+```text
+{diff_stat or '(unavailable)'}
 ```
 
 ## New diff (base...head · merge-base)
@@ -2332,6 +2410,7 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
 
 ## Done when
 - Delta-only: verify prior findings fixed; note any new P0/P1.
+- 禁止通读全文件/原 pack/全仓；只核对上述 diff 与 FAIL 清单，必要时 sed -n 小段。
 - Write verdict PASS|HOLD with machine json (findings/unmet_acceptance).
 - No room_*; do not modify business src.
 """
@@ -2643,6 +2722,7 @@ max_bytes_hint: {MAX_PACK_BYTES}
 
 ## Done when
 - Write verdict to summary_out with machine json block (verdict PASS|HOLD + findings).
+- 禁止通读全文件/原 pack/全仓；只核对上述 diff 与 FAIL 清单，必要时 sed -n 小段。
 - Delta-only review; no room_*; do not modify business src.
 """
     path.write_text(body, encoding="utf-8")

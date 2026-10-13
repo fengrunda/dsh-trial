@@ -29,6 +29,8 @@ DEFAULT_LIMITS = {
     "max_slices": 3,
     "max_supervisor_tickets": 8,
     "max_rounds": 2,
+    # 每 slice submit_for_review 触发的 gate 轮数上限，超限 escalate 给监理。
+    "max_gate_rounds": 2,
     "ask_supervisor_timeout_sec": 600,
     "ask_supervisor_poll_ms": 2000,
     # Hard wall clock for one session/prompt. Idle resets on ACP stdout;

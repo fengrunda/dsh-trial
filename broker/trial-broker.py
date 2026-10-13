@@ -1419,18 +1419,93 @@ _ASK_ERROR_REPORTED: set[str] = set()
 _ASK_ERROR_REPORTED_LOCK = threading.Lock()
 
 
+def _gate_error_answer(ask_id: str, error: str, instruction: str) -> dict:
+    """Terminal ERROR body for a gate that will never produce a verdict.
+
+    ``status=done`` so a polling client stops waiting; never ``gate_running``.
+    """
+    return {
+        "ask_id": ask_id,
+        "status": "done",
+        "ok": False,
+        "verdict": "ERROR",
+        "rework_mode": "",
+        "degrade": "close_ticket",
+        "error": error,
+        "instruction": instruction,
+    }
+
+
+def _overwrite_gate_spawn_fail(
+    ask_id: str, path: Path | None, exc: BaseException, goal: dict | None = None
+) -> None:
+    """Clear an interim ``gate_running`` ack when the gate could not be spawned.
+
+    ``_handle_submit_for_review`` writes ``answers/<ask_id>.json`` with
+    ``status=gate_running`` *before* spawning the gate. If the spawn then raises
+    (drain, missing open-slice, ...) the interim survives forever and the
+    polling client keeps waiting while the pending ask is skipped. Atomically
+    overwrite it with a terminal ERROR and archive the pending file, so the next
+    watcher tick re-dispatches cleanly instead of stalling on a phantom gate.
+    """
+    answers = MAILBOX / "answers"
+    ans_path = answers / f"{ask_id}.json" if ask_id else None
+    if ans_path is not None:
+        try:
+            _atomic_write_json(
+                ans_path,
+                _gate_error_answer(
+                    ask_id,
+                    str(exc),
+                    f"gate 派发失败：{exc}；保持摘要 status=done 并停止，broker 兜底 gate",
+                ),
+            )
+        except OSError:
+            pass
+    try:
+        arch = MAILBOX / "archive"
+        arch.mkdir(parents=True, exist_ok=True)
+        if path is not None and Path(path).is_file():
+            Path(path).rename(arch / f"{ask_id}.pending.json")
+    except OSError:
+        pass
+    if goal is not None:
+        goal["gate_spawn_error"] = str(exc)
+        goal.pop("pending_rework_mode", None)
+        goal["last_gate_findings"] = []
+        _write_goal(goal)
+    print(
+        f"[trial-broker] gate spawn failed (cleared gate_running): {exc}",
+        flush=True,
+    )
+
+
 def _fail_ask_after_error(path: Path, ask: dict, exc: BaseException) -> None:
     """Terminate a crashed ask instead of retrying it on every watcher tick.
 
     Writes a structured ``ok=False`` / ``HOLD`` answer when none exists yet and
     archives the pending file, so a handler crash cannot leave the ask pending
-    forever. Logs at most one line per ask.
+    forever. A pre-existing interim ``gate_running`` ack (no verdict) is
+    overwritten with the same terminal ERROR as a failed gate spawn — it must
+    never be treated as a final answer and skipped. Logs at most one line per
+    ask.
     """
     ask_id = str((ask or {}).get("ask_id") or "").strip()
     if not ask_id and path is not None:
         ask_id = path.stem
     answers = MAILBOX / "answers"
     ans_path = answers / f"{ask_id}.json" if ask_id else None
+    stale_interim = False
+    if ans_path is not None and ans_path.is_file():
+        try:
+            existing = json.loads(ans_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            existing = None
+        stale_interim = (
+            isinstance(existing, dict)
+            and str(existing.get("status") or "") == "gate_running"
+            and existing.get("verdict") is None
+        )
     try:
         if ans_path is not None and not ans_path.exists():
             answers.mkdir(parents=True, exist_ok=True)
@@ -1446,6 +1521,10 @@ def _fail_ask_after_error(path: Path, ask: dict, exc: BaseException) -> None:
                     "instruction": "broker error handling ask — end ticket",
                 },
             )
+        elif stale_interim:
+            # The interim gate_running ack is not a final answer: overwrite it,
+            # otherwise the pending ask is skipped forever (the incident).
+            _overwrite_gate_spawn_fail(ask_id, path, exc)
     except OSError:
         pass
     try:
@@ -2074,18 +2153,27 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
     review_goal_id = str((goal or {}).get("goal") or "")
     review_fp = _impl_fingerprint(Path(cwd))
     profile = T.map_profile((goal or {}).get("gate_profile") or (goal or {}).get("profile") or default_profile)
-    gec = run_open_slice(
-        ticket=gate_ticket,
-        pack_name=gate_pack,
-        profile=profile,
-        cwd=cwd,
-        role="gate",
-        summary_name=gate_summary_name,
-        prompt_mode="gate",
-        log_path=gate_log,
-        goal=goal,
-        watch_mailbox=False,
-    )
+    try:
+        gec = run_open_slice(
+            ticket=gate_ticket,
+            pack_name=gate_pack,
+            profile=profile,
+            cwd=cwd,
+            role="gate",
+            summary_name=gate_summary_name,
+            prompt_mode="gate",
+            log_path=gate_log,
+            goal=goal,
+            watch_mailbox=False,
+        )
+    except BrokerDraining as e:
+        # Drain: clear the interim ack (else it is a phantom gate forever) and
+        # re-raise so the caller can finish draining this Goal.
+        _overwrite_gate_spawn_fail(ask_id, path, e, goal=goal)
+        raise
+    except Exception as e:  # noqa: BLE001 - any spawn failure must not pin gate_running
+        _overwrite_gate_spawn_fail(ask_id, path, e, goal=goal)
+        return
     gate_summary = SUMMARIES / f"{gate_summary_name}.md"
     _adopt_misplaced_summary(gate_summary)
     gate_art = write_artifacts(
@@ -7750,12 +7838,69 @@ def _goal_processing_file(goal: dict, goal_id: str) -> Path | None:
     return fallback
 
 
+def _escalate_orphan_goal(goal: dict, goal_id: str, status: str) -> None:
+    """Escalate a non-terminal Goal whose processing job / live ticket is gone.
+
+    A Goal stuck in planning/running/closeout with no processing job can never
+    finish on its own: nothing will ever write its terminal state. Marking it
+    escalated is the only way to advance it (the incident: an orphan ran
+    forever because the old code merely logged ``left alone``).
+    """
+    goal["status"] = "escalated"
+    goal["escalate_reason"] = "orphan_running_no_processing"
+    goal["error"] = "running/planning/closeout but processing job missing; no live ticket"
+    _write_goal(goal)
+    try:
+        _notify_goal_event(
+            goal,
+            kind="escalate",
+            ok=False,
+            reason="orphan_running_no_processing",
+            suggested_action="无 processing job / 活票：人工收口或重新投递该 Goal",
+        )
+    except Exception as e:  # noqa: BLE001 - notify must never block reconciliation
+        print(f"[trial-broker] orphan escalate notify failed {goal_id}: {e}", flush=True)
+    print(
+        f"[trial-broker] escalate orphan goal {goal_id} (no processing job) status={status}",
+        flush=True,
+    )
+
+
+def reconcile_orphan_running_goals() -> list[str]:
+    """Escalate every non-terminal Goal with no processing job (startup sweep).
+
+    Returns the escalated goal ids. Safe to call from startup and from the
+    watchdog's sibling sweep; a Goal that still owns a processing job is left
+    untouched.
+    """
+    escalated: list[str] = []
+    if not GOALS.is_dir():
+        return escalated
+    for path in sorted(GOALS.glob("*.json")):
+        try:
+            goal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(goal, dict):
+            continue
+        status = str(goal.get("status") or "")
+        if status not in RESUMABLE_GOAL_STATUSES:
+            continue
+        goal_id = str(goal.get("goal") or path.stem)
+        if _goal_processing_file(goal, goal_id) is not None:
+            continue
+        _escalate_orphan_goal(goal, goal_id, status)
+        escalated.append(goal_id)
+    return escalated
+
+
 def collect_resume_items() -> list[dict]:
     """Non-terminal Goals left by a previous run, oldest first (T2 resume).
 
     A Goal is resumable when its status is planning/running/closeout and its
     processing job is still on disk. A running Goal whose processing job is
-    gone is only logged: guessing would risk a double-run.
+    gone is escalated (``orphan_running_no_processing``) instead of being
+    logged and left stuck forever.
     """
     items: list[dict] = []
     if not GOALS.is_dir():
@@ -7773,11 +7918,7 @@ def collect_resume_items() -> list[dict]:
         goal_id = str(goal.get("goal") or path.stem)
         dest = _goal_processing_file(goal, goal_id)
         if dest is None:
-            print(
-                f"[trial-broker] resume: goal {goal_id} status={status} has no "
-                "processing job; left alone",
-                flush=True,
-            )
+            _escalate_orphan_goal(goal, goal_id, status)
             continue
         try:
             job = json.loads(dest.read_text(encoding="utf-8"))
@@ -8014,6 +8155,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         clear_stale_gate_running_acks_at_start()
     except Exception as e:  # never crash startup
         print(f"[trial-broker] stale gate_running ack sweep failed: {e}", flush=True)
+    # A non-terminal Goal whose processing job vanished can never finish by
+    # itself: escalate it now instead of leaving it stuck in running forever.
+    try:
+        reconcile_orphan_running_goals()
+    except Exception as e:  # never crash startup
+        print(f"[trial-broker] orphan goal reconcile failed: {e}", flush=True)
     _write_heartbeat(0)
     if not OPEN_SLICE.is_file():
         print(f"missing {OPEN_SLICE}", file=sys.stderr)

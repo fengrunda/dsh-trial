@@ -85,6 +85,7 @@ TRIAL_SUP = DSH_HOME / "supervisor" / "trial"
 INBOX = TRIAL_SUP / "inbox"
 PROCESSING = TRIAL_SUP / "processing"
 GOALS = DSH_HOME / "supervisor" / "thin-state" / "goals"
+MAILBOX = T.MAILBOX
 NOTIFY = DSH_HOME / "bin" / "khub-dsh-complete-notify.py"
 PIDFILE = STATE_DIR / "trial-broker.pid"
 HEARTBEAT = Path(
@@ -118,6 +119,12 @@ _DSH_HOME_RE = re.compile(r"^DSH_HOME=(\S+)", re.MULTILINE)
 RUNNING_GOAL_STATES = ("running", "planning", "closeout")
 STALLED_KIND = "dsh-trial-stalled"
 FREEZE_KIND = "dsh-trial-resumed-after-freeze"
+STALE_GATE_KIND = "dsh-trial-stale-gate-running"
+ORPHAN_GOAL_KIND = "dsh-trial-orphan-running-goal"
+ORPHAN_ESCALATE_REASON = "orphan_running_no_processing"
+ORPHAN_ESCALATE_ERROR = (
+    "running/planning/closeout but processing job missing; no live ticket"
+)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -137,6 +144,11 @@ def goal_stall_timeout() -> float:
 
 def session_idle_timeout() -> float:
     return _env_float("TRIAL_WATCHDOG_SESSION_IDLE_SEC", 1800)
+
+
+def stale_gate_sec() -> float:
+    """Age after which a ``gate_running`` ack with no process is stale."""
+    return _env_float("TRIAL_WATCHDOG_STALE_GATE_SEC", 180)
 
 
 def cooldown_sec() -> float:
@@ -880,6 +892,208 @@ def _goal_age_sec(goal: dict, now: float) -> float | None:
     return None
 
 
+def _iso_age_sec(raw: str, now: float) -> float | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        from datetime import datetime
+
+        return max(0.0, now - datetime.fromisoformat(text).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def _work_pid_has_token(pids: list[int], token: str) -> bool:
+    """True when any work pid's argv contains ``token`` (e.g. a gate ticket)."""
+    if not token:
+        return False
+    for pid in pids:
+        if any(token in arg for arg in _read_proc_cmdline(pid)):
+            return True
+    return False
+
+
+def _write_goal_doc(path: Path, goal: dict) -> None:
+    goal["updated_at"] = T.now_iso()
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(goal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _goal_has_job(goal: dict, goal_id: str) -> bool:
+    """True when the Goal still owns a processing/inbox job (or declared path)."""
+    raw = str(goal.get("processing_job") or "").strip()
+    if raw:
+        cand = Path(raw)
+        if not cand.is_absolute():
+            cand = PROCESSING / cand
+        if cand.is_file():
+            return True
+    for root in (PROCESSING, INBOX):
+        if not root.is_dir():
+            continue
+        for cand in sorted(root.glob("*.json")):
+            if cand.name.endswith(".error.json"):
+                continue
+            try:
+                data = json.loads(cand.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(data, dict) and str(data.get("goal") or "") == goal_id:
+                return True
+    return False
+
+
+def _clear_stale_gate_running(
+    ask_path: Path, body: dict, threshold: float
+) -> str:
+    """Archive the interim ack and write a terminal ERROR in its place.
+
+    Mirrors the broker's own ``clear_stale_gate_running_acks_at_start`` rename
+    (``*.stale-gate-running.json``), then leaves a *final* answer so the client
+    stops polling instead of waiting on a gate that no longer has a process.
+    """
+    ask_id = str(body.get("ask_id") or ask_path.stem)
+    arch = MAILBOX / "archive"
+    try:
+        arch.mkdir(parents=True, exist_ok=True)
+        ask_path.rename(arch / f"{ask_id}.stale-gate-running.json")
+    except OSError:
+        try:
+            ask_path.unlink()
+        except OSError:
+            pass
+    new = {
+        "ask_id": ask_id,
+        "status": "done",
+        "ok": False,
+        "verdict": "ERROR",
+        "rework_mode": "",
+        "degrade": "close_ticket",
+        "error": f"stale gate_running: no process for >{threshold:.0f}s",
+        "instruction": "gate 进程消失：保持摘要 status=done 并停止，broker 兜底 gate",
+    }
+    tmp = ask_path.with_name(f".{ask_path.name}.tmp-{os.getpid()}")
+    try:
+        tmp.write_text(
+            json.dumps(new, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp, ask_path)
+    except OSError:
+        pass
+    return ask_id
+
+
+def sweep_stale_gate_running_and_orphans(
+    now: float | None = None,
+    *,
+    work_pids: list[int] | None = None,
+    dry_run: bool = False,
+) -> list[dict]:
+    """Light consistency sweep: phantom gate acks + orphaned non-terminal Goals.
+
+    A ``gate_running`` ack older than ``TRIAL_WATCHDOG_STALE_GATE_SEC`` whose
+    gate ticket has no live process can never be finalized, and a Goal in
+    planning/running/closeout with no processing job can never advance. Both are
+    reported as events every round; unless ``dry_run`` they are also repaired
+    (ack archived + ERROR answer written, Goal escalated). Never kills a live
+    process: a matching work pid means the gate/Goal is left alone.
+    """
+    now = time.time() if now is None else now
+    work_pids = list_work_pids() if work_pids is None else list(work_pids)
+    threshold = stale_gate_sec()
+    events: list[dict] = []
+
+    answers = MAILBOX / "answers"
+    if answers.is_dir():
+        for path in sorted(answers.glob("*.json")):
+            try:
+                body = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(body, dict):
+                continue
+            if str(body.get("status") or "") != "gate_running":
+                continue
+            if body.get("verdict") is not None:
+                continue
+            age = _iso_age_sec(str(body.get("started_at") or ""), now)
+            if age is None:
+                try:
+                    age = max(0.0, now - path.stat().st_mtime)
+                except OSError:
+                    age = None
+            if age is None or age <= threshold:
+                continue
+            gate_ticket = str(body.get("gate_ticket") or "")
+            if _work_pid_has_token(work_pids, gate_ticket):
+                continue
+            ask_id = str(body.get("ask_id") or path.stem)
+            if not dry_run:
+                ask_id = _clear_stale_gate_running(path, body, threshold)
+            events.append(
+                {
+                    "kind": STALE_GATE_KIND,
+                    "status": "stalled",
+                    "goal": "",
+                    "reason": (
+                        f"stale gate_running: no process for >{threshold:.0f}s "
+                        f"ask={ask_id} ticket={gate_ticket or '(none)'}"
+                    ),
+                    "suggested_action": (
+                        "gate 进程已消失：清掉 interim ack，broker 兜底 gate"
+                    ),
+                    "reason_key": f"stale_gate_running:{ask_id}",
+                }
+            )
+
+    if GOALS.is_dir():
+        for path in sorted(GOALS.glob("*.json")):
+            try:
+                goal = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(goal, dict):
+                continue
+            status = str(goal.get("status") or "")
+            if status not in RUNNING_GOAL_STATES:
+                continue
+            goal_id = str(goal.get("goal") or path.stem)
+            if _goal_has_job(goal, goal_id):
+                continue
+            if _work_pid_has_token(work_pids, goal_id):
+                continue
+            age = _goal_age_sec(goal, now)
+            if age is not None and age <= threshold:
+                continue
+            reason = (
+                f"orphan running goal status={status}: no processing job / live "
+                f"process for >{threshold:.0f}s"
+            )
+            if not dry_run:
+                goal["status"] = "escalated"
+                goal["escalate_reason"] = ORPHAN_ESCALATE_REASON
+                goal["error"] = ORPHAN_ESCALATE_ERROR
+                try:
+                    _write_goal_doc(path, goal)
+                except OSError:
+                    pass
+            events.append(
+                {
+                    "kind": ORPHAN_GOAL_KIND,
+                    "status": "escalated",
+                    "goal": goal_id,
+                    "reason": reason,
+                    "suggested_action": (
+                        "无 processing job / 活票：人工收口或重新投递该 Goal"
+                    ),
+                    "reason_key": f"orphan_running_goal:{goal_id}",
+                }
+            )
+    return events
+
+
 def _stalled_event(reason_key: str, goal: str, reason: str, suggested: str) -> dict:
     return {
         "kind": STALLED_KIND,
@@ -1378,6 +1592,12 @@ def run_once(
                 f"；watchdog 已杀僵住进程 pids={','.join(str(p) for p in killed)}"
             )
     events += idle_events
+
+    # Light consistency sweep: a phantom gate_running ack or an orphaned
+    # non-terminal Goal would otherwise stall forever. Dry runs only warn.
+    events += sweep_stale_gate_running_and_orphans(
+        now, work_pids=work_pids, dry_run=dry_run
+    )
 
     if persist:
         doc = dict(prior)

@@ -294,6 +294,12 @@ def test_grace_drops_goal_no_ticket_then_reports_it(tmp_path):
         # 1100s old on the injected wall clock of the first round.
         "updated_at": datetime.fromtimestamp(0, timezone.utc).isoformat(),
     }
+    # The Goal still owns a job (only its worker process is gone). The declared
+    # file lives outside inbox/processing so the orphan sweep leaves the Goal
+    # alone while goal_no_ticket — the rule under test — can still fire.
+    job = tmp_path / "g1.job.json"
+    job.write_text(json.dumps({"goal": "g1"}), encoding="utf-8")
+    goal["processing_job"] = str(job)
     (dirs["goals"] / "g1.json").write_text(json.dumps(goal), encoding="utf-8")
     with patch:
         _seed(wd.STATE_FILE, 1000.0, 100.0, freeze_grace_until_mono=400.0)

@@ -57,10 +57,13 @@ def _iso(when: float) -> str:
     return datetime.fromtimestamp(when, tz=timezone.utc).isoformat()
 
 
-def _goal(gid: str, now: float, *, age: float = GOAL_TIMEOUT + 120.0, status: str = "running") -> None:
+def _goal(gid: str, now: float, *, age: float = GOAL_TIMEOUT + 120.0, status: str = "running",
+          processing_job: str | None = None) -> None:
     # Filename deliberately differs from the goal id: only the JSON ``goal``
     # field may drive attribution (no accidental filename/​id substring match).
     body = {"goal": gid, "status": status, "updated_at": _iso(now - age)}
+    if processing_job is not None:
+        body["processing_job"] = processing_job
     name = gid.replace("-", "_") + ".json"
     (wd.GOALS / name).write_text(json.dumps(body), encoding="utf-8")
 
@@ -356,7 +359,12 @@ def test_freeze_round_still_suppresses_goal_no_ticket_and_stale_heartbeat(tmp_pa
     with patch:
         hb = _new_hb("g-9b2e4d")
         _heartbeat_file(now, age=HB_TIMEOUT + 500.0, doc=hb)
-        _goal("g-9b2e4d", now)
+        # The Goal still owns a job (only its worker process is gone). The job
+        # file lives outside inbox/processing so the orphan sweep skips the Goal
+        # while goal_no_ticket — the rule under test — can still fire.
+        job = tmp_path / "g-9b2e4d.job.json"
+        job.write_text(json.dumps({"goal": "g-9b2e4d"}), encoding="utf-8")
+        _goal("g-9b2e4d", now, processing_job=str(job))
         wd.STATE_FILE.write_text(
             json.dumps({"wall": now - 5.0, "mono": now - 5.0, "boot": now, "interval": 60.0}),
             encoding="utf-8",

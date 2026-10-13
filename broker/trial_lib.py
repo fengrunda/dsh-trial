@@ -47,6 +47,10 @@ DEFAULT_LIMITS = {
     # How many Goal jobs the broker may run at once. T1 only publishes the
     # resolution helper (heartbeat + tests); the T2 scheduler consumes it.
     "max_concurrent_goals": 2,
+    # Eager-offload hard character threshold (0 = off). Broker forwards this
+    # to spawned agents as DSH_OFFLOAD_THRESHOLD_CHARS; full text lands under
+    # the ticket's artifacts dir (DSH_OFFLOAD_DIR).
+    "offload_threshold_chars": 4000,
 }
 
 # Product profiles → trial profiles (ask_supervisor installed only here)

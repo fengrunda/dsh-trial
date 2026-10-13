@@ -1219,11 +1219,18 @@ def _spawn_env(
     prompt_idle_timeout_sec: int | None = None,
     slot: int | None = None,
     goal: str | None = None,
+    offload_threshold_chars: int | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     if role:
         env.pop("DSH_HOME", None)
         env["DSH_ROLE"] = str(role)
+    # impl-tokopt-b: hard character threshold for eager-offload (0 = off).
+    # With a ticket, full offloaded text lands under the ticket's artifacts dir.
+    if offload_threshold_chars is not None:
+        env["DSH_OFFLOAD_THRESHOLD_CHARS"] = str(offload_threshold_chars)
+    if ticket:
+        env["DSH_OFFLOAD_DIR"] = str(ARTIFACT_ROOT / "offload" / str(ticket))
     if "NEWAPICY1" not in env and "DEEPSEEK_API_KEY" not in env and "NEWAPICY1_API_KEY" not in env:
         print(
             "[trial-broker] note: source ~/.dsh/load-env.sh before start for API",
@@ -2485,6 +2492,7 @@ def run_open_slice(
         ),
         slot=eff_slot,
         goal=str((goal or {}).get("goal") or current_goal_id() or ""),
+        offload_threshold_chars=int(lim.get("offload_threshold_chars") or 4000),
     )
     # Job timeout must exceed the prompt hard cap. A fixed 2400s backstop
     # used to cut the slice before a still-working agent finished.

@@ -28,6 +28,13 @@ export const DEFAULT_PREVIEW_TAIL_BYTES = 1024
 export const DEFAULT_OFFLOAD_READ_MAX_INLINE_BYTES = 16384
 
 /**
+ * Hard character threshold (JS string length, not bytes): text longer than
+ * this offloads even when under the byte cap. 0 disables the threshold.
+ * Env `DSH_OFFLOAD_THRESHOLD_CHARS` overrides config `offloadThresholdChars`.
+ */
+export const DEFAULT_OFFLOAD_THRESHOLD_CHARS = 4000
+
+/**
  * Age-based clearing is opt-in: product profiles keep every tool_result in full.
  * @deprecated ageMask is a no-op on dsh 0.1.5-rc.2 / 0.2.x — `agent/pre-step`
  * never sees the full history. Kept only so existing profiles still load.
@@ -110,6 +117,25 @@ function requireNonNegInt(n, label, fallback) {
     throw new Error(`eager-offload: ${label} must be a non-negative integer (got ${n})`)
   }
   return n
+}
+
+/**
+ * Character threshold with env override: env `DSH_OFFLOAD_THRESHOLD_CHARS`
+ * (non-empty string) wins over config; config (or default) otherwise. 0 = off.
+ * @param {unknown} value
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {number}
+ */
+function resolveOffloadThresholdChars(value, env) {
+  const raw = env.DSH_OFFLOAD_THRESHOLD_CHARS
+  if (typeof raw === 'string' && raw.trim()) {
+    const parsed = Number(raw.trim())
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error(`eager-offload: DSH_OFFLOAD_THRESHOLD_CHARS must be a non-negative integer (got ${raw})`)
+    }
+    return parsed
+  }
+  return requireNonNegInt(value, 'offloadThresholdChars', DEFAULT_OFFLOAD_THRESHOLD_CHARS)
 }
 
 /**
@@ -319,7 +345,13 @@ export function normalizeContextClear(raw) {
  */
 export function normalizeConfig(config = {}, opts = {}) {
   const source = config && typeof config === 'object' ? config : {}
-  const offloadRoot = resolveOffloadRoot(source.offloadRoot, opts)
+  const env = opts.env ?? process.env
+  // Env DSH_OFFLOAD_DIR wins when non-empty (absolute path anchors as-is).
+  const envOffloadDir =
+    typeof env.DSH_OFFLOAD_DIR === 'string' && env.DSH_OFFLOAD_DIR.trim() ? env.DSH_OFFLOAD_DIR.trim() : undefined
+  const offloadRoot = resolveOffloadRoot(envOffloadDir ?? source.offloadRoot, opts)
+  // Priority: env DSH_OFFLOAD_THRESHOLD_CHARS > config > default. 0 = off.
+  const offloadThresholdChars = resolveOffloadThresholdChars(source.offloadThresholdChars, env)
   const inlineMaxBytes = requireNonNegInt(source.inlineMaxBytes, 'inlineMaxBytes', DEFAULT_INLINE_MAX_BYTES)
   const previewHeadBytes = requireNonNegInt(
     source.previewHeadBytes,
@@ -377,6 +409,7 @@ export function normalizeConfig(config = {}, opts = {}) {
 
   return {
     offloadRoot,
+    offloadThresholdChars,
     inlineMaxBytes,
     previewHeadBytes,
     previewTailBytes,
@@ -670,20 +703,21 @@ export async function maybeOffload(input) {
   }
 
   const cap = effectiveInlineMax(cfg, toolName)
-  if (totalBytes <= cap) return undefined
-  if (sessionId === undefined) return undefined
+  const thr = cfg.offloadThresholdChars ?? 0
+  // Trigger on byte cap OR hard character threshold (0 = threshold disabled).
+  if (totalBytes <= cap && !(thr > 0 && text.length > thr)) return undefined
 
   const save = input.save ?? saveOffloadFile
   const saved = await save({
     offloadRoot: cfg.offloadRoot,
-    sessionId,
+    sessionId: sessionId ?? 'nosession',
     toolName,
     callId: input.callId,
     content: text,
   })
 
   return composeReplacement(text, {
-    inlineMaxBytes: cap,
+    inlineMaxBytes: Math.min(cap, thr || cap),
     previewHeadBytes: cfg.previewHeadBytes,
     previewTailBytes: cfg.previewTailBytes,
     path: saved.path,

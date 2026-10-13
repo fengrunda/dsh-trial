@@ -7,7 +7,13 @@
   "properties": {
     "offloadRoot": {
       "type": "string",
-      "description": "Absolute path, or path relative to $DSH_HOME. Default: offload (= $DSH_HOME/offload)."
+      "description": "Absolute path, or path relative to $DSH_HOME. Default: offload (= $DSH_HOME/offload). Env DSH_OFFLOAD_DIR overrides when non-empty."
+    },
+    "offloadThresholdChars": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 4000,
+      "description": "Hard character threshold: text longer than this (chars, not bytes) offloads even under the byte cap. 0 = disabled. Env DSH_OFFLOAD_THRESHOLD_CHARS overrides."
     },
     "inlineMaxBytes": {
       "type": "integer",

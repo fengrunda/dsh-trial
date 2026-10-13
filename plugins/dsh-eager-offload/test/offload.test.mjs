@@ -469,7 +469,7 @@ test('age mask reuses existing offload path and never re-spills', async () => {
 test('age mask spills untouched old entries once and stays re-readable', async () => {
   const root = await mkdtemp(join(tmpdir(), 'eager-offload-age-'))
   try {
-    const cfg = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 1 }, { dshHome: '/tmp/x', offloadRoot: root })
+    const cfg = normalizeConfig({ ageMaskEnabled: true, ageMaskKeepRecentN: 1, offloadRoot: root }, { dshHome: '/tmp/x' })
     const body = 'FULL_OLD_BODY\n'.repeat(20)
     const r = await maskOldToolResults([toolMsg(body, { callId: 'old' }), toolMsg('NEW')], cfg, { sessionId: 'sess-age' })
 
@@ -524,4 +524,84 @@ test('age mask ignores non-tool messages and rebuilds (does not mutate) frozen i
   assert.notEqual(r.messages[1], old) // rebuilt
   assert.equal(textOf(old), 'OLD_BODY') // original not mutated
   assert.equal(r.messages.length, 3)
+})
+
+test('maybeOffload: char threshold triggers under a huge byte cap (impl-tokopt-b)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'eager-offload-'))
+  try {
+    // cap effectively infinite; 5000-char ASCII text must still offload at thr=4000.
+    const cfg = normalizeConfig(
+      { offloadRoot: root, inlineMaxBytes: 1_000_000, offloadThresholdChars: 4000 },
+      { dshHome: '/tmp/x' },
+    )
+    const body = 'a'.repeat(5000)
+    const r = await maybeOffload({ toolName: 'bash', callId: 'c-thr', text: body, sessionId: 's', cfg })
+    assert.ok(r)
+    assert.ok(r.includes(OFFLOAD_MARK))
+    const m = /path=([^)\s]+)/.exec(r)
+    assert.ok(m, 'replacement cites an offload path')
+    assert.equal(await readFile(m[1], 'utf8'), body)
+    assert.ok(Buffer.byteLength(r, 'utf8') < 5000)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('maybeOffload: DSH_OFFLOAD_DIR env wins over config offloadRoot (impl-tokopt-b)', async () => {
+  const envDir = await mkdtemp(join(tmpdir(), 'eager-offload-env-'))
+  const cfgDir = await mkdtemp(join(tmpdir(), 'eager-offload-cfg-'))
+  try {
+    const cfg = normalizeConfig(
+      { offloadRoot: cfgDir, inlineMaxBytes: 100, offloadThresholdChars: 0 },
+      { dshHome: '/tmp/x', env: { ...process.env, DSH_OFFLOAD_DIR: envDir } },
+    )
+    assert.equal(cfg.offloadRoot, envDir)
+    assert.equal(cfg.offloadThresholdChars, 0) // env threshold absent → config 0 = off
+    const body = 'x'.repeat(500)
+    const r = await maybeOffload({ toolName: 'bash', text: body, sessionId: 's', cfg })
+    assert.ok(r)
+    const m = /path=([^)\s]+)/.exec(r)
+    assert.ok(m)
+    assert.ok(m[1].startsWith(envDir), `path ${m[1]} under DSH_OFFLOAD_DIR`)
+    assert.equal(await readFile(m[1], 'utf8'), body)
+  } finally {
+    await rm(envDir, { recursive: true, force: true })
+    await rm(cfgDir, { recursive: true, force: true })
+  }
+})
+
+test('maybeOffload: DSH_OFFLOAD_THRESHOLD_CHARS env overrides config (impl-tokopt-b)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'eager-offload-'))
+  try {
+    const cfg = normalizeConfig(
+      { offloadRoot: root, inlineMaxBytes: 1_000_000, offloadThresholdChars: 0 },
+      { dshHome: '/tmp/x', env: { ...process.env, DSH_OFFLOAD_THRESHOLD_CHARS: '100' } },
+    )
+    assert.equal(cfg.offloadThresholdChars, 100)
+    // 150 chars < byte cap, but > env threshold 100 → offload.
+    const r = await maybeOffload({ toolName: 'bash', text: 'y'.repeat(150), sessionId: 's', cfg })
+    assert.ok(r)
+    assert.ok(r.includes(OFFLOAD_MARK))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('maybeOffload: missing sessionId still offloads to nosession dir (impl-tokopt-b)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'eager-offload-'))
+  try {
+    const cfg = normalizeConfig(
+      { offloadRoot: root, inlineMaxBytes: 100, offloadThresholdChars: 0 },
+      { dshHome: '/tmp/x' },
+    )
+    const body = 'z'.repeat(500)
+    const r = await maybeOffload({ toolName: 'bash', text: body, sessionId: undefined, cfg })
+    assert.ok(r)
+    const m = /path=([^)\s]+)/.exec(r)
+    assert.ok(m)
+    assert.ok(m[1].startsWith(root), `path ${m[1]} under offload root despite missing sessionId`)
+    assert.equal(await readFile(m[1], 'utf8'), body)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })

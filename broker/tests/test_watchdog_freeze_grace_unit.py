@@ -135,7 +135,7 @@ def test_freeze_wall_jump_with_fresh_heartbeat_only_reports_freeze(tmp_path):
     # The drift is what the wall clock gained on the monotonic clock: 8.7h − 60s.
     assert freeze["jump_sec"] == pytest.approx(FREEZE_SEC - 60.0)
     assert "521.0 min" in freeze["reason"] and "wall-mono" in freeze["reason"]
-    assert "120s grace" in freeze["reason"]
+    assert f"{wd.freeze_grace_sec(60.0):.0f}s grace" in freeze["reason"]
 
 
 # --- (a2) the freeze round still holds the stale pre-freeze heartbeat --------
@@ -165,7 +165,9 @@ def test_freeze_round_stale_heartbeat_is_graced(tmp_path):
     assert second["freeze"] is False
     assert second["grace_active"] is True
     assert _keys(second) == []
-    assert doc["freeze_grace_until_mono"] == pytest.approx(now_mono + 120.0)
+    assert doc["freeze_grace_until_mono"] == pytest.approx(
+        now_mono + wd.freeze_grace_sec(60.0)
+    )
     assert doc["loop_pid"] == os.getpid()
     assert doc["interval"] == pytest.approx(60.0)
 
@@ -180,13 +182,24 @@ def test_heartbeat_stale_after_grace_window(tmp_path):
         freeze_wall, freeze_mono = 1000.0 + FREEZE_SEC, 160.0
         assert _run(freeze_wall, freeze_mono, boot=_boot_for(freeze_mono))["freeze"]
 
-        # 150s later the 120s grace (floored at the 60s loop interval) is over.
-        now, now_mono = freeze_wall + 150.0, freeze_mono + 150.0
-        result = _run(now, now_mono, boot=_boot_for(now_mono))
+        # Walk past the grace window (floored at the loop interval and twice
+        # the heartbeat timeout) in loop-sized steps: the never-recovered
+        # heartbeat then surfaces as exactly one merged freeze_stalled instead
+        # of a bare heartbeat_stale.
+        grace = wd.freeze_grace_sec(60.0)
+        now, now_mono = freeze_wall, freeze_mono
+        result = None
+        while now_mono < freeze_mono + grace:
+            now += 60.0
+            now_mono += 60.0
+            result = _run(now, now_mono, boot=_boot_for(now_mono))
 
     assert result["freeze"] is False
     assert result["grace_active"] is False
-    assert "heartbeat_stale" in _keys(result)
+    assert "heartbeat_stale" not in _keys(result)
+    assert _keys(result).count("freeze_stalled") == 1
+    stalled = next(e for e in result["events"] if e["reason_key"] == "freeze_stalled")
+    assert stalled["kind"] == wd.STALLED_KIND
 
 
 # --- (c) no clock jump: an expired heartbeat stalls exactly as before ---------
@@ -355,3 +368,95 @@ def test_grace_deadline_bound_and_tolerance():
     assert wd.grace_is_active(50.0, True, state, 120.0) is True
     # Unbounded legacy call (no grace_sec) still trusts the stored deadline.
     assert wd.grace_is_active(50.0, False, state) is True
+
+
+# --- (f) pending freeze: heartbeat recovers inside the grace window ----------
+
+def test_pending_freeze_heartbeat_recovers_sends_nothing(tmp_path):
+    """Wall jumps 1h; the broker renews its heartbeat by the very next round.
+
+    The freeze round parks the event in ``pending_freeze`` instead of sending
+    it, and the recovery round clears the pending verdict with a log line
+    only — nothing is ever sent.
+    """
+    patch, _ = _patch_state(tmp_path)
+    with patch:
+        state = wd.STATE_FILE
+        _seed(state, 1000.0, 100.0)
+        _heartbeat(1000.0, age=5.0)  # stale the moment the freeze ends
+        freeze_wall, freeze_mono = 1000.0 + 3600.0, 160.0
+        first = _run(freeze_wall, freeze_mono, boot=_boot_for(freeze_mono))
+        assert first["freeze"] is True
+        assert first["sent"] == []
+        doc = json.loads(state.read_text(encoding="utf-8"))
+        assert doc["pending_freeze"]["grace_until"] == pytest.approx(
+            freeze_mono + wd.freeze_grace_sec(60.0)
+        )
+
+        # Next round, still inside the grace window: heartbeat is back.
+        now, now_mono = freeze_wall + 60.0, freeze_mono + 60.0
+        _heartbeat(now, age=5.0)
+        second = _run(now, now_mono, boot=_boot_for(now_mono))
+        doc = json.loads(state.read_text(encoding="utf-8"))
+
+    assert second["freeze"] is False
+    assert second["grace_active"] is True
+    assert second["sent"] == []
+    assert "freeze_stalled" not in _keys(second)
+    # Recovery only logs: the pending verdict is cleared, never sent.
+    assert "pending_freeze" not in doc
+
+
+# --- (g) pending freeze: heartbeat never recovers -> one merged stalled ------
+
+def test_pending_freeze_never_recovers_merges_exactly_one_stalled(tmp_path):
+    """Wall jumps 1h and the heartbeat never renews: after the grace window
+    the pending freeze merges into exactly one freeze_stalled alert."""
+    patch, _ = _patch_state(tmp_path)
+    with patch:
+        state = wd.STATE_FILE
+        _seed(state, 1000.0, 100.0)
+        _heartbeat(1000.0, age=5.0)  # never touched again
+        freeze_wall, freeze_mono = 1000.0 + 3600.0, 160.0
+        first = _run(freeze_wall, freeze_mono, boot=_boot_for(freeze_mono))
+        assert first["freeze"] is True
+        assert first["sent"] == []
+
+        grace = wd.freeze_grace_sec(60.0)
+
+        # Inside the grace window: pending is kept, nothing is sent.
+        mid = _run(
+            freeze_wall + 60.0, freeze_mono + 60.0,
+            boot=_boot_for(freeze_mono + 60.0),
+        )
+        assert mid["sent"] == []
+        assert "freeze_stalled" not in _keys(mid)
+        doc = json.loads(state.read_text(encoding="utf-8"))
+        assert "pending_freeze" in doc
+
+        # Past the grace window, heartbeat still stale: exactly one stalled.
+        # Walk in loop-sized steps so the loop-interval freeze criterion does
+        # not fire on the fast-forwarded monotonic clock.
+        now, now_mono = freeze_wall + 60.0, freeze_mono + 60.0
+        last = mid
+        doc = {}
+        while now_mono < freeze_mono + grace:
+            now += 60.0
+            now_mono += 60.0
+            last = _run(now, now_mono, boot=_boot_for(now_mono))
+            doc = json.loads(state.read_text(encoding="utf-8"))
+            if now_mono < freeze_mono + grace:
+                assert last["sent"] == []
+                assert "freeze_stalled" not in _keys(last)
+                assert "pending_freeze" in doc
+
+    assert last["freeze"] is False
+    assert last["grace_active"] is False
+    assert "heartbeat_stale" not in _keys(last)
+    stalled_sent = [e for e in last["sent"] if e.get("reason_key") == "freeze_stalled"]
+    assert len(stalled_sent) == 1
+    assert stalled_sent[0]["kind"] == wd.STALLED_KIND
+    assert stalled_sent[0]["status"] == "stalled"
+    assert stalled_sent[0]["jump_sec"] == pytest.approx(3600.0 - 60.0)
+    # The pending verdict is consumed by the merged alert.
+    assert "pending_freeze" not in doc

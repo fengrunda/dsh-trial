@@ -146,11 +146,14 @@ _AUTO = object()
 
 
 def freeze_grace_sec(expected_interval: float | None = None) -> float:
-    """Grace after a detected freeze, never shorter than one loop interval."""
+    """Grace after a detected freeze, floored at the loop interval and at
+    twice the heartbeat timeout (a broker that just froze needs at least two
+    missed-heartbeat beats of slack before a stall verdict is trustworthy)."""
     grace = _env_float("TRIAL_WATCHDOG_FREEZE_GRACE_SEC", FREEZE_GRACE_DEFAULT_SEC)
+    floor = 2.0 * heartbeat_timeout()
     if expected_interval is not None:
-        grace = max(grace, float(expected_interval))
-    return max(0.0, grace)
+        floor = max(floor, float(expected_interval))
+    return max(0.0, grace, floor)
 
 
 def boottime_now() -> float | None:
@@ -1194,7 +1197,65 @@ def run_once(
     goal_pids = work_pid_goals(work_pids, now=now)
     if grace_active:
         events = [e for e in events if not is_clock_related_stall(e)]
+
+    # Freeze events are never sent in the round that detects them: the wall
+    # clock just lied, so park them in ``pending_freeze`` and decide next
+    # round, once the grace window has shown whether the broker recovered.
+    prior_pending = prior.get("pending_freeze")
+    prior_pending = prior_pending if isinstance(prior_pending, dict) else None
+    pending_freeze: dict | None = None
+    pending_drop: tuple[str, ...] = ("pending_freeze",)
+    freeze_stalled: dict | None = None
+    if freeze:
+        pending_freeze = {
+            "detected_wall": float(now),
+            "detected_mono": float(now_mono),
+            "grace_until": float(grace_until) if grace_until is not None else None,
+            "jump_sec": float(freeze_events[0].get("jump_sec") or 0.0),
+            "criteria": list(freeze_events[0].get("criteria") or []),
+        }
+        pending_drop = ()
+    elif prior_pending is not None:
+        try:
+            until = float(prior_pending.get("grace_until"))
+        except (TypeError, ValueError):
+            until = None
+        age = heartbeat_age(now=now)
+        if age is not None and age <= heartbeat_timeout():
+            # The heartbeat came back: the broker survived the freeze. Drop the
+            # pending verdict with a log line only — nothing is ever sent.
+            print(
+                "[trial-watchdog] freeze pending 清除：心跳已恢复，仅记录日志",
+                file=sys.stderr, flush=True,
+            )
+        elif until is not None and now_mono < until:
+            # Grace still running and the heartbeat has not recovered: keep
+            # the pending verdict for a later round.
+            pending_freeze = prior_pending
+            pending_drop = ()
+        else:
+            # Grace over and the heartbeat never came back: merge every
+            # freeze-suppressed clock stall into exactly one stalled alert.
+            detected_mono = float(prior_pending.get("detected_mono") or now_mono)
+            freeze_stalled = {
+                "kind": STALLED_KIND,
+                "status": "stalled",
+                "goal": "*",
+                "reason": (
+                    f"freeze 宽限已过（{(until or 0.0) - detected_mono:.0f}s）心跳仍未恢复；"
+                    f"冻结检测于 {float(prior_pending.get('detected_wall') or now):.0f} "
+                    f"(wall)，合并冻结期间抑制的心跳停滞为一条 stalled"
+                ),
+                "suggested_action": "检查 broker 进程是否存活，必要时 salvage",
+                "reason_key": "freeze_stalled",
+                "criteria": list(prior_pending.get("criteria") or []),
+                "jump_sec": float(prior_pending.get("jump_sec") or 0.0),
+            }
+            events = [e for e in events if not is_clock_related_stall(e)]
+
     events += freeze_events
+    if freeze_stalled is not None:
+        events.append(freeze_stalled)
     idle_events, idle_state = collect_session_idle_events(
         work_pids, now_mono, prior.get("session_idle") or {}, goal_pids
     )
@@ -1208,15 +1269,22 @@ def run_once(
             )
         )
         doc["session_idle"] = idle_state
-        write_watchdog_state(
-            doc,
-            drop=() if grace_until is not None else ("freeze_grace_until_mono",),
-        )
+        if pending_freeze is not None:
+            doc["pending_freeze"] = pending_freeze
+        drop = list(pending_drop)
+        if grace_until is None:
+            drop.append("freeze_grace_until_mono")
+        write_watchdog_state(doc, drop=tuple(drop))
 
     sent: list[dict] = []
     suppressed: list[str] = []
     for ev in events:
         key = str(ev.get("reason_key") or ev.get("reason") or "")
+        if freeze and any(ev is fe for fe in freeze_events):
+            # Parked in pending_freeze this round; the verdict (or silence)
+            # arrives in a later round once the grace window has elapsed.
+            suppressed.append(key)
+            continue
         if not dedupe.should_send(key, now):
             suppressed.append(key)
             continue

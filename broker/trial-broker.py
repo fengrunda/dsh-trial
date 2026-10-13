@@ -877,6 +877,8 @@ def load_job(path: Path) -> dict:
             "auto_supervisor_answer": data.get("auto_supervisor_answer", True),
             "on_slice_fail": data.get("on_slice_fail"),  # stop (default) | continue
             "slices_spec": data.get("slices_spec"),  # optional explicit multi-slice list
+            "khub_keywords": data.get("khub_keywords"),  # optional khub concept keywords
+            "khub_inject": data.get("khub_inject"),  # optional bool; False disables injection
         }
 
     # default single ticket
@@ -3823,6 +3825,68 @@ def clear_stale_gate_running_acks_at_start() -> list[str]:
     return cleared
 
 
+KHUB_GOAL_CONTEXT_MAX_BYTES = 2500
+KHUB_GOAL_CONTEXT_HEADING = "## khub 上下文"
+
+
+def _khub_unavailable(reason: str) -> str:
+    one_line = " ".join(str(reason).split()) or "unknown"
+    return f"{KHUB_GOAL_CONTEXT_HEADING}\n- khub 上下文不可用：{one_line}"
+
+
+def _khub_goal_context(job: dict) -> str | None:
+    """Return an optional ``## khub 上下文`` block for the goal brief pack.
+
+    Never raises: any failure degrades to an explicit ``不可用`` note so the
+    supervisor still gets a usable brief. Returns ``None`` when injection is
+    disabled (``khub_inject: false``).
+    """
+    if job.get("khub_inject") is False:
+        return None
+
+    script = os.environ.get("DSH_KHUB_GOAL_CONTEXT", "/workspace/tools/khub-goal-context.py")
+    goal_id = str(job.get("goal") or job.get("id") or "")
+    brief = str(job.get("brief") or "")
+    first_line = brief.strip().splitlines()[0].strip() if brief.strip() else ""
+    title = f"{goal_id} {first_line}".strip()
+
+    kw_raw = job.get("khub_keywords")
+    if isinstance(kw_raw, (list, tuple)):
+        keywords = ",".join(str(k) for k in kw_raw)
+    elif kw_raw is None:
+        keywords = ""
+    else:
+        keywords = str(kw_raw)
+
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, script,
+                "--title", title,
+                "--keywords", keywords,
+                "--k", "8",
+                "--max-bytes", str(KHUB_GOAL_CONTEXT_MAX_BYTES),
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return _khub_unavailable("子进程超时（10s）")
+    except Exception as e:  # noqa: BLE001 - degrade, never break the brief pack
+        return _khub_unavailable(f"{type(e).__name__}: {e}")
+
+    if proc.returncode != 0:
+        return _khub_unavailable(f"脚本退出码 {proc.returncode}")
+    out = (proc.stdout or "").strip()
+    if not out:
+        return _khub_unavailable("脚本无输出")
+
+    if not out.startswith(KHUB_GOAL_CONTEXT_HEADING):
+        out = f"{KHUB_GOAL_CONTEXT_HEADING}\n{out}"
+    # Ensure the whole block (heading included) stays within the byte budget.
+    out, _ = _truncate_bytes(out, KHUB_GOAL_CONTEXT_MAX_BYTES, note="")
+    return out
+
+
 def build_goal_brief_pack(job: dict) -> str:
     goal_id = job["goal"]
     slice_hint = job.get("suggested_slice") or f"{goal_id}-s1"
@@ -3831,6 +3895,8 @@ def build_goal_brief_pack(job: dict) -> str:
     if isinstance(accept_hint, str):
         accept_hint = [accept_hint]
     accept_json = json.dumps(accept_hint, ensure_ascii=False, indent=2)
+    khub_ctx = _khub_goal_context(job)
+    khub_block = f"\n{khub_ctx}\n" if khub_ctx else ""
     name = f"goal-{goal_id}-brief.pack.md"
     path = PACKS / name
     body = f"""---
@@ -3848,13 +3914,14 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/goal-{goal_id}-plan.md
 
 ## Brief
 {job['brief']}
-
+{khub_block}
 ## Constraints
 - Write at most {job.get('max_slices') or 1} slice pack(s) under packs/ (one pack per slice).
 - If more than one slice, emit `action=emit_chains` with a `slices` list; a single slice may keep the legacy `emit_chain` fields.
 - Leave **one** deliberate ambiguity in exactly one slice pack so foreman must ask (status=question).
 - 禁止把「已开 PR / PR URL / dsh-trial-pr 证据 / 未合并 PR」写进 **gate** acceptance；PR 仅在 gate PASS 之后由 impl/`dsh-trial-pr` 或 supervisor-close 核对。
 - Do not modify business src yourself.
+- slice pack 保留 khub 上下文里用到的概念 id（不复制摘要），worker 用 hub_resolve 展开。
 - acceptance_hint (optional guidance for your acceptance list):
 ```json
 {accept_json}

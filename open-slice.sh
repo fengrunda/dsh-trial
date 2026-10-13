@@ -380,6 +380,7 @@ if [[ -z "$INF_ROLE" ]]; then
 fi
 [[ -n "$INF_ROLE" ]] && ensure_role_pack_bridge "$INF_ROLE"
 
+# 每切片/每票新 ACP 会话，切片间只经 thin-state 摘要（broker 往 pack 追加 digest，勿 resume 旧会话）
 ARGS=(--profile "$PROFILE" --ticket "$TICKET" --cwd "$CWD" --prompt "$PROMPT" --new)
 [[ -n "$ROLE" ]] && ARGS+=(--role "$ROLE")
 # Non-empty only: when unset, dsh-acp-ask.py falls back to DSH_REASONING_EFFORT /

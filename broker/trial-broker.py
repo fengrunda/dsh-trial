@@ -5816,6 +5816,72 @@ def _chain_resume_point(chain: dict, default_pack: str) -> tuple[int, str]:
     return last_round, pack
 
 
+PRIOR_SLICES_HEADING = (
+    "## Prior slices (thin-state digest; 新会话，勿 resume 旧会话，需细节自行 sed -n 读路径)"
+)
+PRIOR_SLICES_DIGEST_MAX = 1500
+
+
+def _chain_last_commit(chain: dict) -> str:
+    """First non-empty ``commit`` value found anywhere in the chain dict."""
+    stack: list = [chain]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "commit" and v:
+                    return str(v)
+                stack.append(v)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return ""
+
+
+def build_prior_slices_digest(goal_id: str, done_slice_ids: list[str]) -> str:
+    """One thin-state line per already-PASS slice, for a fresh slice session.
+
+    Deliberately pointers-only: no summary bodies are inlined, so a new ACP
+    session starts cheap and reads details itself via the printed paths.
+    """
+    lines = [f"# goal={goal_id} prior slices ({len(done_slice_ids)})"]
+    for sid in done_slice_ids:
+        chain = _read_chain(str(sid)) or {}
+        state = str(chain.get("state") or "?")
+        commit = _chain_last_commit(chain)
+        summary = ""
+        for rec in chain.get("rounds") or []:
+            if not isinstance(rec, dict):
+                continue
+            for k in ("summary", "impl_summary", "gate_summary"):
+                if rec.get(k):
+                    summary = str(rec[k])
+        if not summary:
+            summary = str(chain.get("handoff_summary") or "")
+        lines.append(f"- {sid}: state={state} last_commit={commit} summary={summary}")
+    text = "\n".join(lines)
+    if len(text) > PRIOR_SLICES_DIGEST_MAX:
+        text = text[: PRIOR_SLICES_DIGEST_MAX - 15].rstrip() + "\n…(truncated)"
+    return text
+
+
+def _append_prior_slices_digest(pack_abs: Path, goal_id: str, done_slice_ids: list[str]) -> None:
+    """Append the prior-slices digest to a fresh slice's pack (idempotent)."""
+    if not done_slice_ids or not pack_abs.is_file():
+        return
+    try:
+        current = pack_abs.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if PRIOR_SLICES_HEADING in current:
+        return
+    digest = build_prior_slices_digest(goal_id, done_slice_ids)
+    try:
+        with pack_abs.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n{PRIOR_SLICES_HEADING}\n{digest}\n")
+    except OSError:
+        return
+
+
 def _execute_goal_slices(
     goal_state: dict,
     job: dict,
@@ -5847,6 +5913,9 @@ def _execute_goal_slices(
     rc = 0
     last_chain: dict | None = None
     last_chain_job: dict | None = None
+    # Slices already PASS: fresh slices get a thin-state digest appended to
+    # their pack so every slice runs in a brand-new ACP session (no resume).
+    done_slices: list[str] = []
     for spec in slice_specs:
         slice_id = str(spec["slice"])
         existing = _read_chain(slice_id) if (skip_passed or resume) else None
@@ -5856,6 +5925,7 @@ def _execute_goal_slices(
         if existing_state == VERDICT_PASS:
             last_chain = existing
             last_chain_job = _chain_job_from_chain(job, existing, slice_id, spec, goal_id)
+            done_slices.append(slice_id)
             print(
                 f"[trial-broker] goal {goal_id} skip already-PASS slice={slice_id}",
                 flush=True,
@@ -5957,6 +6027,10 @@ def _execute_goal_slices(
                 f"[trial-broker] goal {goal_id} → chain slice={slice_id} pack={pack_name}",
                 flush=True,
             )
+        if not resuming_chain:
+            # Fresh slice ⇒ fresh ACP session: hand it thin-state pointers to
+            # prior PASS slices instead of letting it resume their sessions.
+            _append_prior_slices_digest(pack_abs, goal_id, done_slices)
         rc = run_chain_rounds(
             chain_job,
             chain,
@@ -5975,6 +6049,7 @@ def _execute_goal_slices(
             m = goal_state.setdefault("metrics", T.empty_metrics())
             m["slices_completed"] = int(m.get("slices_completed") or 0) + 1
             _write_goal(goal_state)
+            done_slices.append(slice_id)
             continue
         if state == "closeout":
             # Limit stop with work in the tree. Not failed, not a new impl, not PASS.

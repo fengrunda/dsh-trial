@@ -217,18 +217,26 @@ def test_pack_build_oserror_spends_no_round_and_archives(tmp_path: Path):
             assert goal["review_seq"] == 4              # unchanged
             ans = _answer(dirs, "t3c-gate-1")
             assert ans["ok"] is False
-            assert ans["verdict"] == "HOLD"
+            assert ans["verdict"] == "ERROR"
+            assert ans["rework_mode"] == ""
+            assert ans["degrade"] == "close_ticket"
             assert ans["status"] == "done"
             assert "no such dir" in ans["error"]
             assert archive.is_file()                     # archived → watcher stops
-            assert (dirs["goals"] / f"{GOAL_ID}.json").is_file() is False
+            # the goal is flagged so the chain runs the regular broker gate
+            # instead of opening a fix ticket, and no stale findings survive.
+            saved_goal = json.loads(
+                (dirs["goals"] / f"{GOAL_ID}.json").read_text(encoding="utf-8")
+            )
+            assert saved_goal["gate_pack_error"] == "no such dir"
+            assert saved_goal["last_gate_findings"] == []
 
             # second pass (the watcher's 2 s retry) — still no bump
             tb._handle_submit_for_review(
                 ask, archive, default_profile="acp-lite", cwd=str(tmp_path), goal=goal,
             )
             assert goal["review_seq"] == 4
-            assert _answer(dirs, "t3c-gate-1")["verdict"] == "HOLD"
+            assert _answer(dirs, "t3c-gate-1")["verdict"] == "ERROR"
 
         assert list(dirs["packs"].glob("*gate*")) == []
 

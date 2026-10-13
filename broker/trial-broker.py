@@ -2015,10 +2015,21 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
             )
     except Exception as e:  # a bad slice id (e.g. "/") must never burn a round
         T.write_ask_answer(ask_id, f"[error] gate pack: {e}", supervisor_ticket="(error)")
-        # overwrite with structured fail
+        # overwrite with structured fail — the round is never consumed
         (MAILBOX / "answers" / f"{ask_id}.json").write_text(
-            json.dumps({"ask_id": ask_id, "status": "done", "ok": False, "error": str(e), "verdict": "HOLD",
-                        "rework_mode": "fresh", "instruction": "pack error — end ticket"}, ensure_ascii=False, indent=2) + "\n"
+            json.dumps({"ask_id": ask_id, "status": "done", "ok": False, "error": str(e),
+                        "verdict": "ERROR", "rework_mode": "", "degrade": "close_ticket",
+                        "instruction": f"gate pack 构建失败：{e}；保持摘要 status=done 并停止，broker 兜底 gate"},
+                       ensure_ascii=False, indent=2) + "\n"
+        )
+        if goal is not None:
+            goal["gate_pack_error"] = str(e)
+            goal.pop("pending_rework_mode", None)
+            goal["last_gate_findings"] = []
+            _write_goal(goal)
+        print(
+            f"[trial-broker] gate pack build failed (no round consumed): {e}",
+            flush=True,
         )
         # archive pending, exactly like the precheck path — otherwise the
         # watcher re-processes the same ask every tick, forever.
@@ -2033,6 +2044,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
 
     # T2: the pack is on disk, so the round is real — persist it now.
     if goal is not None:
+        _clear_gate_pack_error(goal)
         goal["review_seq"] = round_n
         grbs = goal.setdefault("gate_rounds_by_slice", {})
         grbs[slice_id] = int(grbs.get(slice_id) or 0) + 1
@@ -2104,6 +2116,9 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
         pass
 
     if goal is not None:
+        # HOLD/PASS accounting: this gate round really ran, so any stale
+        # pack-build error is gone.
+        _clear_gate_pack_error(goal)
         m = goal.setdefault("metrics", T.empty_metrics())
         m["review_submit_count"] = int(m.get("review_submit_count") or 0) + 1
         if gblock.get("verdict") == VERDICT_HOLD:
@@ -2117,8 +2132,12 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                 goal["pending_rework_mode"] = mode
                 goal["pending_rework_ask_id"] = ask_id
                 goal["last_gate_findings"] = gblock.get("findings") or []
+                # A HOLD with no machine findings must not inherit the previous
+                # round's findings on the next completion guard.
+                goal["last_gate_verdict_empty_hold"] = not (gblock.get("findings") or [])
         else:
             # PASS after rework?
+            goal.pop("last_gate_verdict_empty_hold", None)
             prm = goal.pop("pending_rework_mode", None)
             if prm:
                 bucket = m.setdefault(f"rework_{prm}", {"count": 0, "steps_sum": 0, "prompt_token_total": 0, "pass_after": 0})
@@ -2378,14 +2397,18 @@ def build_delta_gate_pack(
     except (OSError, subprocess.SubprocessError):
         diff_stat = ""
     diff = _git_diff(cwd, base if base else None, commit or "HEAD")
-    diff, _ = _truncate_bytes(diff, MAX_DIFF_BYTES)
+    # Same marker as the graded truncation below: one truncation vocabulary.
+    diff, _ = _truncate_bytes(diff, MAX_DIFF_BYTES, note="\n\n…[delta pack truncated]\n")
     findings_json = json.dumps(prior_findings or [], ensure_ascii=False, indent=2)
     acc_txt, _acc_stripped = _gate_acceptance_text(acceptance)
     # label=None keeps the chain round name (r<N>); a rev ticket passes rev<N>.
     tag = label or f"r{round_n}"
     name = f"{slice_id}-gate-delta-{tag}.pack.md"
     path = PACKS / name
-    body = f"""---
+    foreman_text = (foreman_summary_text or "")[:1500]
+
+    def _assemble(diff_text: str, notes_text: str, findings_text: str) -> str:
+        return f"""---
 slice_id: {slice_id}
 kind: gate-delta
 round: {round_n}
@@ -2401,7 +2424,7 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
 
 ## 上轮 FAIL 清单 (re-check these; do not full-file review)
 ```json
-{findings_json}
+{findings_text}
 ```
 
 ## Diff --stat (base...head)
@@ -2411,11 +2434,11 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
 
 ## New diff (base...head · merge-base)
 ```diff
-{diff}
+{diff_text}
 ```
 
 ## Foreman notes
-{(foreman_summary_text or '')[:1500]}
+{notes_text}
 
 ## Done when
 - Delta-only: verify prior findings fixed; note any new P0/P1.
@@ -2423,6 +2446,39 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
 - Write verdict PASS|HOLD with machine json (findings/unmet_acceptance).
 - No room_*; do not modify business src.
 """
+
+    body = _assemble(diff, foreman_text, findings_json)
+    # Graded truncation: an oversize delta pack must never raise — the full gate
+    # pack is larger still, so falling back to it cannot help.
+    budget = MAX_PACK_BYTES - 80
+    note = "\n\n…[delta pack truncated]\n"
+    diff_show, foreman_show = diff, foreman_text
+    if len(body.encode("utf-8")) > budget:
+        # (a) shrink the diff body; Diff --stat + file list above are preserved.
+        base_len = len(_assemble("", foreman_show, findings_json).encode("utf-8"))
+        diff_show, _ = _truncate_bytes(diff_show, budget - base_len, note=note)
+        body = _assemble(diff_show, foreman_show, findings_json)
+    if len(body.encode("utf-8")) > budget:
+        # (b) shrink the Foreman notes.
+        base_len = len(_assemble(diff_show, "", findings_json).encode("utf-8"))
+        foreman_show, _ = _truncate_bytes(foreman_show, budget - base_len, note=note)
+        body = _assemble(diff_show, foreman_show, findings_json)
+    if len(body.encode("utf-8")) > budget:
+        # (c) cap every fix_hint/detail at 200 chars.
+        short_findings = []
+        for f in (prior_findings or []):
+            if isinstance(f, dict):
+                f = dict(f)
+                for k in ("fix_hint", "detail"):
+                    v = f.get(k)
+                    if isinstance(v, str) and len(v) > 200:
+                        f[k] = v[:200] + "…[delta pack truncated]"
+            short_findings.append(f)
+        findings_json = json.dumps(short_findings, ensure_ascii=False, indent=2)
+        body = _assemble(diff_show, foreman_show, findings_json)
+    if len(body.encode("utf-8")) > budget:
+        # Safety net so _enforce_pack_bytes can never raise on an oversize pack.
+        body, _ = _truncate_bytes(body, budget, note=note)
     path.write_text(body, encoding="utf-8")
     _enforce_pack_bytes(path)
     return name
@@ -2808,6 +2864,20 @@ def _resolutions_cover_findings(resolutions: list, findings: list) -> bool:
     return all(s in RESOLUTION_TERMINAL_STATUSES for s in statuses)
 
 
+def _clear_gate_pack_error(goal: dict | None) -> None:
+    """Forget a stale ``gate_pack_error`` once a gate pack build succeeds.
+
+    ``submit_for_review`` records ``gate_pack_error`` when the delta/full pack
+    build fails (no round is consumed). If it were never cleared, the
+    ``decide_impl_completion`` guard below would keep short-circuiting to
+    ``clean_done`` for the rest of the ticket. Called right after
+    ``build_delta_gate_pack``/``build_gate_pack`` returns and again in the
+    HOLD/PASS accounting block; ``goal`` may be ``None`` (no active chain).
+    """
+    if goal is not None:
+        goal.pop("gate_pack_error", None)
+
+
 def decide_impl_completion(block: dict, goal: dict | None) -> dict:
     """Guard a ``done`` impl summary that still carries unresolved P0/P1 findings.
 
@@ -2821,7 +2891,21 @@ def decide_impl_completion(block: dict, goal: dict | None) -> dict:
     Returns ``{"action": "clean_done"|"open_fix", "findings": [...], "reason": str, "mode": str}``.
     """
     goal = goal or {}
-    findings = pending_blocking_findings(goal.get("last_gate_findings"))
+    if goal.get("gate_pack_error"):
+        # The delta gate pack failed to build, so no gate round was consumed and
+        # no findings are trustworthy — let the chain run its regular broker gate
+        # instead of opening a fix ticket.
+        return {
+            "action": "clean_done",
+            "findings": [],
+            "reason": "gate pack build error; broker gate will review",
+            "mode": "",
+        }
+    if goal.get("last_gate_verdict_empty_hold"):
+        # The last HOLD carried no machine findings: nothing to inherit.
+        findings = []
+    else:
+        findings = pending_blocking_findings(goal.get("last_gate_findings"))
     mode = str(goal.get("pending_rework_mode") or "")
     if not findings:
         return {

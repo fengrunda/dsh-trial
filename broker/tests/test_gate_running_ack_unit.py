@@ -203,7 +203,9 @@ def test_pack_error_answer_carries_status_done(tmp_path: Path):
     body = json.loads((d["mailbox"] / "answers" / f"{ask_id}.json").read_text())
     assert body["status"] == "done"
     assert body["ok"] is False
-    assert body["verdict"] == "HOLD"
+    assert body["verdict"] == "ERROR"
+    assert body["rework_mode"] == ""
+    assert body["degrade"] == "close_ticket"
 
 
 if __name__ == "__main__":

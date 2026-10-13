@@ -34,6 +34,12 @@ clock-based stalls — ``heartbeat_stale`` / ``no_heartbeat`` /
 Past the grace window the old rules apply unchanged, so a heartbeat the broker
 really stopped renewing still stalls.
 
+Note on scope: ``ensure-up`` restart and wallclock freeze recovery only handle a
+*dead* process or a jumped clock — neither notices "process alive, ACP stream
+dead". That case is exactly check 4: on a ``session_idle:*`` stall the watchdog
+now reaps the stuck ticket tree (unless ``TRIAL_WATCHDOG_KILL_IDLE_ASK`` is off)
+so the broker can collect the ticket instead of hanging forever.
+
 Dedup: the same stall key is not re-sent within ``--cooldown`` seconds.
 
 ``--dry-run`` never writes state: neither the freeze baseline nor the
@@ -49,6 +55,8 @@ Env knobs (all optional):
   TRIAL_WATCHDOG_FREEZE_GRACE_SEC  post-freeze grace for clock-based stalls
                                 (default 120, never below --interval)
   TRIAL_WATCHDOG_SESSION_IDLE_SEC  live-ticket session idle threshold (default 1800)
+  TRIAL_WATCHDOG_KILL_IDLE_ASK  kill the stuck ticket tree on a session_idle
+                                stall (default on; 0/false/off/no disables)
   TRIAL_WATCHDOG_LOG_DIR        open-slice default log dir (default /workspace/tmp)
   DSH_HOMES_ROOT                ACP homes root for the session fallback
                                 (default ~/.dsh-homes)
@@ -59,6 +67,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -132,6 +141,22 @@ def session_idle_timeout() -> float:
 
 def cooldown_sec() -> float:
     return _env_float("TRIAL_WATCHDOG_COOLDOWN_SEC", 900)
+
+
+# Grace between the SIGTERM and the SIGKILL when reaping a stuck ticket tree.
+KILL_IDLE_ASK_GRACE_SEC = 1.0
+
+_KILL_IDLE_ASK_OFF = frozenset({"0", "false", "off", "no"})
+
+
+def kill_idle_ask_enabled() -> bool:
+    """Whether a ``session_idle:*`` stall may reap the stuck ticket tree.
+
+    On by default; ``TRIAL_WATCHDOG_KILL_IDLE_ASK`` set to ``0``/``false``/
+    ``off``/``no`` turns it off. An unset or empty value keeps it on.
+    """
+    raw = (os.environ.get("TRIAL_WATCHDOG_KILL_IDLE_ASK") or "").strip().lower()
+    return raw not in _KILL_IDLE_ASK_OFF
 
 
 FREEZE_GRACE_DEFAULT_SEC = 120
@@ -446,6 +471,83 @@ def _descendant_pids(pid: int, *, limit: int = 64) -> list[int]:
                 out.append(child)
                 stack.append(child)
     return out
+
+
+def pids_for_session_idle_key(key: str, work_pids: list[int]) -> list[int]:
+    """Work pids (plus descendants) owning a ``session_idle:<key>`` event.
+
+    ``key`` may carry the ``session_idle:`` prefix. A ``pid:N`` key maps to that
+    pid only when it is a known work pid; a ticket/goal key maps to every work
+    pid whose cmdline ``--ticket`` (or ``--goal``) equals it; a ``fallback:`` key
+    is not attributable to any process and yields ``[]``. Every seed's
+    descendants are included so the whole stuck tree is covered.
+    """
+    raw = str(key or "")
+    if raw.startswith("session_idle:"):
+        raw = raw.split(":", 1)[1]
+    if not raw or raw.startswith("fallback:"):
+        return []
+    work = [int(p) for p in work_pids]
+    seeds: list[int] = []
+    if raw.startswith("pid:"):
+        try:
+            pid = int(raw.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return []
+        if pid in work:
+            seeds = [pid]
+    else:
+        for pid in work:
+            argv = _read_proc_cmdline(pid)
+            if _arg_value(argv, "--ticket") == raw or _arg_value(argv, "--goal") == raw:
+                seeds.append(pid)
+    out: list[int] = []
+    for pid in seeds:
+        for cand in [pid, *_descendant_pids(pid)]:
+            if cand not in out:
+                out.append(cand)
+    return out
+
+
+def kill_idle_ask_pids(
+    pids: list[int],
+    killfn=None,
+    *,
+    grace_sec: float = KILL_IDLE_ASK_GRACE_SEC,
+) -> list[int]:
+    """SIGTERM the pids, wait briefly, then SIGKILL; return the signaled pids.
+
+    ``killfn(pid, sig)`` is injectable for tests; with an injected function the
+    graceful wait is skipped (there is nothing real to wait on) and SIGKILL is
+    attempted unconditionally. Already-dead pids and permission errors are
+    swallowed, so the caller always gets the list of pids that got a SIGTERM.
+    """
+    kill = os.kill if killfn is None else killfn
+    signaled: list[int] = []
+    for pid in pids:
+        try:
+            ipid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if ipid in signaled:
+            continue
+        try:
+            kill(ipid, signal.SIGTERM)
+        except (OSError, ValueError):
+            continue
+        signaled.append(ipid)
+    if killfn is None and signaled and grace_sec > 0:
+        deadline = time.monotonic() + float(grace_sec)
+        while time.monotonic() < deadline:
+            if not any(pid_alive(p) for p in signaled):
+                break
+            time.sleep(0.05)
+    for pid in signaled:
+        try:
+            kill(pid, signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    return signaled
 
 
 def _fd_targets(pid: int) -> list[str]:
@@ -1259,6 +1361,22 @@ def run_once(
     idle_events, idle_state = collect_session_idle_events(
         work_pids, now_mono, prior.get("session_idle") or {}, goal_pids
     )
+    kill_enabled = kill_idle_ask_enabled() and not dry_run
+    for ev in idle_events:
+        # A live-but-hung ticket never recovers on its own; reap its process
+        # tree so the broker can close the slice (never on a dry-run pass).
+        ev_pids = (
+            pids_for_session_idle_key(str(ev.get("reason_key") or ""), work_pids)
+            if kill_enabled
+            else []
+        )
+        killed = kill_idle_ask_pids(ev_pids) if (kill_enabled and ev_pids) else []
+        ev["killed_pids"] = killed
+        if killed:
+            ev["suggested_action"] = (
+                f"{ev.get('suggested_action') or ''}"
+                f"；watchdog 已杀僵住进程 pids={','.join(str(p) for p in killed)}"
+            )
     events += idle_events
 
     if persist:

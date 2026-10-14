@@ -379,11 +379,14 @@ def test_hold_does_not_wake_supervisor():
             ):
                 rc = tb.run_chain_rounds(job, chain, dest, start_round=1, start_pack=pack.name)
 
+            # Question-path auto_supervisor_answer must still NOT fire on HOLD.
             assert calls["auto"] == 0
-            assert rc == 1, rc
+            # max_rounds HOLD parks for decision (not mechanical escalate).
+            assert rc == 0, rc
             state = json.loads((dirs["chains"] / f"{slice_id}.json").read_text(encoding="utf-8"))
-            assert state["state"] == "escalated", state
-    print("OK HOLD no-wake")
+            assert state["state"] == "awaiting_supervisor", state
+            assert state.get("awaiting_reason") == "max_rounds"
+    print("OK HOLD parks max_rounds (no question-path wake)")
 
 
 def main() -> int:

@@ -13,7 +13,7 @@ Usage:
   open-slice.sh --ticket NAME --pack REL_OR_ABS [--profile acp|acp-lite]
                 [--cwd ABS] [--role gate|impl|supervisor] [--final] [--keep-open]
                 [--log PATH] [--summary-name NAME]
-                [--prompt-mode baseline|foreman|gate|supervisor-plan|supervisor-answer|supervisor-close] [--prompt-file PATH]
+                [--prompt-mode baseline|foreman|gate|supervisor-plan|supervisor-answer|supervisor-close|supervisor-max-rounds] [--prompt-file PATH]
                 [--reasoning-effort off|low|high|max] [--step-budget N]
                 [--print-prompt]
 
@@ -36,6 +36,7 @@ prompt-mode:
   supervisor-plan   — dsh 监理：读 Goal brief pack，写 slice pack + emit_chain 机器块
   supervisor-answer — dsh 监理：读问题 pack，写 chain_reply 机器块
   supervisor-close  — dsh 监理：读收尾 pack，写 goal_done 机器块
+  supervisor-max-rounds — dsh 监理：max_rounds 触顶三选一 inplace|split|escalate
   ( --prompt-file overrides the built-in template entirely )
 
 print-prompt:
@@ -345,6 +346,34 @@ PROMPT
     '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
 }
 
+build_prompt_supervisor_max_rounds() {
+  local _tpl
+  _tpl="$(cat <<'PROMPT'
+你是 dsh 试用**监理**短票（supervisor-max-rounds）。**禁止 join 任何 team-room**，禁止 room_*。不要改业务 src。
+
+读 design_pack_read path=「@@PACK_BASENAME@@」（max_rounds 触顶决策包）。在 inplace / split / escalate 中**三选一**（有界；返工≠hang，勿写 orch.nudge）。
+- inplace：同切片有界 +1（若 pack 写 bonus_used=true 则不可选 inplace，改 escalate 或 split）
+- split：结束本链决策，剩余 P0/P1 建议新 slice；Goal 可 resume
+- escalate：真升级
+
+写入摘要：「@@SUMMARY_OUT@@」，文末：
+```json
+{
+  "action": "max_rounds_decision",
+  "slice": "<slice_id>",
+  "decision": "inplace|split|escalate",
+  "notes": "一两句理由"
+}
+```
+硬禁：room_*；push / gh / dsh-trial-pr；空泛回复；打印 API key；盲抬全局 max_rounds。
+Done when: summary 含 max_rounds_decision + decision 为三选一之一。
+PROMPT
+)"
+  _render_prompt "$_tpl" \
+    '@@PACK_BASENAME@@' "$PACK_BASENAME" \
+    '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
+}
+
 if [[ -n "$PROMPT_FILE" ]]; then
   [[ -f "$PROMPT_FILE" ]] || { echo "prompt-file missing: $PROMPT_FILE" >&2; exit 2; }
   PROMPT="$(cat "$PROMPT_FILE")"
@@ -356,6 +385,7 @@ else
     supervisor-plan)   PROMPT="$(build_prompt_supervisor_plan)" ;;
     supervisor-answer) PROMPT="$(build_prompt_supervisor_answer)" ;;
     supervisor-close)  PROMPT="$(build_prompt_supervisor_close)" ;;
+    supervisor-max-rounds) PROMPT="$(build_prompt_supervisor_max_rounds)" ;;
     *) echo "unknown --prompt-mode: $PROMPT_MODE" >&2; exit 2 ;;
   esac
 fi

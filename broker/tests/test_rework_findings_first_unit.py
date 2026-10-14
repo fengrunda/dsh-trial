@@ -6,7 +6,7 @@ Locks:
 * ``decide_impl_completion`` refuses to treat ``done`` with pending P0/P1 and no
   ``finding_resolutions`` / ``rework_fresh`` handoff as a clean completion;
 * ``run_chain_rounds`` really opens a findings-first fix ticket on that guard
-  (and escalates instead of PASSing when no round remains);
+  (and parks awaiting_supervisor instead of mechanical escalate when no round remains);
 * ``decide_and_answer_review`` fresh instruction matches "broker opens a new
   fix ticket";
 * ``open-slice.sh`` foreman prompt requires ``finding_resolutions``.
@@ -231,18 +231,22 @@ def test_chain_opens_fresh_fix_ticket_on_dirty_done(tmp_path):
     assert state["state"] == "PASS"
 
 
-def test_chain_escalates_dirty_done_at_max_rounds(tmp_path):
+def test_chain_parks_dirty_done_at_max_rounds(tmp_path):
+    """fresh rework on done + round_n>=max_rounds → awaiting_supervisor, not escalated."""
     rc, state, modes, notify = _run_chain(
         tmp_path,
         max_rounds=1,
         round1_block={"status": "done", "changed_files": ["a.py"], "notes": "no handoff"},
     )
-    assert rc == 1, rc
-    assert state["state"] == "escalated"
-    assert "unresolved P0/P1" in state["escalate_reason"]
-    assert modes == ["foreman"], modes
-    # Chain escalate is terminal: Hub must be woken.
-    assert notify.called
+    assert rc == 0, rc
+    assert state["state"] == "awaiting_supervisor", state
+    assert state.get("awaiting_reason") == "max_rounds"
+    assert "max_rounds_decision_pending" in state
+    # Supervisor short ticket opened (auto); foreman only for the dirty done.
+    assert modes[0] == "foreman", modes
+    assert "supervisor-max-rounds" in modes, modes
+    # Not a terminal escalate — Hub terminal notify must NOT fire.
+    assert not notify.called
 
 
 # --- Change ②: run_ticket_job uses the same guard ---------------------------
@@ -340,18 +344,22 @@ def test_ticket_opens_fresh_fix_ticket_on_dirty_done(tmp_path):
     assert notify.called
 
 
-def test_ticket_escalates_dirty_done_at_max_rounds(tmp_path):
+def test_ticket_parks_dirty_done_at_max_rounds(tmp_path):
+    """Ticket path: dirty done at max_rounds parks awaiting_supervisor."""
     rc, state, modes, _packs, notify = _run_ticket(
         tmp_path,
         max_rounds=1,
         blocks=[{"status": "done", "changed_files": ["a.py"], "notes": "no handoff"}],
     )
-    assert rc == 1, rc
-    assert modes == ["baseline"], modes
-    assert state["status"] == "escalated"
-    assert "unresolved P0/P1" in state["escalate_reason"]
+    assert rc == 0, rc
+    assert modes[0] == "baseline", modes
+    assert "supervisor-max-rounds" in modes, modes
+    assert state["status"] == "running", state
+    assert state.get("last_chain_state") == "awaiting_supervisor"
+    assert state.get("awaiting_reason") == "max_rounds"
     assert "pending_rework_mode" not in state
-    assert notify.called
+    # Not terminal escalate.
+    assert not notify.called
 
 
 def test_ticket_rework_fresh_handoff_schedules_fix(tmp_path):
@@ -435,3 +443,159 @@ def test_open_slice_foreman_prompt_requires_finding_resolutions():
     assert "rework_fresh" in text
     # fresh wording must agree with the broker opening a new fix ticket.
     assert "另开" in text
+
+
+# --- max_rounds supervisor decision -----------------------------------------
+
+def test_parse_max_rounds_decision_variants():
+    assert tb.parse_max_rounds_decision({"decision": "inplace"}) == "inplace"
+    assert tb.parse_max_rounds_decision({"decision": "SPLIT"}) == "split"
+    assert tb.parse_max_rounds_decision({"answer": "escalate now"}) == "escalate"
+    assert tb.parse_max_rounds_decision({}, '"decision": "inplace"') == "inplace"
+    assert tb.parse_max_rounds_decision({"answer": "keep going"}) is None
+
+
+def test_build_supervisor_max_rounds_pack(tmp_path):
+    with mock.patch.object(tb, "PACKS", tmp_path):
+        name = tb.build_supervisor_max_rounds_pack(
+            slice_id="s1",
+            round_n=2,
+            max_rounds=2,
+            findings=[{"tier": "P0", "issue": "crash"}, {"tier": "P1", "issue": "typo"}],
+            reason="unresolved P0/P1 at max_rounds after rework handoff: dirty done",
+            goal_id="g1",
+            pending_pack="s1.pack.md",
+            bonus_used=False,
+        )
+        body = (tmp_path / name).read_text(encoding="utf-8")
+    assert "inplace" in body and "split" in body and "escalate" in body
+    assert "max_rounds_decision" in body
+    assert "bonus_used: false" in body
+
+
+def test_chain_max_rounds_inplace_continues(tmp_path):
+    """Supervisor decision=inplace bumps max_rounds +1 and opens fix ticket."""
+    patch, d = _dirs(tmp_path)
+    slice_id = "inplace-slice"
+    goal_id = "inplace-goal"
+    orig = d["packs"] / f"{slice_id}.pack.md"
+    orig.write_text(f"---\nslice_id: {slice_id}\n---\n# intent\n", encoding="utf-8")
+    goal = {
+        "goal": goal_id, "status": "running", "slices": [slice_id],
+        "profile": "acp-lite", "max_rounds": 1,
+        "last_gate_findings": [{"tier": "P1", "file": "a.py", "issue": "missing docstring"}],
+    }
+    (d["goals"] / f"{goal_id}.json").write_text(json.dumps(goal), encoding="utf-8")
+    modes: list[str] = []
+
+    def fake_open_slice(**kwargs):
+        modes.append(kwargs["prompt_mode"])
+        summary = d["summaries"] / f"{kwargs['summary_name']}.md"
+        kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["log_path"].write_text("log\n", encoding="utf-8")
+        if kwargs["prompt_mode"] == "foreman":
+            rnd = kwargs["ticket"].rsplit("-r", 1)[-1]
+            if str(rnd) == "1" or kwargs["ticket"].endswith("-r1"):
+                block = {"status": "done", "changed_files": ["a.py"], "notes": "no handoff"}
+            else:
+                block = {
+                    "status": "done", "changed_files": ["a.py"],
+                    "finding_resolutions": [
+                        {"finding": "missing docstring", "change": "a.py:1", "status": "fixed"}
+                    ],
+                }
+            _write_summary(summary, block)
+        elif kwargs["prompt_mode"] == "gate":
+            _write_summary(summary, {"verdict": "PASS", "findings": []})
+        elif kwargs["prompt_mode"] == "supervisor-max-rounds":
+            _write_summary(summary, {
+                "action": "max_rounds_decision",
+                "slice": slice_id,
+                "decision": "inplace",
+                "notes": "one more round",
+            })
+        return 0
+
+    def fake_artifacts(job, log_path, summary_path, ec, ticket=None):
+        return {"ticket": ticket or job.get("ticket"), "exit_code": ec, "assert_clean": True,
+                "composition": None, "summary_exists": summary_path.is_file()}
+
+    job = {
+        "id": "j-inplace", "type": "chain", "slice": slice_id, "pack": orig.name,
+        "acceptance": ["x"], "profile": "acp-lite", "gate_profile": "acp-lite",
+        "cwd": str(tmp_path), "max_rounds": 1, "goal": goal_id,
+        "defer_supervisor_close": True, "auto_supervisor_answer": True,
+    }
+    chain = tb._new_chain_state(job)
+    chain["goal"] = goal_id
+    tb._write_chain(chain)
+    dest = d["processing"] / "job-inplace.json"
+    dest.write_text("x", encoding="utf-8")
+    with patch, mock.patch.object(tb, "run_open_slice", side_effect=fake_open_slice), \
+            mock.patch.object(tb, "write_artifacts", side_effect=fake_artifacts), \
+            mock.patch.object(tb, "maybe_notify_hub", return_value={"sent": False}), \
+            mock.patch.object(tb, "_notify_goal_terminal", mock.MagicMock()):
+        rc = tb.run_chain_rounds(job, chain, dest, start_round=1, start_pack=orig.name)
+    state = json.loads((d["chains"] / f"{slice_id}.json").read_text(encoding="utf-8"))
+    assert rc == 0, (rc, state)
+    assert state["state"] == "PASS", state
+    assert state.get("max_rounds_bonus_used") is True
+    assert int(state.get("max_rounds") or 0) >= 2
+    assert "supervisor-max-rounds" in modes
+    assert modes.count("foreman") >= 2
+
+
+def test_chain_max_rounds_escalate_via_supervisor(tmp_path):
+    patch, d = _dirs(tmp_path)
+    slice_id = "esc-slice"
+    goal_id = "esc-goal"
+    orig = d["packs"] / f"{slice_id}.pack.md"
+    orig.write_text(f"---\nslice_id: {slice_id}\n---\n# intent\n", encoding="utf-8")
+    goal = {
+        "goal": goal_id, "status": "running", "slices": [slice_id],
+        "profile": "acp-lite", "max_rounds": 1,
+        "last_gate_findings": [{"tier": "P0", "file": "a.py", "issue": "crash"}],
+    }
+    (d["goals"] / f"{goal_id}.json").write_text(json.dumps(goal), encoding="utf-8")
+    modes: list[str] = []
+
+    def fake_open_slice(**kwargs):
+        modes.append(kwargs["prompt_mode"])
+        summary = d["summaries"] / f"{kwargs['summary_name']}.md"
+        kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["log_path"].write_text("log\n", encoding="utf-8")
+        if kwargs["prompt_mode"] == "foreman":
+            _write_summary(summary, {"status": "done", "changed_files": ["a.py"]})
+        elif kwargs["prompt_mode"] == "supervisor-max-rounds":
+            _write_summary(summary, {
+                "action": "max_rounds_decision", "decision": "escalate", "notes": "stuck",
+            })
+        return 0
+
+    def fake_artifacts(job, log_path, summary_path, ec, ticket=None):
+        return {"ticket": ticket or job.get("ticket"), "exit_code": ec, "assert_clean": True,
+                "composition": None, "summary_exists": summary_path.is_file()}
+
+    notify_mock = mock.MagicMock()
+    job = {
+        "id": "j-esc", "type": "chain", "slice": slice_id, "pack": orig.name,
+        "acceptance": ["x"], "profile": "acp-lite", "gate_profile": "acp-lite",
+        "cwd": str(tmp_path), "max_rounds": 1, "goal": goal_id,
+        "defer_supervisor_close": True, "auto_supervisor_answer": True,
+    }
+    chain = tb._new_chain_state(job)
+    chain["goal"] = goal_id
+    tb._write_chain(chain)
+    dest = d["processing"] / "job-esc.json"
+    dest.write_text("x", encoding="utf-8")
+    with patch, mock.patch.object(tb, "run_open_slice", side_effect=fake_open_slice), \
+            mock.patch.object(tb, "write_artifacts", side_effect=fake_artifacts), \
+            mock.patch.object(tb, "maybe_notify_hub", return_value={"sent": False}), \
+            mock.patch.object(tb, "_notify_goal_terminal", notify_mock):
+        rc = tb.run_chain_rounds(job, chain, dest, start_round=1, start_pack=orig.name)
+    state = json.loads((d["chains"] / f"{slice_id}.json").read_text(encoding="utf-8"))
+    assert rc == 1, rc
+    assert state["state"] == "escalated"
+    assert notify_mock.called
+    assert "supervisor-max-rounds" in modes
+

@@ -4288,6 +4288,493 @@ def auto_supervisor_answer(job: dict, chain: dict, *, round_n: int, block: dict)
     return answer
 
 
+
+# --- max_rounds → awaiting_supervisor decision (2026-10-14) -----------------
+# Park instead of mechanical escalate when round_n >= max_rounds with
+# unresolved P0/P1. Supervisor picks inplace(+1 once) / split / escalate.
+# Not hang/stall; do not reuse orch.nudge event names.
+
+_MAX_ROUNDS_DECISIONS = frozenset({"inplace", "split", "escalate"})
+
+
+def build_supervisor_max_rounds_pack(
+    *,
+    slice_id: str,
+    round_n: int,
+    max_rounds: int,
+    findings: list,
+    reason: str,
+    goal_id: str | None,
+    pending_pack: str,
+    bonus_used: bool,
+    wip_tip: str = "",
+) -> str:
+    """Pack for the max_rounds supervisor decision short ticket."""
+    name = f"{slice_id}-maxrounds-r{round_n}.pack.md"
+    path = PACKS / name
+    # Prefer P0, keep pack small.
+    ranked = sorted(
+        list(findings or []),
+        key=lambda f: (0 if str((f or {}).get("tier") or "").upper() == "P0" else 1),
+    )
+    excerpt = ranked[:12]
+    body = f"""---
+kind: supervisor-max-rounds
+slice_id: {slice_id}
+round: {round_n}
+max_rounds: {max_rounds}
+goal: {goal_id or ''}
+pending_impl_pack: {pending_pack}
+bonus_used: {str(bool(bonus_used)).lower()}
+wip_tip: {wip_tip}
+summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-sup-maxrounds-r{round_n}.md
+---
+
+# Supervisor max_rounds decision · {slice_id} · r{round_n}/{max_rounds}
+
+触顶是决策点，不是失败点。禁止机械 escalate。返工≠hang。
+
+## Reason
+{(reason or '')[:1500]}
+
+## Unresolved findings (P0 first)
+```json
+{json.dumps(excerpt, ensure_ascii=False, indent=2)}
+```
+
+## Options (pick exactly one)
+- **inplace**: same slice, bounded +1 round only (forbidden if bonus_used=true)
+- **split**: end this chain decision; record split advice; Goal stays resumable
+- **escalate**: real escalate + Hub notify
+
+## Instruction
+Write summary with machine block:
+```json
+{{
+  "action": "max_rounds_decision",
+  "slice": "{slice_id}",
+  "decision": "inplace|split|escalate",
+  "notes": "one line why"
+}}
+```
+"""
+    path.write_text(body, encoding="utf-8")
+    _enforce_pack_bytes(path)
+    return name
+
+
+def parse_max_rounds_decision(block: dict | None, text: str = "") -> str | None:
+    """Extract inplace|split|escalate from supervisor summary block or prose."""
+    block = block if isinstance(block, dict) else {}
+    for key in ("decision", "verdict", "choice"):
+        raw = str(block.get(key) or "").strip().lower()
+        if raw in _MAX_ROUNDS_DECISIONS:
+            return raw
+    answer = str(block.get("answer") or "").strip().lower()
+    for opt in ("inplace", "split", "escalate"):
+        if answer == opt or answer.startswith(opt + " ") or f"decision={opt}" in answer:
+            return opt
+    blob = (text or "").lower()
+    # Prefer explicit tokens near the end.
+    for opt in ("inplace", "split", "escalate"):
+        if f'"decision": "{opt}"' in blob or f'"decision":"{opt}"' in blob:
+            return opt
+    return None
+
+
+def auto_supervisor_max_rounds_decision(
+    job: dict,
+    chain: dict,
+    *,
+    round_n: int,
+    max_rounds: int,
+    findings: list,
+    reason: str,
+    goal: dict | None = None,
+) -> str | None:
+    """Open supervisor short ticket; return inplace|split|escalate or None."""
+    goal_id = job.get("goal") or chain.get("goal")
+    if goal is None and goal_id:
+        goal = _read_goal(goal_id)
+    max_sup = int(
+        (goal or {}).get("max_supervisor_tickets")
+        or job.get("max_supervisor_tickets")
+        or 8
+    )
+    if goal and int(goal.get("supervisor_ticket_count") or 0) >= max_sup:
+        print(f"[trial-broker] supervisor ticket cap {max_sup} reached (max_rounds)", flush=True)
+        return None
+    bonus_used = bool(chain.get("max_rounds_bonus_used"))
+    ask_pack = build_supervisor_max_rounds_pack(
+        slice_id=chain["slice"],
+        round_n=round_n,
+        max_rounds=max_rounds,
+        findings=list(findings or []),
+        reason=reason,
+        goal_id=goal_id,
+        pending_pack=str(chain.get("pending_impl_pack") or chain.get("pack") or ""),
+        bonus_used=bonus_used,
+        wip_tip=str(chain.get("wip_tip") or (goal or {}).get("wip_tip") or ""),
+    )
+    ticket = f"supervisor-maxrounds-{chain['slice']}-r{round_n}"
+    summary_name = f"{chain['slice']}-sup-maxrounds-r{round_n}"
+    profile = str(
+        job.get("supervisor_profile")
+        or (goal or {}).get("supervisor_profile")
+        or "acp-lite"
+    )
+    ec, art, summary_path = run_supervisor_ticket(
+        ticket=ticket,
+        pack_name=ask_pack,
+        profile=profile,
+        cwd=str(job.get("cwd") or chain.get("cwd") or "/workspace"),
+        summary_name=summary_name,
+        prompt_mode="supervisor-max-rounds",
+        goal=goal,
+    )
+    chain.setdefault("supervisor_events", []).append({
+        "kind": "max_rounds_decision",
+        "ticket": ticket,
+        "exit": ec,
+        "summary": str(summary_path),
+        "assert_clean": art.get("assert_clean"),
+        "peak": _peak_prompt(art.get("composition"))[0],
+        "steps": _peak_prompt(art.get("composition"))[1],
+        "artifacts": art,
+    })
+    _write_chain(chain)
+    parsed = _parse_supervisor_summary(summary_path)
+    decision = parse_max_rounds_decision(parsed.get("block"), parsed.get("text") or "")
+    if decision == "inplace" and bonus_used:
+        print(
+            f"[trial-broker] inplace refused (bonus already used) → escalate",
+            flush=True,
+        )
+        decision = "escalate"
+    if not decision:
+        print("[trial-broker] max_rounds supervisor decision empty", flush=True)
+        return None
+    print(
+        f"[trial-broker] max_rounds supervisor decision={decision} via {ticket}",
+        flush=True,
+    )
+    return decision
+
+
+def _park_chain_awaiting_max_rounds(
+    job: dict,
+    chain: dict,
+    *,
+    round_n: int,
+    max_rounds: int,
+    findings: list,
+    reason: str,
+    goal_obj: dict | None,
+    pack_for_impl: str,
+) -> None:
+    """Persist awaiting_supervisor for a max_rounds touch (no escalate yet)."""
+    chain["state"] = "awaiting_supervisor"
+    chain["awaiting_answer_for_round"] = round_n
+    chain["awaiting_reason"] = "max_rounds"
+    chain["pending_impl_pack"] = Path(pack_for_impl).name
+    chain["max_rounds_decision_pending"] = {
+        "at": _iso(),
+        "round_n": round_n,
+        "max_rounds": max_rounds,
+        "reason": reason,
+        "findings": list(findings or [])[:20],
+    }
+    chain.pop("escalate_reason", None)
+    _write_chain(chain)
+    if goal_obj is not None:
+        gid = str(job.get("goal") or chain.get("goal") or goal_obj.get("goal") or "")
+        g = _read_goal(gid) if gid else goal_obj
+        if g is not None:
+            g["last_chain_state"] = "awaiting_supervisor"
+            # Keep Goal running / explicitly waiting supervisor — not escalated.
+            if str(g.get("status") or "") not in ("done", "failed", "cancelled", "escalated"):
+                g["status"] = "running"
+            g["awaiting_reason"] = "max_rounds"
+            g.pop("error", None)
+            g.pop("escalate_reason", None)
+            g.pop("pending_rework_mode", None)
+            g.pop("pending_rework_ask_id", None)
+            _write_goal(g)
+
+
+def handle_max_rounds_touch(
+    job: dict,
+    chain: dict,
+    dest: Path,
+    *,
+    round_n: int,
+    max_rounds: int,
+    findings: list,
+    reason: str,
+    goal_obj: dict | None,
+    slice_id: str,
+    pack_for_impl: str,
+    source: str,
+) -> str:
+    """Park at max_rounds and optionally apply supervisor decision.
+
+    Returns one of:
+      - ``\"inplace\"`` — caller should open the next fix round (max_rounds bumped)
+      - ``\"split\"`` — decision recorded; caller returns 0 (Goal resumable)
+      - ``\"escalate\"`` — caller should write escalated + Hub notify + return 1
+      - ``\"parked\"`` — awaiting_supervisor; caller returns 0
+    """
+    _park_chain_awaiting_max_rounds(
+        job,
+        chain,
+        round_n=round_n,
+        max_rounds=max_rounds,
+        findings=findings,
+        reason=reason,
+        goal_obj=goal_obj,
+        pack_for_impl=pack_for_impl,
+    )
+    print(
+        f"[trial-broker] chain {slice_id} → awaiting_supervisor "
+        f"(max_rounds touch via {source}; r{round_n}/{max_rounds})",
+        flush=True,
+    )
+
+    auto = job.get("auto_supervisor_answer")
+    if auto is None:
+        auto = True
+    decision = None
+    if auto:
+        try:
+            decision = auto_supervisor_max_rounds_decision(
+                job,
+                chain,
+                round_n=round_n,
+                max_rounds=max_rounds,
+                findings=findings,
+                reason=reason,
+                goal=goal_obj,
+            )
+        except Exception as e:  # noqa: BLE001 — decision best-effort; stay parked
+            print(f"[trial-broker] max_rounds supervisor ticket error: {e}", flush=True)
+            decision = None
+
+    if decision == "inplace":
+        # Bounded +1 only once.
+        chain["max_rounds_bonus_used"] = True
+        new_max = max(int(chain.get("max_rounds") or max_rounds), round_n) + 1
+        chain["max_rounds"] = new_max
+        chain["state"] = "running"
+        chain["awaiting_answer_for_round"] = None
+        chain["awaiting_reason"] = None
+        chain["supervisor_decision"] = {
+            "decision": "inplace",
+            "at": _iso(),
+            "prior_max_rounds": max_rounds,
+            "new_max_rounds": new_max,
+            "source": source,
+        }
+        chain.pop("max_rounds_decision_pending", None)
+        _write_chain(chain)
+        if goal_obj is not None:
+            gid = str(job.get("goal") or chain.get("goal") or "")
+            g = _read_goal(gid) if gid else goal_obj
+            if g is not None:
+                g["last_chain_state"] = "running"
+                g["status"] = "running"
+                g.pop("awaiting_reason", None)
+                _write_goal(g)
+        print(
+            f"[trial-broker] chain {slice_id} max_rounds inplace +1 "
+            f"→ max_rounds={new_max}",
+            flush=True,
+        )
+        return "inplace"
+
+    if decision == "split":
+        chain["supervisor_decision"] = {
+            "decision": "split",
+            "at": _iso(),
+            "reason": reason,
+            "findings": list(findings or [])[:20],
+            "source": source,
+            "note": "remaining P0/P1 should go to a new slice/pack; Goal resumable",
+        }
+        chain["state"] = "awaiting_supervisor"
+        chain["awaiting_reason"] = "max_rounds_split"
+        _write_chain(chain)
+        if goal_obj is not None:
+            gid = str(job.get("goal") or chain.get("goal") or "")
+            g = _read_goal(gid) if gid else goal_obj
+            if g is not None:
+                g["last_chain_state"] = "awaiting_supervisor"
+                g["status"] = "running"
+                g["awaiting_reason"] = "max_rounds_split"
+                g["supervisor_decision"] = dict(chain["supervisor_decision"])
+                _write_goal(g)
+        _notify_awaiting_hub(
+            job, chain, reason="max_rounds_split",
+            block={"notes": reason, "questions": ["split: open new slice for remaining P0/P1"]},
+            goal=goal_obj,
+        )
+        print(
+            f"[trial-broker] chain {slice_id} max_rounds split recorded "
+            f"(Goal resumable)",
+            flush=True,
+        )
+        return "split"
+
+    if decision == "escalate":
+        chain["supervisor_decision"] = {
+            "decision": "escalate",
+            "at": _iso(),
+            "reason": reason,
+            "source": source,
+        }
+        _write_chain(chain)
+        return "escalate"
+
+    # No decision / auto off → stay parked; wake Hub for chain-reply.
+    _notify_awaiting_hub(
+        job, chain, reason="max_rounds",
+        block={"notes": reason, "questions": [
+            "max_rounds: choose inplace (+1) | split | escalate"
+        ]},
+        goal=goal_obj,
+    )
+    return "parked"
+
+
+def handle_ticket_max_rounds_touch(
+    job: dict,
+    *,
+    goal_id: str | None,
+    goal_obj: dict | None,
+    round_n: int,
+    max_rounds: int,
+    findings: list,
+    reason: str,
+    handoff: dict,
+    slice_id: str,
+    pack_for_impl: str,
+) -> str:
+    """Ticket-job variant: park Goal awaiting_supervisor; optional sync decide.
+
+    Returns inplace|split|escalate|parked (same contract as handle_max_rounds_touch).
+    """
+    # Synthesize a minimal chain-like dict so we can reuse the supervisor ticket.
+    fake_chain = {
+        "slice": slice_id,
+        "goal": goal_id,
+        "pack": pack_for_impl,
+        "pending_impl_pack": Path(pack_for_impl).name,
+        "cwd": job.get("cwd"),
+        "max_rounds": max_rounds,
+        "max_rounds_bonus_used": bool((goal_obj or {}).get("max_rounds_bonus_used")),
+        "supervisor_events": list((goal_obj or {}).get("supervisor_events") or []),
+    }
+    if goal_obj is not None and goal_id:
+        g = _read_goal(goal_id) or goal_obj
+        g["status"] = "running"
+        g["last_chain_state"] = "awaiting_supervisor"
+        g["awaiting_reason"] = "max_rounds"
+        g["last_rework_handoff"] = handoff
+        g["max_rounds_decision_pending"] = {
+            "at": _iso(),
+            "round_n": round_n,
+            "max_rounds": max_rounds,
+            "reason": reason,
+            "findings": list(findings or [])[:20],
+        }
+        g.pop("escalate_reason", None)
+        g.pop("error", None)
+        g.pop("pending_rework_mode", None)
+        g.pop("pending_rework_ask_id", None)
+        _write_goal(g)
+        goal_obj = g
+
+    print(
+        f"[trial-broker] ticket {job.get('ticket')} → awaiting_supervisor "
+        f"(max_rounds touch; r{round_n}/{max_rounds})",
+        flush=True,
+    )
+
+    auto = job.get("auto_supervisor_answer")
+    if auto is None:
+        auto = True
+    decision = None
+    if auto:
+        try:
+            decision = auto_supervisor_max_rounds_decision(
+                job,
+                fake_chain,
+                round_n=round_n,
+                max_rounds=max_rounds,
+                findings=findings,
+                reason=reason,
+                goal=goal_obj,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[trial-broker] ticket max_rounds supervisor error: {e}", flush=True)
+            decision = None
+
+    if goal_id and fake_chain.get("supervisor_events") and goal_obj is not None:
+        g = _read_goal(goal_id) or goal_obj
+        g["supervisor_events"] = list(fake_chain.get("supervisor_events") or [])
+        _write_goal(g)
+
+    if decision == "inplace":
+        if goal_id:
+            g = _read_goal(goal_id) or goal_obj
+            if g is not None:
+                g["max_rounds_bonus_used"] = True
+                new_max = max(int(g.get("max_rounds") or max_rounds), round_n) + 1
+                g["max_rounds"] = new_max
+                g["status"] = "running"
+                g["last_chain_state"] = "running"
+                g.pop("awaiting_reason", None)
+                g.pop("max_rounds_decision_pending", None)
+                g["supervisor_decision"] = {
+                    "decision": "inplace",
+                    "at": _iso(),
+                    "new_max_rounds": new_max,
+                }
+                _write_goal(g)
+        return "inplace"
+
+    if decision == "split":
+        if goal_id:
+            g = _read_goal(goal_id) or goal_obj
+            if g is not None:
+                g["status"] = "running"
+                g["last_chain_state"] = "awaiting_supervisor"
+                g["awaiting_reason"] = "max_rounds_split"
+                g["supervisor_decision"] = {
+                    "decision": "split",
+                    "at": _iso(),
+                    "reason": reason,
+                    "findings": list(findings or [])[:20],
+                }
+                _write_goal(g)
+        return "split"
+
+    if decision == "escalate":
+        return "escalate"
+
+    # Parked: do not call _ticket_goal_terminal (that would escalate/fail).
+    if goal_id:
+        _notify_awaiting_hub(
+            job,
+            {"slice": slice_id, "goal": goal_id, "state": "awaiting_supervisor"},
+            reason="max_rounds",
+            block={"notes": reason, "questions": [
+                "max_rounds: choose inplace (+1) | split | escalate"
+            ]},
+            goal=goal_obj,
+        )
+    return "parked"
+
+
 def _resolve_parent_goal_id(job: dict, chain: dict) -> str | None:
     """Real parent Goal id for a chain job, or None for a standalone chain.
 
@@ -5156,7 +5643,10 @@ def run_chain_rounds(
     goal_id = job.get("goal") or chain.get("goal")
     goal_obj = _read_goal(str(goal_id)) if goal_id else None
 
-    for round_n in range(start_round, max_rounds + 1):
+    # while (not fixed range): inplace +1 may bump max_rounds mid-loop.
+    round_n = int(start_round)
+    while round_n <= max_rounds:
+        max_rounds = max(max_rounds, int(chain.get("max_rounds") or max_rounds))
         impl_ticket = f"impl-trial-{slice_id}-r{round_n}"
         impl_summary_name = f"{slice_id}-impl-r{round_n}"
         impl_summary = SUMMARIES / f"{impl_summary_name}.md"
@@ -5456,30 +5946,58 @@ def run_chain_rounds(
             }
             round_rec["rework_handoff"] = dict(chain["rework_handoff"])
             if round_n >= max_rounds:
-                chain["state"] = "escalated"
-                chain["escalate_reason"] = (
+                # Touch → awaiting_supervisor (not mechanical escalate).
+                chain["rounds"][-1] = round_rec
+                _write_chain(chain)
+                touch_reason = (
                     "unresolved P0/P1 at max_rounds after rework handoff: "
                     + completion["reason"]
                 )
-                if goal_obj is not None:
-                    goal_obj = _read_goal(str(goal_id)) or goal_obj
-                    goal_obj.pop("pending_rework_mode", None)
-                    goal_obj.pop("pending_rework_ask_id", None)
-                    goal_obj["last_chain_state"] = "escalated"
-                    goal_obj["status"] = "escalated"
-                    goal_obj["error"] = chain["escalate_reason"]
-                    _write_goal(goal_obj)
-                chain["rounds"][-1] = round_rec
-                _write_chain(chain)
-                print(
-                    f"[trial-broker] chain {slice_id} ESCALATED r{round_n} "
-                    f"unresolved P0/P1 ({completion['reason']})",
-                    flush=True,
+                outcome = handle_max_rounds_touch(
+                    job, chain, dest,
+                    round_n=round_n,
+                    max_rounds=max_rounds,
+                    findings=blocking,
+                    reason=touch_reason,
+                    goal_obj=goal_obj,
+                    slice_id=slice_id,
+                    pack_for_impl=pack_for_impl,
+                    source="rework_handoff",
                 )
-                out = _terminal_outbox(job, chain, dest, ok=False)
-                if goal_id:
-                    _notify_goal_terminal(str(goal_id))
-                return 1
+                if outcome == "inplace":
+                    max_rounds = int(chain.get("max_rounds") or max_rounds)
+                    # Fall through to open findings-first fix ticket below.
+                elif outcome == "escalate":
+                    chain["state"] = "escalated"
+                    chain["escalate_reason"] = touch_reason
+                    if goal_obj is not None:
+                        goal_obj = _read_goal(str(goal_id)) or goal_obj
+                        goal_obj.pop("pending_rework_mode", None)
+                        goal_obj.pop("pending_rework_ask_id", None)
+                        goal_obj["last_chain_state"] = "escalated"
+                        goal_obj["status"] = "escalated"
+                        goal_obj["error"] = touch_reason
+                        goal_obj["escalate_reason"] = touch_reason
+                        _write_goal(goal_obj)
+                    _write_chain(chain)
+                    print(
+                        f"[trial-broker] chain {slice_id} ESCALATED r{round_n} "
+                        f"(supervisor decision; {completion['reason']})",
+                        flush=True,
+                    )
+                    out = _terminal_outbox(job, chain, dest, ok=False)
+                    if goal_id:
+                        _notify_goal_terminal(str(goal_id))
+                    return 1
+                else:
+                    # parked / split — Goal resumable; no terminal escalate.
+                    out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+                    print(
+                        f"[trial-broker] chain {slice_id} max_rounds {outcome} "
+                        f"outbox={out.name}",
+                        flush=True,
+                    )
+                    return 0
             next_round = round_n + 1
             try:
                 fresh_fix_pack = build_fix_pack(
@@ -5509,6 +6027,7 @@ def run_chain_rounds(
                 f"fix ticket r{next_round} pack={fresh_fix_pack}",
                 flush=True,
             )
+            round_n = next_round
             continue
 
         # Decision: HOLD never wakes supervisor (handled below via fix pack).
@@ -5808,12 +6327,44 @@ def run_chain_rounds(
                     out = _terminal_outbox(job, chain, dest, ok=True)
                     print(f"[trial-broker] chain {slice_id} PASS outbox={out.name}", flush=True)
                     return 0
-            chain["state"] = "escalated"
-            chain["escalate_reason"] = f"HOLD at max_rounds={max_rounds}"
+            # Real HOLD at cap → supervisor decision (not mechanical escalate).
+            hold_findings = list(gblock.get("findings") or [])
+            touch_reason = f"HOLD at max_rounds={max_rounds}"
+            chain["rounds"][-1] = round_rec
             _write_chain(chain)
-            out = _terminal_outbox(job, chain, dest, ok=False)
-            print(f"[trial-broker] chain {slice_id} escalated outbox={out.name}", flush=True)
-            return 1
+            outcome = handle_max_rounds_touch(
+                job, chain, dest,
+                round_n=round_n,
+                max_rounds=max_rounds,
+                findings=hold_findings,
+                reason=touch_reason,
+                goal_obj=goal_obj,
+                slice_id=slice_id,
+                pack_for_impl=pack_for_impl,
+                source="hold_at_max_rounds",
+            )
+            if outcome == "inplace":
+                max_rounds = int(chain.get("max_rounds") or max_rounds)
+                # Fall through to build_fix_pack below.
+            elif outcome == "escalate":
+                chain["state"] = "escalated"
+                chain["escalate_reason"] = touch_reason
+                _write_chain(chain)
+                out = _terminal_outbox(job, chain, dest, ok=False)
+                print(
+                    f"[trial-broker] chain {slice_id} escalated outbox={out.name} "
+                    f"(supervisor decision)",
+                    flush=True,
+                )
+                return 1
+            else:
+                out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+                print(
+                    f"[trial-broker] chain {slice_id} max_rounds {outcome} "
+                    f"outbox={out.name}",
+                    flush=True,
+                )
+                return 0
 
         next_round = round_n + 1
         try:
@@ -5837,6 +6388,8 @@ def run_chain_rounds(
             f"[trial-broker] chain {slice_id} HOLD r{round_n} → fix pack {fix_pack}",
             flush=True,
         )
+        round_n = next_round
+        continue
 
     chain["state"] = "escalated"
     chain["escalate_reason"] = "exhausted rounds"
@@ -6707,6 +7260,117 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         shutil.move(str(dest), str(FAILED / dest.name))
         return 1
 
+    # max_rounds parked: answer may be a decision (inplace|split|escalate) rather
+    # than a free-text foreman reply. Apply it before the generic reply path.
+    awaiting_reason = str(chain.get("awaiting_reason") or "")
+    if awaiting_reason in ("max_rounds", "max_rounds_split"):
+        decision = parse_max_rounds_decision(
+            {"decision": job.get("decision"), "answer": job.get("answer")},
+            str(job.get("answer") or ""),
+        )
+        pending = chain.get("max_rounds_decision_pending") or {}
+        findings = list(pending.get("findings") or [])
+        touch_reason = str(pending.get("reason") or "max_rounds chain-reply")
+        round_n = int(
+            pending.get("round_n")
+            or chain.get("awaiting_answer_for_round")
+            or len(chain.get("rounds") or [])
+            or 1
+        )
+        max_rounds = int(chain.get("max_rounds") or pending.get("max_rounds") or 2)
+        parent_goal_id = _resolve_parent_goal_id(job, chain)
+        goal_obj = _read_goal(parent_goal_id) if parent_goal_id else None
+        pack_for_impl = str(
+            chain.get("pending_impl_pack") or chain.get("pack") or ""
+        )
+        if decision == "inplace" and chain.get("max_rounds_bonus_used"):
+            decision = "escalate"
+        if decision == "inplace":
+            chain["max_rounds_bonus_used"] = True
+            new_max = max(max_rounds, round_n) + 1
+            chain["max_rounds"] = new_max
+            chain["state"] = "running"
+            chain["awaiting_answer_for_round"] = None
+            chain["awaiting_reason"] = None
+            chain["supervisor_decision"] = {
+                "decision": "inplace",
+                "at": _iso(),
+                "via": "chain-reply",
+                "new_max_rounds": new_max,
+            }
+            chain.pop("max_rounds_decision_pending", None)
+            _write_chain(chain)
+            # Fall through to generic reply resume with bumped max_rounds.
+            job = dict(job)
+            job["answer"] = str(
+                job.get("answer")
+                or "Supervisor decision=inplace: continue same slice (+1 bounded round)."
+            )
+            print(
+                f"[trial-broker] chain-reply max_rounds inplace +1 "
+                f"slice={slice_id} max_rounds={new_max}",
+                flush=True,
+            )
+        elif decision == "split":
+            chain["supervisor_decision"] = {
+                "decision": "split",
+                "at": _iso(),
+                "via": "chain-reply",
+                "reason": touch_reason,
+                "findings": findings[:20],
+                "note": "remaining P0/P1 → new slice; Goal resumable",
+            }
+            chain["awaiting_reason"] = "max_rounds_split"
+            _write_chain(chain)
+            if goal_obj is not None:
+                goal_obj["supervisor_decision"] = dict(chain["supervisor_decision"])
+                goal_obj["awaiting_reason"] = "max_rounds_split"
+                goal_obj["status"] = "running"
+                goal_obj["last_chain_state"] = "awaiting_supervisor"
+                _write_goal(goal_obj)
+            out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+            print(
+                f"[trial-broker] chain-reply max_rounds split recorded "
+                f"slice={slice_id} outbox={out.name}",
+                flush=True,
+            )
+            return 0
+        elif decision == "escalate":
+            chain["state"] = "escalated"
+            chain["escalate_reason"] = touch_reason
+            chain["supervisor_decision"] = {
+                "decision": "escalate",
+                "at": _iso(),
+                "via": "chain-reply",
+            }
+            _write_chain(chain)
+            if goal_obj is not None:
+                goal_obj["status"] = "escalated"
+                goal_obj["last_chain_state"] = "escalated"
+                goal_obj["escalate_reason"] = touch_reason
+                goal_obj["error"] = touch_reason
+                _write_goal(goal_obj)
+            out = _terminal_outbox(job, chain, dest, ok=False)
+            if parent_goal_id:
+                _notify_goal_terminal(str(parent_goal_id))
+            print(
+                f"[trial-broker] chain-reply max_rounds escalate "
+                f"slice={slice_id} outbox={out.name}",
+                flush=True,
+            )
+            return 1
+        elif not decision:
+            err = (
+                "max_rounds chain-reply needs decision=inplace|split|escalate "
+                f"(got answer={str(job.get('answer') or '')[:80]!r})"
+            )
+            print(f"[trial-broker] FAIL {err}", flush=True)
+            (FAILED / f"{dest.stem}.error.json").write_text(
+                json.dumps({"error": err, "job": job, "at": _iso()}, ensure_ascii=False, indent=2)
+            )
+            shutil.move(str(dest), str(FAILED / dest.name))
+            return 1
+
     prior_round = int(chain.get("awaiting_answer_for_round") or len(chain.get("rounds") or []) or 1)
     next_round = prior_round + 1
     max_rounds = int(chain.get("max_rounds") or 2)
@@ -7042,18 +7706,48 @@ def run_ticket_job(path: Path, job: dict) -> int:
                 "unresolved P0/P1 at max_rounds after rework handoff: "
                 + completion["reason"]
             )
-            status = "escalated"
             if goal_obj is not None:
                 goal_obj = _read_goal(goal_id) or goal_obj
                 goal_obj["last_rework_handoff"] = handoff
                 _write_goal(goal_obj)
-            print(
-                f"[trial-broker] ticket {job['ticket']} ESCALATED r{round_n} "
-                f"unresolved P0/P1 ({completion['reason']})",
-                flush=True,
+            outcome = handle_ticket_max_rounds_touch(
+                job,
+                goal_id=goal_id,
+                goal_obj=goal_obj,
+                round_n=round_n,
+                max_rounds=max_rounds,
+                findings=blocking,
+                reason=reason,
+                handoff=handoff,
+                slice_id=slice_id,
+                pack_for_impl=pack_for_impl,
             )
-            _ticket_goal_terminal(goal_id, "escalated", reason=reason)
-            break
+            if outcome == "inplace":
+                if goal_id:
+                    goal_obj = _read_goal(goal_id) or goal_obj
+                    max_rounds = int(
+                        (goal_obj or {}).get("max_rounds") or max_rounds
+                    )
+                # Fall through to open findings-first fix ticket below.
+            elif outcome == "escalate":
+                status = "escalated"
+                print(
+                    f"[trial-broker] ticket {job['ticket']} ESCALATED r{round_n} "
+                    f"(supervisor decision; {completion['reason']})",
+                    flush=True,
+                )
+                _ticket_goal_terminal(goal_id, "escalated", reason=reason)
+                break
+            else:
+                # parked / split — keep Goal running/awaiting; not failed.
+                status = "awaiting_supervisor"
+                reason = reason
+                print(
+                    f"[trial-broker] ticket {job['ticket']} max_rounds {outcome} "
+                    f"r{round_n}",
+                    flush=True,
+                )
+                break
         try:
             fresh_fix_pack = build_fix_pack(
                 slice_id=slice_id,
@@ -7109,10 +7803,11 @@ def run_ticket_job(path: Path, job: dict) -> int:
     out_path.write_text(json.dumps(out_body, ensure_ascii=False, indent=2) + "\n")
     maybe_offload_gc(force=True)
 
-    if status == "ok":
+    if status in ("ok", "awaiting_supervisor"):
         shutil.move(str(dest), str(OUTBOX / dest.name))
         print(
-            f"[trial-broker] OK outbox={out_path.name} summary={summary_path} assert_clean={result.get('assert_clean')}",
+            f"[trial-broker] OK status={status} outbox={out_path.name} "
+            f"summary={summary_path} assert_clean={result.get('assert_clean')}",
             flush=True,
         )
         return 0

@@ -430,8 +430,8 @@ def test_last_round_gate_missing_summary_with_prior_pass_is_salvaged(tmp_path: P
         print("OK gate-salvage: missing gate summary + prior PASS ->", chain["state"])
 
 
-def test_last_round_gate_missing_summary_without_pass_still_escalates(tmp_path: Path):
-    """Missing final-round gate summary but NO PASS evidence -> escalated."""
+def test_last_round_gate_missing_summary_without_pass_parks_supervisor(tmp_path: Path):
+    """Missing final-round gate summary but NO PASS evidence -> awaiting_supervisor."""
     slice_id = "unit-gp-gateesc"
     goal_id = "unit-gp-gateesc-goal"
     ctx, dirs = _patched_dirs(tmp_path / "state")
@@ -456,14 +456,15 @@ def test_last_round_gate_missing_summary_without_pass_still_escalates(tmp_path: 
 
         ec = _run_chain(_chain_job(slice_id, tmp_path, goal=goal_id), tmp_path, fake_open_slice)
         chain = json.loads((dirs["chains"] / f"{slice_id}.json").read_text())
-        assert ec != 0, ec
-        assert chain["state"] == "escalated", chain
+        assert ec == 0, ec
+        assert chain["state"] == "awaiting_supervisor", chain
+        assert chain.get("awaiting_reason") == "max_rounds"
         assert "last-round gate missing summary" not in str(chain.get("salvage_note") or ""), chain
         print("OK gate-salvage: missing gate summary + no PASS ->", chain["state"])
 
 
-def test_last_round_gate_hold_with_findings_still_escalates(tmp_path: Path):
-    """A real HOLD gate summary (findings present) must never be salvaged."""
+def test_last_round_gate_hold_with_findings_parks_supervisor(tmp_path: Path):
+    """A real HOLD gate summary (findings present) parks for supervisor; never salvaged PASS."""
     slice_id = "unit-gp-gatehold"
     goal_id = "unit-gp-gatehold-goal"
     ctx, dirs = _patched_dirs(tmp_path / "state")
@@ -492,8 +493,9 @@ def test_last_round_gate_hold_with_findings_still_escalates(tmp_path: Path):
 
         ec = _run_chain(_chain_job(slice_id, tmp_path, goal=goal_id), tmp_path, fake_open_slice)
         chain = json.loads((dirs["chains"] / f"{slice_id}.json").read_text())
-        assert ec != 0, ec
-        assert chain["state"] == "escalated", chain
+        assert ec == 0, ec
+        assert chain["state"] == "awaiting_supervisor", chain
+        assert chain.get("awaiting_reason") == "max_rounds"
         assert "last-round gate missing summary" not in str(chain.get("salvage_note") or ""), chain
         print("OK gate-salvage: real HOLD with findings ->", chain["state"])
 
@@ -512,8 +514,8 @@ def main():
         test_hold_verdict_is_not_pass_evidence(p / "f")
         test_helper_is_slice_scoped(p / "g")
         test_last_round_gate_missing_summary_with_prior_pass_is_salvaged(p / "h")
-        test_last_round_gate_missing_summary_without_pass_still_escalates(p / "i")
-        test_last_round_gate_hold_with_findings_still_escalates(p / "j")
+        test_last_round_gate_missing_summary_without_pass_parks_supervisor(p / "i")
+        test_last_round_gate_hold_with_findings_parks_supervisor(p / "j")
     print("ALL GATE-PASS-NO-FALSE-FAIL UNIT OK")
 
 

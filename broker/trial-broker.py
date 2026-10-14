@@ -1213,6 +1213,83 @@ def write_artifacts(job: dict, log_path: Path, summary_path: Path, ec: int, tick
     return result
 
 
+HUB_ENV_KEYS = ("HUB_BANK", "HUB_SCENE", "HUB_READ_ENV", "HUB_WIRE_SRC")
+DEFAULT_HUB_INTEGRATIONS_DIR = Path.home() / ".dsh" / "integrations" / "dsh"
+
+
+def hub_read_profiles_path(profiles_path: str | Path | None = None) -> Path:
+    """Resolve the hub-read-profiles registry path (env overrides first)."""
+    if profiles_path:
+        return Path(profiles_path)
+    override = os.environ.get("DSH_HUB_READ_PROFILES")
+    if override:
+        return Path(override)
+    base = os.environ.get("DSH_HUB_INTEGRATIONS_DIR")
+    root = Path(base) if base else DEFAULT_HUB_INTEGRATIONS_DIR
+    return root / "hub-read-profiles.json"
+
+
+def _hub_binding(
+    profile: str | None = None,
+    bank: str | None = None,
+    profiles_path: str | Path | None = None,
+) -> dict[str, str] | None:
+    """Map a goal/job hub binding to HUB_* env values, or ``None`` (fail-closed).
+
+    Never guesses a default and never falls back to dsh-dev: if the registry is
+    missing/broken, the id is unknown, the bank is ambiguous, or a required
+    field is absent, nothing is injected so the plugin can fail closed itself.
+    Only the ``env_file`` *path* is exposed -- its content is never read.
+    """
+    if not profile and not bank:
+        return None
+    path = hub_read_profiles_path(profiles_path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        print(f"[trial-broker] hub binding: fail-closed (read {path.name}: {type(e).__name__})", flush=True)
+        return None
+    except json.JSONDecodeError as e:
+        print(f"[trial-broker] hub binding: fail-closed (parse {path.name}: {type(e).__name__})", flush=True)
+        return None
+    if not isinstance(raw, dict):
+        print(f"[trial-broker] hub binding: fail-closed (schema {path.name}: not an object)", flush=True)
+        return None
+    entry: dict | None = None
+    if profile:
+        cand = raw.get(str(profile))
+        if not isinstance(cand, dict):
+            print(f"[trial-broker] hub binding: fail-closed (profile {profile!r} absent in {path.name})", flush=True)
+            return None
+        entry = cand
+    else:
+        matches = [v for v in raw.values() if isinstance(v, dict) and str(v.get("bank") or "") == str(bank)]
+        if len(matches) != 1:
+            print(
+                f"[trial-broker] hub binding: fail-closed (bank {bank!r}: {len(matches)} matches in {path.name})",
+                flush=True,
+            )
+            return None
+        entry = matches[0]
+    missing = [f for f in ("bank", "scene", "env_file", "wire_src") if not str(entry.get(f) or "").strip()]
+    if missing:
+        print(
+            f"[trial-broker] hub binding: fail-closed (fields {','.join(missing)} in {path.name})",
+            flush=True,
+        )
+        return None
+    binding = {
+        "HUB_BANK": str(entry["bank"]),
+        "HUB_SCENE": str(entry["scene"]),
+        "HUB_READ_ENV": str(entry["env_file"]),
+        "HUB_WIRE_SRC": str(entry["wire_src"]),
+    }
+    python = str(entry.get("python") or "").strip()
+    if python:
+        binding["HUB_PYTHON"] = python
+    return binding
+
+
 def _spawn_env(
     role: str | None,
     *,
@@ -1222,6 +1299,8 @@ def _spawn_env(
     slot: int | None = None,
     goal: str | None = None,
     offload_threshold_chars: int | None = None,
+    hub_profile: str | None = None,
+    hub_bank: str | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     if role:
@@ -1290,6 +1369,15 @@ def _spawn_env(
     else:
         env.pop("DSH_STEP_BUDGET", None)
     env.pop("NEW_API_KEY", None)
+    # hub-mount-b s2: inject HUB_* only from the goal's hub binding. The four
+    # keys are cleared unconditionally (inherited dirt included) and re-set
+    # only when the registry resolves the binding -- no default, no dsh-dev
+    # fallback. Must happen before _redact_env so the values are final.
+    binding = _hub_binding(profile=hub_profile, bank=hub_bank)
+    for key in HUB_ENV_KEYS + ("HUB_PYTHON",):
+        env.pop(key, None)
+    if binding:
+        env.update(binding)
     _ = _redact_env(env)
     return env
 
@@ -2639,6 +2727,8 @@ def run_open_slice(
         slot=eff_slot,
         goal=str((goal or {}).get("goal") or current_goal_id() or ""),
         offload_threshold_chars=int(lim.get("offload_threshold_chars") or 4000),
+        hub_profile=(goal if isinstance(goal, dict) else {}).get("hub_profile"),
+        hub_bank=(goal if isinstance(goal, dict) else {}).get("hub_bank"),
     )
     # Job timeout must exceed the prompt hard cap. A fixed 2400s backstop
     # used to cut the slice before a still-working agent finished.

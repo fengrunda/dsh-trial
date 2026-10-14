@@ -158,3 +158,54 @@ def test_overlong_stdout_truncated_to_cap(tmp_path):
     assert sec is not None
     assert len(sec) <= CAP
     assert HEADING in body
+
+
+# --- lib wiring (B): override / fail-closed / no legacy script ---------------
+
+def test_u1_all_lib_candidates_missing_degrades_without_spawn(tmp_path, monkeypatch):
+    """U1: lib 解析不到 → ``不可用``，不抛，且不 spawn 旧脚本。"""
+    patch, d = _dirs(tmp_path)
+    monkeypatch.setenv("DSH_KHUB_BRIEF_INJECT", str(tmp_path / "nope-lib.py"))
+    monkeypatch.setenv("DSH_HUB_INTEGRATIONS_DIR", str(tmp_path / "nope-dir"))
+    monkeypatch.setattr(
+        tb, "KHUB_BRIEF_INJECT_HUB_DIR_DEFAULT", str(tmp_path / "nope-hub")
+    )
+    tb._clear_khub_brief_inject_cache()
+
+    fake = mock.Mock(return_value=_ok("legacy script must not run"))
+    with patch, mock.patch.object(tb.subprocess, "run", fake):
+        name = tb.build_goal_brief_pack(_job())
+
+    body = (d["packs"] / name).read_text(encoding="utf-8")
+    assert HEADING in body
+    assert "khub 上下文不可用" in body
+    assert "brief inject lib 不可用" in body
+    assert fake.call_count == 0
+
+
+def test_u2_env_override_fake_lib_content_lands_verbatim(tmp_path, monkeypatch):
+    """U2: ``DSH_KHUB_BRIEF_INJECT`` 指向假 lib → 其内容原样进 brief pack。"""
+    patch, d = _dirs(tmp_path)
+    fake_lib = tmp_path / "fake_khub_brief_inject.py"
+    fake_lib.write_text(
+        "KHUB_GOAL_CONTEXT_MAX_BYTES = 2500\n"
+        "def khub_goal_context(job):\n"
+        "    return '## khub 上下文\\n- 假注入'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DSH_KHUB_BRIEF_INJECT", str(fake_lib))
+    tb._clear_khub_brief_inject_cache()
+
+    fake = mock.Mock(return_value=_ok("legacy script must not run"))
+    with patch, mock.patch.object(tb.subprocess, "run", fake):
+        name = tb.build_goal_brief_pack(_job())
+
+    body = (d["packs"] / name).read_text(encoding="utf-8")
+    assert "## khub 上下文\n- 假注入" in body
+    assert fake.call_count == 0
+
+
+def test_u3_no_legacy_script_path_in_broker_source():
+    """U3: 旧写死脚本路径已从 broker 源码移除。"""
+    src = (ROOT / "trial-broker.py").read_text(encoding="utf-8")
+    assert src.count("/workspace/tools/khub-goal-context.py") == 0

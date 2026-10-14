@@ -87,6 +87,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -4090,10 +4091,57 @@ def clear_stale_gate_running_acks_at_start() -> list[str]:
 KHUB_GOAL_CONTEXT_MAX_BYTES = 2500
 KHUB_GOAL_CONTEXT_HEADING = "## khub 上下文"
 
+#: Brief-inject lib (Hub-side source of truth), resolved at call time.
+KHUB_BRIEF_INJECT_LIB_NAME = "khub_brief_inject.py"
+#: Staged runtime integrations dir (s1 stages hub-read-profiles.json here).
+KHUB_BRIEF_INJECT_STAGED_DIR_DEFAULT = "~/.dsh/integrations/dsh"
+#: Last-resort source-repo fallback (box path; monkeypatchable in tests).
+KHUB_BRIEF_INJECT_HUB_DIR_DEFAULT = "/workspace/knowledge-hub/integrations/dsh"
+#: path -> loaded module; cleared by ``_clear_khub_brief_inject_cache``.
+_KHUB_BRIEF_INJECT_CACHE: dict[str, object] = {}
+
 
 def _khub_unavailable(reason: str) -> str:
     one_line = " ".join(str(reason).split()) or "unknown"
     return f"{KHUB_GOAL_CONTEXT_HEADING}\n- khub 上下文不可用：{one_line}"
+
+
+def _clear_khub_brief_inject_cache() -> None:
+    """Drop loaded lib modules (tests: avoid cross-case pollution)."""
+    _KHUB_BRIEF_INJECT_CACHE.clear()
+
+
+def _khub_brief_inject_candidates() -> list[str]:
+    """Lib candidates in priority order (override → staged dir → repo)."""
+    out: list[str] = []
+    override = (os.environ.get("DSH_KHUB_BRIEF_INJECT") or "").strip()
+    if override:
+        out.append(override)
+    staged = (os.environ.get("DSH_HUB_INTEGRATIONS_DIR") or "").strip()
+    staged_dir = staged or os.path.expanduser(KHUB_BRIEF_INJECT_STAGED_DIR_DEFAULT)
+    out.append(os.path.join(staged_dir, "lib", KHUB_BRIEF_INJECT_LIB_NAME))
+    out.append(
+        os.path.join(KHUB_BRIEF_INJECT_HUB_DIR_DEFAULT, "lib", KHUB_BRIEF_INJECT_LIB_NAME)
+    )
+    deduped: list[str] = []
+    for path in out:
+        if path not in deduped:
+            deduped.append(path)
+    return deduped
+
+
+def _load_khub_brief_inject(path: str):
+    """Import the brief-inject lib by file path (cached per path)."""
+    cached = _KHUB_BRIEF_INJECT_CACHE.get(path)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location("dsh_khub_brief_inject", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 brief inject lib: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _KHUB_BRIEF_INJECT_CACHE[path] = mod
+    return mod
 
 
 def _khub_goal_context(job: dict) -> str | None:
@@ -4106,46 +4154,34 @@ def _khub_goal_context(job: dict) -> str | None:
     if job.get("khub_inject") is False:
         return None
 
-    script = os.environ.get("DSH_KHUB_GOAL_CONTEXT", "/workspace/tools/khub-goal-context.py")
-    goal_id = str(job.get("goal") or job.get("id") or "")
-    brief = str(job.get("brief") or "")
-    first_line = brief.strip().splitlines()[0].strip() if brief.strip() else ""
-    title = f"{goal_id} {first_line}".strip()
-
-    kw_raw = job.get("khub_keywords")
-    if isinstance(kw_raw, (list, tuple)):
-        keywords = ",".join(str(k) for k in kw_raw)
-    elif kw_raw is None:
-        keywords = ""
-    else:
-        keywords = str(kw_raw)
+    lib_path = next(
+        (p for p in _khub_brief_inject_candidates() if os.path.isfile(p)), None
+    )
+    if lib_path is None:
+        candidates = " / ".join(_khub_brief_inject_candidates())
+        return _khub_unavailable(f"brief inject lib 不可用：候选均不存在（{candidates}）")
 
     try:
-        proc = subprocess.run(
-            [
-                sys.executable, script,
-                "--title", title,
-                "--keywords", keywords,
-                "--k", "8",
-                "--max-bytes", str(KHUB_GOAL_CONTEXT_MAX_BYTES),
-            ],
-            capture_output=True, text=True, timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return _khub_unavailable("子进程超时（10s）")
+        lib = _load_khub_brief_inject(lib_path)
+        out = lib.khub_goal_context(job)
     except Exception as e:  # noqa: BLE001 - degrade, never break the brief pack
-        return _khub_unavailable(f"{type(e).__name__}: {e}")
+        return _khub_unavailable(
+            f"brief inject lib 加载失败（{lib_path}）：{type(e).__name__}: {e}"
+        )
 
-    if proc.returncode != 0:
-        return _khub_unavailable(f"脚本退出码 {proc.returncode}")
-    out = (proc.stdout or "").strip()
-    if not out:
-        return _khub_unavailable("脚本无输出")
+    if not isinstance(out, str) or not out.strip():
+        return _khub_unavailable(f"brief inject lib 无输出（{lib_path}）")
 
     if not out.startswith(KHUB_GOAL_CONTEXT_HEADING):
-        out = f"{KHUB_GOAL_CONTEXT_HEADING}\n{out}"
-    # Ensure the whole block (heading included) stays within the byte budget.
-    out, _ = _truncate_bytes(out, KHUB_GOAL_CONTEXT_MAX_BYTES, note="")
+        out = f"{KHUB_GOAL_CONTEXT_HEADING}\n{out.strip()}"
+    # Ensure the whole block (heading included) stays within the byte budget;
+    # never trust the lib's own cap to be <= the broker's budget.
+    lib_cap = getattr(lib, "KHUB_GOAL_CONTEXT_MAX_BYTES", KHUB_GOAL_CONTEXT_MAX_BYTES)
+    try:
+        cap = min(int(lib_cap), KHUB_GOAL_CONTEXT_MAX_BYTES)
+    except (TypeError, ValueError):
+        cap = KHUB_GOAL_CONTEXT_MAX_BYTES
+    out, _ = _truncate_bytes(out, cap, note="")
     return out
 
 

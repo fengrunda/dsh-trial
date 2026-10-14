@@ -87,6 +87,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -1213,6 +1214,83 @@ def write_artifacts(job: dict, log_path: Path, summary_path: Path, ec: int, tick
     return result
 
 
+HUB_ENV_KEYS = ("HUB_BANK", "HUB_SCENE", "HUB_READ_ENV", "HUB_WIRE_SRC")
+DEFAULT_HUB_INTEGRATIONS_DIR = Path.home() / ".dsh" / "integrations" / "dsh"
+
+
+def hub_read_profiles_path(profiles_path: str | Path | None = None) -> Path:
+    """Resolve the hub-read-profiles registry path (env overrides first)."""
+    if profiles_path:
+        return Path(profiles_path)
+    override = os.environ.get("DSH_HUB_READ_PROFILES")
+    if override:
+        return Path(override)
+    base = os.environ.get("DSH_HUB_INTEGRATIONS_DIR")
+    root = Path(base) if base else DEFAULT_HUB_INTEGRATIONS_DIR
+    return root / "hub-read-profiles.json"
+
+
+def _hub_binding(
+    profile: str | None = None,
+    bank: str | None = None,
+    profiles_path: str | Path | None = None,
+) -> dict[str, str] | None:
+    """Map a goal/job hub binding to HUB_* env values, or ``None`` (fail-closed).
+
+    Never guesses a default and never falls back to dsh-dev: if the registry is
+    missing/broken, the id is unknown, the bank is ambiguous, or a required
+    field is absent, nothing is injected so the plugin can fail closed itself.
+    Only the ``env_file`` *path* is exposed -- its content is never read.
+    """
+    if not profile and not bank:
+        return None
+    path = hub_read_profiles_path(profiles_path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        print(f"[trial-broker] hub binding: fail-closed (read {path.name}: {type(e).__name__})", flush=True)
+        return None
+    except json.JSONDecodeError as e:
+        print(f"[trial-broker] hub binding: fail-closed (parse {path.name}: {type(e).__name__})", flush=True)
+        return None
+    if not isinstance(raw, dict):
+        print(f"[trial-broker] hub binding: fail-closed (schema {path.name}: not an object)", flush=True)
+        return None
+    entry: dict | None = None
+    if profile:
+        cand = raw.get(str(profile))
+        if not isinstance(cand, dict):
+            print(f"[trial-broker] hub binding: fail-closed (profile {profile!r} absent in {path.name})", flush=True)
+            return None
+        entry = cand
+    else:
+        matches = [v for v in raw.values() if isinstance(v, dict) and str(v.get("bank") or "") == str(bank)]
+        if len(matches) != 1:
+            print(
+                f"[trial-broker] hub binding: fail-closed (bank {bank!r}: {len(matches)} matches in {path.name})",
+                flush=True,
+            )
+            return None
+        entry = matches[0]
+    missing = [f for f in ("bank", "scene", "env_file", "wire_src") if not str(entry.get(f) or "").strip()]
+    if missing:
+        print(
+            f"[trial-broker] hub binding: fail-closed (fields {','.join(missing)} in {path.name})",
+            flush=True,
+        )
+        return None
+    binding = {
+        "HUB_BANK": str(entry["bank"]),
+        "HUB_SCENE": str(entry["scene"]),
+        "HUB_READ_ENV": str(entry["env_file"]),
+        "HUB_WIRE_SRC": str(entry["wire_src"]),
+    }
+    python = str(entry.get("python") or "").strip()
+    if python:
+        binding["HUB_PYTHON"] = python
+    return binding
+
+
 def _spawn_env(
     role: str | None,
     *,
@@ -1222,6 +1300,8 @@ def _spawn_env(
     slot: int | None = None,
     goal: str | None = None,
     offload_threshold_chars: int | None = None,
+    hub_profile: str | None = None,
+    hub_bank: str | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     if role:
@@ -1290,6 +1370,15 @@ def _spawn_env(
     else:
         env.pop("DSH_STEP_BUDGET", None)
     env.pop("NEW_API_KEY", None)
+    # hub-mount-b s2: inject HUB_* only from the goal's hub binding. The four
+    # keys are cleared unconditionally (inherited dirt included) and re-set
+    # only when the registry resolves the binding -- no default, no dsh-dev
+    # fallback. Must happen before _redact_env so the values are final.
+    binding = _hub_binding(profile=hub_profile, bank=hub_bank)
+    for key in HUB_ENV_KEYS + ("HUB_PYTHON",):
+        env.pop(key, None)
+    if binding:
+        env.update(binding)
     _ = _redact_env(env)
     return env
 
@@ -2639,6 +2728,8 @@ def run_open_slice(
         slot=eff_slot,
         goal=str((goal or {}).get("goal") or current_goal_id() or ""),
         offload_threshold_chars=int(lim.get("offload_threshold_chars") or 4000),
+        hub_profile=(goal if isinstance(goal, dict) else {}).get("hub_profile"),
+        hub_bank=(goal if isinstance(goal, dict) else {}).get("hub_bank"),
     )
     # Job timeout must exceed the prompt hard cap. A fixed 2400s backstop
     # used to cut the slice before a still-working agent finished.
@@ -4000,10 +4091,57 @@ def clear_stale_gate_running_acks_at_start() -> list[str]:
 KHUB_GOAL_CONTEXT_MAX_BYTES = 2500
 KHUB_GOAL_CONTEXT_HEADING = "## khub 上下文"
 
+#: Brief-inject lib (Hub-side source of truth), resolved at call time.
+KHUB_BRIEF_INJECT_LIB_NAME = "khub_brief_inject.py"
+#: Staged runtime integrations dir (s1 stages hub-read-profiles.json here).
+KHUB_BRIEF_INJECT_STAGED_DIR_DEFAULT = "~/.dsh/integrations/dsh"
+#: Last-resort source-repo fallback (box path; monkeypatchable in tests).
+KHUB_BRIEF_INJECT_HUB_DIR_DEFAULT = "/workspace/knowledge-hub/integrations/dsh"
+#: path -> loaded module; cleared by ``_clear_khub_brief_inject_cache``.
+_KHUB_BRIEF_INJECT_CACHE: dict[str, object] = {}
+
 
 def _khub_unavailable(reason: str) -> str:
     one_line = " ".join(str(reason).split()) or "unknown"
     return f"{KHUB_GOAL_CONTEXT_HEADING}\n- khub 上下文不可用：{one_line}"
+
+
+def _clear_khub_brief_inject_cache() -> None:
+    """Drop loaded lib modules (tests: avoid cross-case pollution)."""
+    _KHUB_BRIEF_INJECT_CACHE.clear()
+
+
+def _khub_brief_inject_candidates() -> list[str]:
+    """Lib candidates in priority order (override → staged dir → repo)."""
+    out: list[str] = []
+    override = (os.environ.get("DSH_KHUB_BRIEF_INJECT") or "").strip()
+    if override:
+        out.append(override)
+    staged = (os.environ.get("DSH_HUB_INTEGRATIONS_DIR") or "").strip()
+    staged_dir = staged or os.path.expanduser(KHUB_BRIEF_INJECT_STAGED_DIR_DEFAULT)
+    out.append(os.path.join(staged_dir, "lib", KHUB_BRIEF_INJECT_LIB_NAME))
+    out.append(
+        os.path.join(KHUB_BRIEF_INJECT_HUB_DIR_DEFAULT, "lib", KHUB_BRIEF_INJECT_LIB_NAME)
+    )
+    deduped: list[str] = []
+    for path in out:
+        if path not in deduped:
+            deduped.append(path)
+    return deduped
+
+
+def _load_khub_brief_inject(path: str):
+    """Import the brief-inject lib by file path (cached per path)."""
+    cached = _KHUB_BRIEF_INJECT_CACHE.get(path)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location("dsh_khub_brief_inject", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 brief inject lib: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _KHUB_BRIEF_INJECT_CACHE[path] = mod
+    return mod
 
 
 def _khub_goal_context(job: dict) -> str | None:
@@ -4016,46 +4154,34 @@ def _khub_goal_context(job: dict) -> str | None:
     if job.get("khub_inject") is False:
         return None
 
-    script = os.environ.get("DSH_KHUB_GOAL_CONTEXT", "/workspace/tools/khub-goal-context.py")
-    goal_id = str(job.get("goal") or job.get("id") or "")
-    brief = str(job.get("brief") or "")
-    first_line = brief.strip().splitlines()[0].strip() if brief.strip() else ""
-    title = f"{goal_id} {first_line}".strip()
-
-    kw_raw = job.get("khub_keywords")
-    if isinstance(kw_raw, (list, tuple)):
-        keywords = ",".join(str(k) for k in kw_raw)
-    elif kw_raw is None:
-        keywords = ""
-    else:
-        keywords = str(kw_raw)
+    lib_path = next(
+        (p for p in _khub_brief_inject_candidates() if os.path.isfile(p)), None
+    )
+    if lib_path is None:
+        candidates = " / ".join(_khub_brief_inject_candidates())
+        return _khub_unavailable(f"brief inject lib 不可用：候选均不存在（{candidates}）")
 
     try:
-        proc = subprocess.run(
-            [
-                sys.executable, script,
-                "--title", title,
-                "--keywords", keywords,
-                "--k", "8",
-                "--max-bytes", str(KHUB_GOAL_CONTEXT_MAX_BYTES),
-            ],
-            capture_output=True, text=True, timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return _khub_unavailable("子进程超时（10s）")
+        lib = _load_khub_brief_inject(lib_path)
+        out = lib.khub_goal_context(job)
     except Exception as e:  # noqa: BLE001 - degrade, never break the brief pack
-        return _khub_unavailable(f"{type(e).__name__}: {e}")
+        return _khub_unavailable(
+            f"brief inject lib 加载失败（{lib_path}）：{type(e).__name__}: {e}"
+        )
 
-    if proc.returncode != 0:
-        return _khub_unavailable(f"脚本退出码 {proc.returncode}")
-    out = (proc.stdout or "").strip()
-    if not out:
-        return _khub_unavailable("脚本无输出")
+    if not isinstance(out, str) or not out.strip():
+        return _khub_unavailable(f"brief inject lib 无输出（{lib_path}）")
 
     if not out.startswith(KHUB_GOAL_CONTEXT_HEADING):
-        out = f"{KHUB_GOAL_CONTEXT_HEADING}\n{out}"
-    # Ensure the whole block (heading included) stays within the byte budget.
-    out, _ = _truncate_bytes(out, KHUB_GOAL_CONTEXT_MAX_BYTES, note="")
+        out = f"{KHUB_GOAL_CONTEXT_HEADING}\n{out.strip()}"
+    # Ensure the whole block (heading included) stays within the byte budget;
+    # never trust the lib's own cap to be <= the broker's budget.
+    lib_cap = getattr(lib, "KHUB_GOAL_CONTEXT_MAX_BYTES", KHUB_GOAL_CONTEXT_MAX_BYTES)
+    try:
+        cap = min(int(lib_cap), KHUB_GOAL_CONTEXT_MAX_BYTES)
+    except (TypeError, ValueError):
+        cap = KHUB_GOAL_CONTEXT_MAX_BYTES
+    out, _ = _truncate_bytes(out, cap, note="")
     return out
 
 

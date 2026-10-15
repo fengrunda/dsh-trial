@@ -858,7 +858,7 @@ def load_job(path: Path) -> dict:
         max_slices = int(data.get("max_slices") or 1)
         max_sup = int(data.get("max_supervisor_tickets") or 8)
         max_rounds = int(data.get("max_rounds") or 2)
-        return {
+        goal = {
             **base,
             "goal": str(goal_id),
             "brief": str(brief),
@@ -881,6 +881,8 @@ def load_job(path: Path) -> dict:
             "khub_keywords": data.get("khub_keywords"),  # optional khub concept keywords
             "khub_inject": data.get("khub_inject"),  # optional bool; False disables injection
         }
+        _apply_goal_hub_binding(data, goal)
+        return goal
 
     # default single ticket
     ticket = data.get("ticket")
@@ -4128,6 +4130,28 @@ def _khub_brief_inject_candidates() -> list[str]:
         if path not in deduped:
             deduped.append(path)
     return deduped
+
+
+def _apply_goal_hub_binding(data: dict, goal: dict) -> None:
+    """Copy Goal job hub_profile/hub_bank onto the goal dict via the Hub lib.
+
+    The lib lives next to khub_brief_inject.py; unknown/conflicting ids raise
+    ValueError so the job is rejected (fail-closed).
+    """
+    import importlib.util
+
+    for cand in _khub_brief_inject_candidates():
+        lib = os.path.join(os.path.dirname(cand), "goal_hub_binding.py")
+        if os.path.isfile(lib):
+            spec = importlib.util.spec_from_file_location("goal_hub_binding", lib)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.apply_goal_hub_binding(data, goal)
+            return
+    if data.get("hub_profile") or data.get("hub_bank"):
+        raise ValueError(
+            "goal job has hub_profile/hub_bank but the goal_hub_binding lib is unavailable"
+        )
 
 
 def _load_khub_brief_inject(path: str):

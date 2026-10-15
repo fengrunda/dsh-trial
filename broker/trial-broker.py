@@ -7150,7 +7150,7 @@ def _run_goal_job_body(path: Path, job: dict, *, resume: bool = False) -> int:
 
 def _new_goal_state(goal_id: str, job: dict, dest: Path) -> dict:
     """Fresh goal state for a new Goal job (plan not run yet)."""
-    return {
+    state = {
         "goal": goal_id,
         "status": "planning",
         "brief": job["brief"][:4000],
@@ -7172,6 +7172,12 @@ def _new_goal_state(goal_id: str, job: dict, dest: Path) -> dict:
         # resume without scanning the whole processing dir.
         "processing_job": str(dest),
     }
+    # Hub binding (load_job → _apply_goal_hub_binding): persist so spawn env
+    # can inject HUB_BANK/HUB_SCENE from goal state (grill: goal dict + state).
+    for key in ("hub_profile", "hub_bank", "hub_scene", "khub_keywords", "khub_inject"):
+        if key in job and job.get(key) is not None:
+            state[key] = job.get(key)
+    return state
 
 
 def _continue_goal_from_plan(goal_state: dict, job: dict, dest: Path, *, resume: bool) -> int:

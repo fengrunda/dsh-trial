@@ -28,6 +28,8 @@ export DSH_ACP_PROMPT_IDLE_TIMEOUT="${DSH_ACP_PROMPT_IDLE_TIMEOUT:-900}"
 export DSH_ACP_PROMPT_TIMEOUT="${DSH_ACP_PROMPT_TIMEOUT:-3600}"
 export DSH_ACP_ASK="${DSH_ACP_ASK:-$ROOT/dsh-acp-ask.py}"
 export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"
+# Hub brief-inject generator (feeds under knowledge-hub); override via env.
+export DSH_KHUB_GOAL_CONTEXT="${DSH_KHUB_GOAL_CONTEXT:-/workspace/knowledge-hub/integrations/dsh/scripts/khub-goal-context.py}"
 # Prefer official DeepSeek env from load-env; never echo secrets
 unset NEW_API_KEY 2>/dev/null || true
 

@@ -30,6 +30,8 @@ export DSH_ACP_ASK="${DSH_ACP_ASK:-$ROOT/dsh-acp-ask.py}"
 export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"
 # Hub brief-inject generator (feeds under knowledge-hub); override via env.
 export DSH_KHUB_GOAL_CONTEXT="${DSH_KHUB_GOAL_CONTEXT:-/workspace/knowledge-hub/integrations/dsh/scripts/khub-goal-context.py}"
+# Hub brief live read-wire opt-in (#125); derives HUB_READ_ENV/HUB_WIRE_SRC from registry.
+export DSH_KHUB_LIVE="${DSH_KHUB_LIVE:-1}"
 # Prefer official DeepSeek env from load-env; never echo secrets
 unset NEW_API_KEY 2>/dev/null || true
 

@@ -275,3 +275,40 @@ def test_watchdog_orphan_goal_event_and_escalation(tmp_path: Path):
         goal = json.loads(goal_path.read_text())
         assert goal["status"] == "escalated"
         assert goal["escalate_reason"] == wd.ORPHAN_ESCALATE_REASON
+
+
+def test_reconcile_orphan_skips_awaiting_supervisor(tmp_path: Path):
+    """Awaiting Goals without a processing job must not be orphan-escalated."""
+    ctx, d = _patched_dirs(tmp_path / "state")
+    goal_id = "orphan-awaiting"
+    sid = f"{goal_id}-s1"
+    with ctx:
+        goal = {
+            "goal": goal_id,
+            "status": "running",
+            "cwd": str(tmp_path / "repo"),
+            "slices": [sid],
+            "current_slice": sid,
+            "last_chain_state": "awaiting_supervisor",
+            "awaiting_reason": "pause_continue:paused_wallclock",
+        }
+        (d["goals"] / f"{goal_id}.json").write_text(
+            json.dumps(goal, ensure_ascii=False), encoding="utf-8"
+        )
+        (d["chains"] / f"{sid}.json").write_text(
+            json.dumps(
+                {
+                    "slice": sid,
+                    "state": "awaiting_supervisor",
+                    "awaiting_reason": "pause_continue:paused_wallclock",
+                    "goal": goal_id,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        escalated = tb.reconcile_orphan_running_goals()
+        assert goal_id not in escalated
+        after = json.loads((d["goals"] / f"{goal_id}.json").read_text(encoding="utf-8"))
+        assert after["status"] == "running"
+        assert after.get("escalate_reason") is None

@@ -763,3 +763,129 @@ def test_scheduler_resume_dispatch_passes_path_and_job(tmp_path):
         failed = [p.name for p in dirs["failed"].iterdir()]
         assert failed == [], failed
         assert proc.is_file()
+
+
+# ---------------------------------------------------------------------------
+# 8. multi-slice: awaiting s1 must NOT spawn s2 on restart (hub-k7c incident)
+# ---------------------------------------------------------------------------
+def test_resume_awaiting_s1_does_not_spawn_s2(tmp_path):
+    """Broker restart with s1 awaiting_supervisor must not open s2.
+
+    Reproduces hub-k7c-20261020: Goal.status=running, s1 parked
+    (pause_continue:paused_wallclock), plan has s2/s3 — old code ``continue``d
+    past awaiting and emitted the next slice.
+    """
+    gid = "unit-await-guard"
+    s1, s2, s3 = f"{gid}-s1", f"{gid}-s2", f"{gid}-s3"
+    p1, p2, p3 = f"{s1}.pack.md", f"{s2}.pack.md", f"{s3}.pack.md"
+    with _patched(tmp_path / "state") as dirs, _limits(
+        tmp_path, {"max_slices": 3, "max_rounds": 2}
+    ):
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        plan_path = dirs["summaries"] / f"goal-{gid}-plan.md"
+        _write_summary(
+            plan_path,
+            _plan_block(
+                gid,
+                [
+                    {"slice": s1, "pack": p1, "acceptance": []},
+                    {"slice": s2, "pack": p2, "acceptance": []},
+                    {"slice": s3, "pack": p3, "acceptance": []},
+                ],
+            ),
+        )
+        for pack in (p1, p2, p3):
+            (dirs["packs"] / pack).write_text(f"# {pack}\n", encoding="utf-8")
+        impl_summary = dirs["summaries"] / f"{s1}-impl-r1.md"
+        _write_summary(impl_summary, _foreman_block())
+        _seed_goal(
+            dirs,
+            gid,
+            cwd,
+            status="running",
+            slices=[s1],
+            plan_summary=plan_path,
+        )
+        # Mirror ops dial: current_slice + last_chain_state parked.
+        goal = json.loads((dirs["goals"] / f"{gid}.json").read_text(encoding="utf-8"))
+        goal["current_slice"] = s1
+        goal["last_chain_state"] = "awaiting_supervisor"
+        goal["awaiting_reason"] = "pause_continue:paused_wallclock"
+        (dirs["goals"] / f"{gid}.json").write_text(
+            json.dumps(goal, ensure_ascii=False), encoding="utf-8"
+        )
+        proc, job = _seed_processing_job(dirs, gid, cwd)
+        chain = _seed_chain(
+            dirs,
+            gid,
+            s1,
+            cwd,
+            p1,
+            [_round_rec(s1, 1, p1, impl_summary=impl_summary)],
+            state="awaiting_supervisor",
+        )
+        chain["awaiting_reason"] = "pause_continue:paused_wallclock"
+        chain["pause_resume_mode"] = "continue_same"
+        (dirs["chains"] / f"{s1}.json").write_text(
+            json.dumps(chain, ensure_ascii=False), encoding="utf-8"
+        )
+
+        tickets = _Tickets()
+        rc = _resume(proc, job, tickets)
+
+        assert rc == 0, rc
+        assert tickets.calls == [], tickets.calls
+        # s2 / s3 must never appear as chain files or ticket opens.
+        assert not (dirs["chains"] / f"{s2}.json").exists()
+        assert not (dirs["chains"] / f"{s3}.json").exists()
+        goal_after = tb._read_goal(gid)
+        assert goal_after["status"] == "running"
+        assert goal_after["current_slice"] == s1
+        assert goal_after["last_chain_state"] == "awaiting_supervisor"
+        assert tb._read_chain(s1)["state"] == "awaiting_supervisor"
+        assert proc.is_file()
+
+
+def test_resume_paused_wallclock_state_does_not_spawn_next(tmp_path):
+    """Chain.state=paused_wallclock (pre-park) also blocks next-slice spawn."""
+    gid, s1, s2 = "unit-pause-wall", "unit-pause-wall-s1", "unit-pause-wall-s2"
+    p1, p2 = f"{s1}.pack.md", f"{s2}.pack.md"
+    with _patched(tmp_path / "state") as dirs, _limits(
+        tmp_path, {"max_slices": 2, "max_rounds": 2}
+    ):
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        plan_path = dirs["summaries"] / f"goal-{gid}-plan.md"
+        _write_summary(
+            plan_path,
+            _plan_block(
+                gid,
+                [
+                    {"slice": s1, "pack": p1, "acceptance": []},
+                    {"slice": s2, "pack": p2, "acceptance": []},
+                ],
+            ),
+        )
+        for pack in (p1, p2):
+            (dirs["packs"] / pack).write_text("# pack\n", encoding="utf-8")
+        impl_summary = dirs["summaries"] / f"{s1}-impl-r1.md"
+        _write_summary(impl_summary, _foreman_block())
+        _seed_goal(dirs, gid, cwd, status="running", slices=[s1], plan_summary=plan_path)
+        proc, job = _seed_processing_job(dirs, gid, cwd)
+        _seed_chain(
+            dirs,
+            gid,
+            s1,
+            cwd,
+            p1,
+            [_round_rec(s1, 1, p1, impl_summary=impl_summary)],
+            state="paused_wallclock",
+        )
+
+        tickets = _Tickets()
+        rc = _resume(proc, job, tickets)
+        assert rc == 0, rc
+        assert tickets.calls == [], tickets.calls
+        assert not (dirs["chains"] / f"{s2}.json").exists()
+        assert tb._read_goal(gid)["current_slice"] == s1

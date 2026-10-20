@@ -272,14 +272,18 @@ def test_on_slice_fail_stop_default():
 
                 ec = _run(_goal_job(gid, cwd, max_slices=2), root, fake_open_slice, calls)
 
-                assert ec == 1, ec
+                # Parked awaiting_supervisor is a successful park (rc=0), not a
+                # Goal failure — and must still stop before opening s2.
+                assert ec == 0, ec
                 goal = json.loads((dirs["goals"] / f"{gid}.json").read_text())
                 assert goal["slices"] == ["unit-ms-t1"], goal["slices"]
+                assert goal.get("last_chain_state") == "awaiting_supervisor"
+                assert goal.get("current_slice") == "unit-ms-t1"
                 assert goal["metrics"]["slices_completed"] == 0
                 assert not (dirs["chains"] / "unit-ms-t2.json").exists()
                 modes = [c["prompt_mode"] for c in calls]
                 assert "supervisor-close" not in modes, modes
-                print("OK on_slice_fail default stop")
+                print("OK on_slice_fail default stop (park awaiting, no s2)")
 
 
 def main():

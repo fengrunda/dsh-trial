@@ -63,13 +63,14 @@ with top-level slice/pack/acceptance) or many (``action=emit_chains`` with a
 first failed/escalated slice unless ``on_slice_fail=continue``, and runs the
 supervisor close once after every slice PASSes.
 
-An impl that exits without a summary because it hit the ACP hard cap
-(``timeout after Ns hard cap``) or the step cap (``max_steps`` / 步数上限)
-is not marked failed when the slice worktree already has committable
-changes. The broker closeout commits those changes, runs the tests named
-in the slice pack, opens a PR through ``dsh-trial-pr`` when the pack asks
-for one, and writes a supervisor handoff under thin-state summaries. A
-clean worktree still fails. An idle timeout is not a closeout.
+An impl that hits the ACP hard/idle wall-clock or the step hard threshold
+(classifies as ``paused_wallclock`` / ``paused_limit``) routes to the
+supervisor five-way (continue_same / new_ticket / close / split / escalate)
+instead of mechanical closeout. Soft step reminders are unchanged.
+``limit_stop_closeout`` remains as a legacy fallback when classification
+does not match. Only ``escalate`` wakes Hub/human; other decisions park or
+close under supervisor control. Same-Goal supervisor tickets reuse via
+keep-open + resume.
 
 ``type:goal-update`` with ``resume: true`` on a goal already ``failed``
 continues only when that failure is a missing impl summary and the slice
@@ -105,6 +106,7 @@ from typing import Iterator
 from zoneinfo import ZoneInfo
 import threading
 import trial_lib as T
+import pause_supervisor as PS
 import trial_mailbox as TM
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -157,6 +159,9 @@ PROD_RESTART = DSH_HOME / "bin" / "khub-broker-restart.sh"
 FOREMAN_STATUS_DONE = "done"
 FOREMAN_STATUS_BLOCKED = "blocked"
 FOREMAN_STATUS_QUESTION = "question"
+FOREMAN_STATUS_PAUSED_LIMIT = "paused_limit"
+FOREMAN_STATUS_PAUSED_WALLCLOCK = "paused_wallclock"
+FOREMAN_STATUS_PAUSED = frozenset({FOREMAN_STATUS_PAUSED_LIMIT, FOREMAN_STATUS_PAUSED_WALLCLOCK})
 VERDICT_PASS = "PASS"
 VERDICT_HOLD = "HOLD"
 
@@ -2692,6 +2697,8 @@ def run_open_slice(
     goal: dict | None = None,
     watch_mailbox: bool | None = None,
     slot: int | None = None,
+    keep_open: bool = False,
+    resume: bool = False,
 ) -> int:
     profile = T.map_profile(profile)
     if draining():
@@ -2716,9 +2723,14 @@ def run_open_slice(
         "--role", role,
         "--summary-name", summary_name,
         "--prompt-mode", prompt_mode,
-        "--final",
         "--log", str(log_path),
     ]
+    if keep_open:
+        cmd.append("--keep-open")
+    else:
+        cmd.append("--final")
+    if resume:
+        cmd.append("--resume")
     lim = T.resolve_limits(goal=goal) if goal else T.load_global_limits()
     env = _spawn_env(
         role,
@@ -3379,7 +3391,13 @@ def _parse_foreman_summary(summary_path: Path) -> dict:
     text = summary_path.read_text(encoding="utf-8") if summary_path.is_file() else ""
     block = _extract_fenced_json(text) or {}
     status = str(block.get("status") or "").strip().lower()
-    if status not in (FOREMAN_STATUS_DONE, FOREMAN_STATUS_BLOCKED, FOREMAN_STATUS_QUESTION):
+    if status not in (
+        FOREMAN_STATUS_DONE,
+        FOREMAN_STATUS_BLOCKED,
+        FOREMAN_STATUS_QUESTION,
+        FOREMAN_STATUS_PAUSED_LIMIT,
+        FOREMAN_STATUS_PAUSED_WALLCLOCK,
+    ):
         # heuristic fallback
         low = text.lower()
         if "blocked" in low:
@@ -4352,6 +4370,8 @@ def run_supervisor_ticket(
     prompt_mode: str,
     goal: dict | None = None,
     slot: int | None = None,
+    keep_open: bool = False,
+    resume: bool = False,
 ) -> tuple[int, dict, Path]:
     """Open one supervisor short ticket; return (exit, artifacts, summary_path)."""
     log_path = ARTIFACT_ROOT / f"{ticket}.log"
@@ -4367,6 +4387,8 @@ def run_supervisor_ticket(
         goal=goal,
         watch_mailbox=False,
         slot=slot,
+        keep_open=keep_open,
+        resume=resume,
     )
     summary_path = SUMMARIES / f"{summary_name}.md"
     art = write_artifacts(
@@ -4609,6 +4631,173 @@ def auto_supervisor_max_rounds_decision(
         flush=True,
     )
     return decision
+
+
+
+def _supervisor_reuse_kwargs(goal: dict | None) -> dict:
+    """keep-open + optional --resume for Goal-level supervisor session."""
+    reuse, ticket = PS.should_reuse_supervisor(goal)
+    return {
+        "keep_open": True,
+        "resume": reuse,
+        "reuse_ticket": ticket if reuse else (PS.supervisor_ticket_name(str((goal or {}).get("goal") or "goal"))),
+    }
+
+
+def auto_supervisor_pause_decision(
+    job: dict,
+    chain: dict,
+    *,
+    round_n: int,
+    pause_kind: str,
+    goal: dict | None = None,
+    steps_used: int | None = None,
+    elapsed_sec: int | None = None,
+    notes: str = "",
+    impl_ticket: str = "",
+) -> str | None:
+    """Open (or resume) supervisor pause ticket; return one of PAUSE_DECISIONS or None."""
+    goal_id = job.get("goal") or chain.get("goal")
+    if goal is None and goal_id:
+        goal = _read_goal(goal_id)
+    max_sup = int(
+        (goal or {}).get("max_supervisor_tickets")
+        or job.get("max_supervisor_tickets")
+        or 8
+    )
+    if goal and int(goal.get("supervisor_ticket_count") or 0) >= max_sup:
+        print(f"[trial-broker] supervisor ticket cap {max_sup} reached (pause)", flush=True)
+        return None
+    lim = T.resolve_limits(goal=goal) if goal else T.load_global_limits()
+    step_budget = int(lim.get("impl_max_steps") or T.DEFAULT_LIMITS.get("impl_max_steps") or 30)
+    ask_pack_name = f"{chain['slice']}-pause-r{round_n}.pack.md"
+    body = PS.build_pause_pack_body(
+        slice_id=chain["slice"],
+        round_n=round_n,
+        pause_kind=pause_kind,
+        steps_used=steps_used,
+        step_budget=step_budget,
+        elapsed_sec=elapsed_sec,
+        idle_timeout_sec=int(lim.get("prompt_idle_timeout_sec") or 0) or None,
+        hard_timeout_sec=int(lim.get("prompt_timeout_sec") or 0) or None,
+        goal_id=goal_id,
+        pending_pack=str(chain.get("pending_impl_pack") or chain.get("pack") or ""),
+        impl_ticket=impl_ticket or str(chain.get("last_impl_ticket") or ""),
+        notes=notes,
+    )
+    (PACKS / ask_pack_name).write_text(body, encoding="utf-8")
+    _enforce_pack_bytes(PACKS / ask_pack_name)
+    reuse_kw = _supervisor_reuse_kwargs(goal)
+    ticket = str(reuse_kw["reuse_ticket"])
+    summary_name = f"{chain['slice']}-sup-pause-r{round_n}"
+    profile = str(
+        job.get("supervisor_profile")
+        or (goal or {}).get("supervisor_profile")
+        or "acp-lite"
+    )
+    ec, art, summary_path = run_supervisor_ticket(
+        ticket=ticket,
+        pack_name=ask_pack_name,
+        profile=profile,
+        cwd=str(job.get("cwd") or chain.get("cwd") or "/workspace"),
+        summary_name=summary_name,
+        prompt_mode="supervisor-max-rounds",  # same decision-style prompt template
+        goal=goal,
+        keep_open=True,
+        resume=bool(reuse_kw["resume"]),
+    )
+    if goal is not None and ec == 0:
+        goal["supervisor_reuse_ticket"] = ticket
+        goal.pop("supervisor_reuse_broken", None)
+        _write_goal(goal)
+    elif goal is not None and ec != 0:
+        goal["supervisor_reuse_broken"] = True
+        _write_goal(goal)
+    chain.setdefault("supervisor_events", []).append({
+        "kind": "pause_decision",
+        "pause_kind": pause_kind,
+        "ticket": ticket,
+        "exit": ec,
+        "summary": str(summary_path),
+        "assert_clean": art.get("assert_clean"),
+        "peak": _peak_prompt(art.get("composition"))[0],
+        "steps": _peak_prompt(art.get("composition"))[1],
+        "artifacts": art,
+    })
+    _write_chain(chain)
+    parsed = _parse_supervisor_summary(summary_path)
+    decision = PS.parse_pause_decision(parsed.get("block"), parsed.get("text") or "")
+    if not decision:
+        print("[trial-broker] pause supervisor decision empty", flush=True)
+        return None
+    print(
+        f"[trial-broker] pause supervisor decision={decision} kind={pause_kind} via {ticket}",
+        flush=True,
+    )
+    return decision
+
+
+def route_pause_decision(
+    job: dict,
+    chain: dict,
+    dest: Path,
+    *,
+    decision: str,
+    pause_kind: str,
+    round_n: int,
+    pack_for_impl: str,
+    goal_obj: dict | None,
+    impl_ticket: str = "",
+) -> int:
+    """Apply a pause decision; return process exit code for the chain runner."""
+    chain["last_pause"] = {
+        "at": _iso(),
+        "kind": pause_kind,
+        "decision": decision,
+        "round_n": round_n,
+        "impl_ticket": impl_ticket,
+    }
+    if decision == "escalate":
+        chain["state"] = "escalated"
+        chain["escalate_reason"] = f"pause:{pause_kind}"
+        _write_chain(chain)
+        _notify_awaiting_hub(job, chain, reason=f"pause_escalate:{pause_kind}", block={}, goal=goal_obj)
+        _terminal_outbox(job, chain, dest, ok=False)
+        return 1
+    if decision == "close":
+        chain["state"] = "closeout"
+        chain["closeout_note"] = f"supervisor close after {pause_kind}"
+        chain["handoff_summary"] = str((chain.get("last_pause") or {}))
+        _write_chain(chain)
+        _terminal_outbox(job, chain, dest, ok=True)
+        return 2
+    if decision == "split":
+        chain["state"] = "awaiting_supervisor"
+        chain["awaiting_reason"] = f"pause_split:{pause_kind}"
+        _write_chain(chain)
+        _notify_awaiting_hub(job, chain, reason="pause_split", block={}, goal=goal_obj)
+        _terminal_outbox(job, chain, dest, ok=True, notify=False)
+        return 0
+    if decision == "new_ticket":
+        # Park with pending pack; Hub/chain-reply or inline continue with fresh ticket.
+        chain["state"] = "awaiting_supervisor"
+        chain["awaiting_reason"] = f"pause_new_ticket:{pause_kind}"
+        chain["pending_impl_pack"] = Path(pack_for_impl).name
+        chain["pause_resume_mode"] = "new_ticket"
+        _write_chain(chain)
+        _notify_awaiting_hub(job, chain, reason="pause_new_ticket", block={}, goal=goal_obj)
+        _terminal_outbox(job, chain, dest, ok=True, notify=False)
+        return 0
+    # continue_same: mark for resume of same impl ticket
+    chain["state"] = "awaiting_supervisor"
+    chain["awaiting_reason"] = f"pause_continue:{pause_kind}"
+    chain["pending_impl_pack"] = Path(pack_for_impl).name
+    chain["pause_resume_mode"] = "continue_same"
+    chain["pause_impl_ticket"] = impl_ticket
+    _write_chain(chain)
+    # Auto-continue inline when possible: bump max and re-enter with resume.
+    # Keep awaiting marker for observability; runner below clears it.
+    return 0
 
 
 def _park_chain_awaiting_max_rounds(
@@ -5042,8 +5231,8 @@ def maybe_supervisor_close(job: dict, chain: dict) -> None:
 
 
 
-# Limit-stop closeout. Hard cap and max_steps share this path. Idle timeout
-# is intentionally not a kind: "timeout after Ns idle" must stay a plain fail.
+# Limit-stop closeout (legacy fallback). Prefer pause → supervisor five-way.
+# Idle / hard / max_steps are classified by pause_supervisor first.
 _HARD_CAP_RE = re.compile(r"timeout after \d+s hard cap")
 _STEP_LIMIT_RE = re.compile(
     r"(?i)(?:"
@@ -6014,10 +6203,75 @@ def run_chain_rounds(
                     flush=True,
                 )
                 return 0
-            # Hard cap and max_steps share one closeout. Idle timeout and a
-            # plain non-zero exit still fail below. No second impl ticket.
+            # G1/wallclock: pause → supervisor five-way (not mechanical closeout).
+            log_text = ""
+            try:
+                log_text = impl_log.read_text(encoding="utf-8", errors="replace") if impl_log.is_file() else ""
+            except OSError:
+                log_text = ""
+            pause_kind = PS.classify_pause_reason(
+                summary_status=str((block or {}).get("status") or ""),
+                log_text=log_text,
+            )
+            if pause_kind is None and ec != 0:
+                # Map legacy limit_stop_kind into pause kinds.
+                kind = limit_stop_kind(log_text)
+                if kind == "hard_cap":
+                    pause_kind = PS.PAUSE_WALLCLOCK
+                elif kind == "max_steps":
+                    pause_kind = PS.PAUSE_LIMIT
+                elif PS.classify_pause_reason(log_text=log_text):
+                    pause_kind = PS.classify_pause_reason(log_text=log_text)
+            if pause_kind:
+                steps_used = round_rec.get("impl_steps")
+                if not isinstance(steps_used, int):
+                    try:
+                        _c = (impl_art or {}).get("composition")
+                        _peak, steps_used = _peak_prompt(_c)
+                    except Exception:
+                        steps_used = None
+                decision = auto_supervisor_pause_decision(
+                    job,
+                    chain,
+                    round_n=round_n,
+                    pause_kind=pause_kind,
+                    goal=goal_obj,
+                    steps_used=steps_used if isinstance(steps_used, int) else None,
+                    notes=str((block or {}).get("notes") or "")[:800],
+                    impl_ticket=impl_ticket,
+                )
+                round_rec["pause_kind"] = pause_kind
+                round_rec["pause_decision"] = decision
+                chain["rounds"][-1] = round_rec
+                if not decision:
+                    # Supervisor failed/empty → park awaiting, do not closeout Goal.
+                    chain["state"] = "awaiting_supervisor"
+                    chain["awaiting_reason"] = pause_kind
+                    chain["pending_impl_pack"] = Path(pack_for_impl).name
+                    _write_chain(chain)
+                    _notify_awaiting_hub(
+                        job, chain, reason=pause_kind, block=block or {}, goal=goal_obj
+                    )
+                    out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+                    print(
+                        f"[trial-broker] chain {slice_id} → awaiting_supervisor "
+                        f"({pause_kind}; supervisor decision empty) outbox={out.name}",
+                        flush=True,
+                    )
+                    return 0
+                return route_pause_decision(
+                    job,
+                    chain,
+                    dest,
+                    decision=decision,
+                    pause_kind=pause_kind,
+                    round_n=round_n,
+                    pack_for_impl=pack_for_impl,
+                    goal_obj=goal_obj,
+                    impl_ticket=impl_ticket,
+                )
             closed = None
-            if ec != 0:
+            if ec != 0 and closed is None and pause_kind is None:
                 closed = limit_stop_closeout(
                     job=job,
                     chain=chain,
@@ -6183,6 +6437,50 @@ def run_chain_rounds(
         # Decision: HOLD never wakes supervisor (handled below via fix pack).
         # Blocked → awaiting without auto-wake. Question → auto supervisor answer
         # (fallback when ask_supervisor mid-ticket timed out / unused).
+        # G1: explicit paused_* summary → supervisor five-way (same as limit path).
+        if status in FOREMAN_STATUS_PAUSED:
+            pause_kind = status
+            decision = auto_supervisor_pause_decision(
+                job,
+                chain,
+                round_n=round_n,
+                pause_kind=pause_kind,
+                goal=goal_obj,
+                steps_used=round_rec.get("impl_steps")
+                if isinstance(round_rec.get("impl_steps"), int)
+                else None,
+                notes=str(block.get("notes") or "")[:800],
+                impl_ticket=impl_ticket,
+            )
+            round_rec["pause_kind"] = pause_kind
+            round_rec["pause_decision"] = decision
+            chain["rounds"][-1] = round_rec
+            if not decision:
+                chain["state"] = "awaiting_supervisor"
+                chain["awaiting_reason"] = pause_kind
+                chain["pending_impl_pack"] = Path(pack_for_impl).name
+                _write_chain(chain)
+                _notify_awaiting_hub(
+                    job, chain, reason=pause_kind, block=block, goal=goal_obj
+                )
+                out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+                print(
+                    f"[trial-broker] chain {slice_id} → awaiting_supervisor "
+                    f"({pause_kind}) outbox={out.name}",
+                    flush=True,
+                )
+                return 0
+            return route_pause_decision(
+                job,
+                chain,
+                dest,
+                decision=decision,
+                pause_kind=pause_kind,
+                round_n=round_n,
+                pack_for_impl=pack_for_impl,
+                goal_obj=goal_obj,
+                impl_ticket=impl_ticket,
+            )
         if status == FOREMAN_STATUS_BLOCKED:
             chain["state"] = "awaiting_supervisor"
             chain["awaiting_answer_for_round"] = round_n

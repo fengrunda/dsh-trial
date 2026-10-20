@@ -1,54 +1,50 @@
 /**
- * dsh-step-budget-reminder — a soft step-budget nudge for the ROOT agent.
+ * dsh-step-budget-reminder — soft reminders + hard tool block at 2× (G1).
  *
- * When a step budget is configured, the root agent's loop gets one notice when
- * it reaches the budget and one more when it reaches `budget * secondFactor`
- * (rounded up). The notice is appended to the *latest* position — the tail of
- * the current step's `additionalContexts` — so history is never rewritten and
- * the cached prefix stays stable. Nothing here vetoes a tool call or stops the
- * loop: this plugin only talks.
- *
- * Budget source precedence: `config.budget` > `DSH_STEP_BUDGET` (read at apply
- * time) > none. With no budget the plugin registers listeners that do nothing.
+ * Soft: notice at budget and budget*secondFactor (default 1.5).
+ * Hard: at budget*hardFactor (default 2) inject paused_limit notice and
+ * block subsequent tool calls (except write/edit so the agent can land summary).
  * @module dsh-step-budget-reminder
  */
-import { DEFAULT_SECOND_FACTOR, StepCounter, parseBudget } from "./budget.js";
+import {
+	DEFAULT_HARD_FACTOR,
+	DEFAULT_SECOND_FACTOR,
+	StepCounter,
+	parseBudget,
+} from "./budget.js";
 
 const name = "step-budget-reminder";
 
-/**
- * The `{kind:'plugin'}` source stamped on every notice this plugin injects —
- * the label is load-bearing (an unlabeled context would render as a user
- * prompt in derived history).
- */
 const PLUGIN_SOURCE = {
 	kind: "plugin",
 	plugin: "step-budget-reminder",
 };
 
-/** First reminder, emitted at the budget. */
 function firstReminder(steps, budget) {
 	return `[step-budget] 已到步数预算（${steps}/${budget}）。请收尾：跑相关测试、写 summary、提交；做不完就在 summary 里写清剩余工作。`;
 }
 
-/** Escalated reminder, emitted at `budget * secondFactor` (rounded up). */
 function secondReminder(steps, budget) {
 	return `[step-budget] 已超预算 1.5 倍（${steps}/${budget}）。请立即收尾：跑相关测试、写 summary、提交；做不完就写清剩余工作。`;
 }
 
-/**
- * Build the notice message. Constructed inline (not via a dsh-llm helper)
- * because a link-installed plugin cannot resolve `@deepseek-ai/dsh-llm`.
- */
+function hardReminder(steps, budget) {
+	return `[step-budget] 已到硬阈值（${steps}/${budget}，约 2×）。停止探索性工具调用；立即写 summary，机器块 status=paused_limit，notes 写清已用步数与剩余工作。broker 会交监理五选一，不会机械 closeout。`;
+}
+
 function createNotice(kind, steps, budget, secondFactor) {
-	const text =
-		kind === "first"
-			? firstReminder(steps, budget)
-			: secondReminder(steps, budget);
-	const summary =
-		kind === "first"
-			? `step-budget reached (${steps}/${budget})`
-			: `step-budget ${secondFactor}x exceeded (${steps}/${budget})`;
+	let text;
+	let summary;
+	if (kind === "first") {
+		text = firstReminder(steps, budget);
+		summary = `step-budget reached (${steps}/${budget})`;
+	} else if (kind === "second") {
+		text = secondReminder(steps, budget);
+		summary = `step-budget ${secondFactor}x exceeded (${steps}/${budget})`;
+	} else {
+		text = hardReminder(steps, budget);
+		summary = `step-budget hard cap (${steps}/${budget}) → paused_limit`;
+	}
 	return Object.freeze({
 		id: crypto.randomUUID(),
 		role: "user",
@@ -57,18 +53,16 @@ function createNotice(kind, steps, budget, secondFactor) {
 	});
 }
 
-/** Append our notice at the END, preserving every downstream context. */
 function appendContext(ours, theirs) {
 	return [...(theirs ?? []), ours];
 }
 
-/**
- * Install the listeners.
- * @param ctx - plugin context; listeners are scoped to it and disposed with it.
- * @param config - `{ budget?: number, secondFactor?: number }`. A missing,
- *   `null`, or non-object config (e.g. an empty `config:` block in YAML
- *   parses to `null`) is treated as `{}` rather than throwing.
- */
+/** Tools still allowed after hard: land the paused_limit summary. */
+function isWrapUpTool(exec) {
+	const n = String(exec?.name || exec?.toolName || "").toLowerCase();
+	return n === "write" || n === "edit" || n === "design_pack_read";
+}
+
 function apply(ctx, config) {
 	const cfg = config !== null && typeof config === "object" ? config : {};
 	const budget = parseBudget(process.env, cfg);
@@ -78,13 +72,15 @@ function apply(ctx, config) {
 		cfg.secondFactor > 1
 			? cfg.secondFactor
 			: DEFAULT_SECOND_FACTOR;
+	const hardFactor =
+		typeof cfg.hardFactor === "number" && Number.isFinite(cfg.hardFactor)
+			? cfg.hardFactor
+			: DEFAULT_HARD_FACTOR;
 
-	/** Per-agent counters; only the root agent is tracked. */
 	const counters = new WeakMap();
-	/** Per-agent reminder awaiting the next post-execute delivery. */
 	const pending = new WeakMap();
+	const hardAgents = new WeakSet();
 
-	/** Root agents are those without a live parent Agent (`parentAgent`). */
 	function isRoot(agent) {
 		return Boolean(agent) && !agent.parentAgent;
 	}
@@ -92,7 +88,7 @@ function apply(ctx, config) {
 	function counterFor(agent) {
 		let counter = counters.get(agent);
 		if (!counter) {
-			counter = new StepCounter(budget, secondFactor);
+			counter = new StepCounter(budget, secondFactor, hardFactor);
 			counters.set(agent, counter);
 		}
 		return counter;
@@ -103,10 +99,31 @@ function apply(ctx, config) {
 			const counter = counterFor(agent);
 			const kind = counter.step();
 			if (kind) {
-				pending.set(agent, createNotice(kind, counter.steps, budget, secondFactor));
+				pending.set(
+					agent,
+					createNotice(kind, counter.steps, budget, secondFactor),
+				);
+				if (kind === "hard") hardAgents.add(agent);
 			}
+			if (counter.hardReached) hardAgents.add(agent);
 		}
 		return next();
+	});
+
+	ctx.on("tools/pre-execute", async (exec, next) => {
+		if (!isRoot(exec.agent) || !hardAgents.has(exec.agent)) {
+			return next();
+		}
+		if (isWrapUpTool(exec)) {
+			return next();
+		}
+		const notice = createNotice("hard", counterFor(exec.agent).steps, budget, secondFactor);
+		return {
+			kind: "block",
+			feedback:
+				"step-budget hard: 停止该工具。请只写 summary（status=paused_limit）后停止。",
+			additionalContexts: [notice],
+		};
 	});
 
 	ctx.on("tools/post-execute", async (exec, _result, next) => {
@@ -131,4 +148,10 @@ function apply(ctx, config) {
 	});
 }
 
-export { DEFAULT_SECOND_FACTOR, apply, createNotice, name };
+export {
+	DEFAULT_HARD_FACTOR,
+	DEFAULT_SECOND_FACTOR,
+	apply,
+	createNotice,
+	name,
+};

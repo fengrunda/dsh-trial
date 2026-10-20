@@ -606,6 +606,8 @@ class AcpClient:
                     f"before replying (timeout after {hard}s): {early[0]}"
                 )
             kind = getattr(self, "_timeout_kind", None) or "hard"
+            # Broker maps these log lines to paused_wallclock (G1 wall-clock pause).
+            print(f"pause_kind=paused_wallclock reason={kind}", file=sys.stderr)
             if kind == "idle":
                 raise RuntimeError(
                     f"ACP session/prompt failed: timeout after {idle}s idle "

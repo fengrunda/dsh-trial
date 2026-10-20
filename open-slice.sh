@@ -11,7 +11,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   open-slice.sh --ticket NAME --pack REL_OR_ABS [--profile acp|acp-lite]
-                [--cwd ABS] [--role gate|impl|supervisor] [--final] [--keep-open]
+                [--cwd ABS] [--role gate|impl|supervisor] [--final] [--keep-open] [--resume]
                 [--log PATH] [--summary-name NAME]
                 [--prompt-mode baseline|foreman|gate|supervisor-plan|supervisor-answer|supervisor-close|supervisor-max-rounds] [--prompt-file PATH]
                 [--reasoning-effort off|low|high|max] [--step-budget N]
@@ -52,6 +52,7 @@ CWD="/workspace"
 ROLE=""
 FINAL=1
 KEEP_OPEN=0
+RESUME=0
 LOG=""
 SUMMARY_NAME=""
 PROMPT_MODE="baseline"
@@ -70,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --role) ROLE="${2:-}"; shift 2 ;;
     --final) FINAL=1; KEEP_OPEN=0; shift ;;
     --keep-open) KEEP_OPEN=1; FINAL=0; shift ;;
+    --resume) RESUME=1; shift ;;
     --log) LOG="${2:-}"; shift 2 ;;
     --summary-name) SUMMARY_NAME="${2:-}"; shift 2 ;;
     --prompt-mode) PROMPT_MODE="${2:-}"; shift 2 ;;
@@ -176,6 +178,7 @@ build_prompt_foreman() {
 ## 工具步数纪律（软上限；保质量优先于穷尽探索）
 - **建议上限约 25 步**工具轮（design_pack_read / read / edit / bash / ask / submit 均计）。limits 字段 `impl_max_steps` 默认 30（软参考，broker **不**裸杀）。
 - 接近上限（约 20+）：停止无效探索；收工写 summary（done/blocked/question）或 ask_supervisor 把剩余拆下一片；禁止重复 glob/无目标 bash/反复读同一大文件。
+- 若收到 `[step-budget] …硬阈值` 或工具被拦截：立即写 summary，`status=paused_limit`，notes 写清已用步数与剩余工作；**不要**继续探索。墙钟超时同理可用 `paused_wallclock`。broker 会交监理五选一（继续/新开/收尾/拆分/升级），不会机械 closeout。
 - 大工具输出已由 eager-offload 裁剪：优先 offset/limit 读所需片段，不要为「看全量」空转。
 
 ## 强制步骤：
@@ -191,7 +194,7 @@ build_prompt_foreman() {
    摘要必须短，并在文末含 **一个** 机器可读 fenced json 块，键固定：
 ```json
 {
-  "status": "done|blocked|question",
+  "status": "done|blocked|question|paused_limit|paused_wallclock",
   "changed_files": ["相对路径…"],
   "branch": "当前分支或空",
   "commit": "HEAD sha 短或空",
@@ -478,8 +481,13 @@ EOF
   exit 0
 fi
 
-# 每切片/每票新 ACP 会话，切片间只经 thin-state 摘要（broker 往 pack 追加 digest，勿 resume 旧会话）
-ARGS=(--profile "$PROFILE" --ticket "$TICKET" --cwd "$CWD" --prompt "$PROMPT" --new)
+# 默认每票新会话；监理同 Goal 复用时传 --resume（勿加 --new）。
+ARGS=(--profile "$PROFILE" --ticket "$TICKET" --cwd "$CWD" --prompt "$PROMPT")
+if [[ "$RESUME" -eq 1 ]]; then
+  ARGS+=(--resume)
+else
+  ARGS+=(--new)
+fi
 [[ -n "$ROLE" ]] && ARGS+=(--role "$ROLE")
 # Non-empty only: when unset, dsh-acp-ask.py falls back to DSH_REASONING_EFFORT /
 # DSH_STEP_BUDGET from the environment itself.

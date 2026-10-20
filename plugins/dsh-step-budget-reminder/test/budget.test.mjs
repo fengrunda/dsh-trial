@@ -129,7 +129,7 @@ test('apply: second reminder at 45 only, and never repeated after', async () => 
     }
   }
 
-  assert.equal(withReminder.length, 2)
+  assert.equal(withReminder.length, 3)
   assert.deepEqual(withReminder[0], [
     30,
     '[step-budget] 已到步数预算（30/30）。请收尾：跑相关测试、写 summary、提交；做不完就在 summary 里写清剩余工作。',
@@ -138,6 +138,8 @@ test('apply: second reminder at 45 only, and never repeated after', async () => 
     45,
     '[step-budget] 已超预算 1.5 倍（45/30）。请立即收尾：跑相关测试、写 summary、提交；做不完就写清剩余工作。',
   ])
+  assert.equal(withReminder[2][0], 60)
+  assert.match(withReminder[2][1], /硬阈值/)
 })
 
 test('apply: block branch keeps the reminder and downstream feedback', async () => {
@@ -191,9 +193,10 @@ test('apply: env budget is used when config has none', async () => {
     }
     assert.deepEqual(
       withReminder.map(([step]) => step),
-      [4, 8],
+      [4, 8, 9],
     )
     assert.match(withReminder[1][1], /已超预算 1\.5 倍（8\/4）/)
+    assert.match(withReminder[2][1], /硬阈值/)
   } finally {
     if (previous === undefined) delete process.env.DSH_STEP_BUDGET
     else process.env.DSH_STEP_BUDGET = previous
@@ -239,4 +242,58 @@ test('apply: null/undefined config does not throw and env budget still applies',
     if (previous === undefined) delete process.env.DSH_STEP_BUDGET
     else process.env.DSH_STEP_BUDGET = previous
   }
+})
+
+import { hardThreshold, DEFAULT_HARD_FACTOR } from '../lib/budget.js'
+
+test('hardThreshold: 30 → 60 at factor 2', () => {
+  assert.equal(hardThreshold(30, 2), 60)
+  assert.equal(DEFAULT_HARD_FACTOR, 2)
+})
+
+test('StepCounter: hard fires once at 60 for budget 30', () => {
+  const counter = new StepCounter(30, 1.5, 2)
+  const fired = []
+  for (let step = 1; step <= 65; step += 1) {
+    const kind = counter.step()
+    if (kind !== null) fired.push([step, kind])
+  }
+  assert.deepEqual(fired, [
+    [30, 'first'],
+    [45, 'second'],
+    [60, 'hard'],
+  ])
+  assert.equal(counter.hardReached, true)
+})
+
+test('StepCounter: hardFactor<=1 disables hard', () => {
+  const counter = new StepCounter(10, 1.5, 0)
+  const kinds = []
+  for (let i = 0; i < 30; i += 1) {
+    const k = counter.step()
+    if (k) kinds.push(k)
+  }
+  assert.ok(!kinds.includes('hard'))
+  assert.equal(counter.hardReached, false)
+})
+
+test('apply: hard blocks non-wrap tools after 2x', async () => {
+  const ctx = fakeCtx()
+  apply(ctx, { budget: 2, secondFactor: 1.5, hardFactor: 2 })
+  const agent = rootAgent()
+  for (let step = 1; step <= 4; step += 1) {
+    await runStep(ctx, agent)
+  }
+  const pre = ctx.handlers.get('tools/pre-execute')
+  const blocked = await pre(
+    { agent, name: 'bash', arguments: { command: 'ls' } },
+    () => Promise.resolve({ kind: 'allow' }),
+  )
+  assert.equal(blocked.kind, 'block')
+  assert.match(blocked.feedback, /paused_limit|hard/)
+  const allowed = await pre(
+    { agent, name: 'write', arguments: { file_path: 'x.md' } },
+    () => Promise.resolve({ kind: 'allow' }),
+  )
+  assert.equal(allowed.kind, 'allow')
 })

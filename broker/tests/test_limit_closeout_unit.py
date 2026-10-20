@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Limit-stop closeout: hard cap and max_steps share one path.
+"""Limit-stop / pause routing (G1).
 
-Idle timeout and a plain non-zero exit stay on the old failure path.
-A clean worktree still fails, but the handoff says there was nothing to commit.
-Closeout must not open a second impl ticket and must not mark the slice PASS.
+Hard cap, idle timeout, and max_steps now classify as paused_* and route to
+the supervisor five-way (continue_same / new_ticket / close / split / escalate).
+Mechanical closeout is no longer automatic; empty supervisor decision parks
+awaiting_supervisor. Plain non-zero exits still fail. limit_stop_kind remains
+for legacy log classification / fallback.
 """
 from __future__ import annotations
 
@@ -115,7 +117,9 @@ def _pr_script(path: Path, log: Path) -> None:
     path.chmod(0o755)
 
 
-def _run(dirs, repo, slice_id, goal_id, log_body, pr_bin: Path) -> tuple[int, list[str]]:
+def _run(
+    dirs, repo, slice_id, goal_id, log_body, pr_bin: Path, *, pause_decision: str | None = None
+) -> tuple[int, list[str]]:
     calls: list[str] = []
 
     def fake_open_slice(**kwargs):
@@ -145,17 +149,37 @@ def _run(dirs, repo, slice_id, goal_id, log_body, pr_bin: Path) -> tuple[int, li
     dest = dirs["processing"] / f"job-{slice_id}.json"
     dest.write_text("{}\n", encoding="utf-8")
     goal = json.loads((dirs["goals"] / f"{goal_id}.json").read_text(encoding="utf-8"))
-    with mock.patch.object(tb, "run_open_slice", side_effect=fake_open_slice), mock.patch.object(
-        tb, "write_artifacts", side_effect=fake_artifacts
-    ), mock.patch.dict(os.environ, {"DSH_TRIAL_PR": str(pr_bin)}):
-        rc = tb._execute_goal_slices(
-            goal,
-            job,
-            [{"slice": slice_id, "pack": f"{slice_id}.pack.md", "acceptance": []}],
-            dest,
-            on_slice_fail="stop",
-            plan_ticket="plan-unit",
+    patches = [
+        mock.patch.object(tb, "run_open_slice", side_effect=fake_open_slice),
+        mock.patch.object(tb, "write_artifacts", side_effect=fake_artifacts),
+        mock.patch.dict(os.environ, {"DSH_TRIAL_PR": str(pr_bin)}),
+    ]
+    if pause_decision is not None:
+        patches.append(
+            mock.patch.object(
+                tb, "auto_supervisor_pause_decision", return_value=pause_decision
+            )
         )
+    with patches[0], patches[1], patches[2]:
+        if pause_decision is not None:
+            with patches[3]:
+                rc = tb._execute_goal_slices(
+                    goal,
+                    job,
+                    [{"slice": slice_id, "pack": f"{slice_id}.pack.md", "acceptance": []}],
+                    dest,
+                    on_slice_fail="stop",
+                    plan_ticket="plan-unit",
+                )
+        else:
+            rc = tb._execute_goal_slices(
+                goal,
+                job,
+                [{"slice": slice_id, "pack": f"{slice_id}.pack.md", "acceptance": []}],
+                dest,
+                on_slice_fail="stop",
+                plan_ticket="plan-unit",
+            )
     return rc, calls
 
 
@@ -190,52 +214,39 @@ IDLE = (
 PLAIN = "=== run ===\nforeman crashed: assertion failed\n"
 
 
-def test_hard_cap_with_changes_closes_out_and_does_not_rerun(tmp_path: Path):
+def test_hard_cap_routes_to_supervisor_close(tmp_path: Path):
+    """Hard cap → paused_wallclock; supervisor close → chain closeout, no re-impl."""
     ctx, dirs = _patched_dirs(tmp_path / "state")
     repo = tmp_path / "repo"
     _init_repo(repo)
     _dirty(repo)
     slice_id = "unit-hard-dirty"
     goal_id = "goal-hard-dirty"
-    pr_log = tmp_path / "pr.log"
     pr_bin = tmp_path / "dsh-trial-pr"
-    _pr_script(pr_bin, pr_log)
+    _pr_script(pr_bin, tmp_path / "pr.log")
     with ctx:
         _write_pack(dirs, slice_id, repo)
         _seed_goal(dirs, goal_id, repo)
-        rc, calls = _run(dirs, repo, slice_id, goal_id, HARD, pr_bin)
+        rc, calls = _run(
+            dirs, repo, slice_id, goal_id, HARD, pr_bin, pause_decision="close"
+        )
         goal, chain = _load(dirs, goal_id, slice_id)
-    assert rc != 0
     assert goal["status"] == "closeout", goal
-    assert goal["status"] != "failed"
     assert chain["state"] == "closeout"
     assert chain["state"] != "PASS"
-    assert chain.get("last_verdict") in (None, "")
+    assert (chain.get("last_pause") or {}).get("kind") == "paused_wallclock"
+    assert (chain.get("last_pause") or {}).get("decision") == "close"
     assert len(chain["rounds"]) == 1
     assert calls == [f"impl-trial-{slice_id}-r1"]
     assert not any(c.startswith("gate-") for c in calls)
-    text = _handoff_text(chain)
-    assert "硬上限" in text
-    assert "unit-hard-dirty" in text
-    assert "impl-trial-unit-hard-dirty-r1" in text
-    assert "src/new_work.py" in text
-    assert "python3 -m pytest -q" in text
-    assert "https://github.com/fengrunda/memory-as-training/pull/4242" in text
-    head = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
-    ).stdout.strip()
-    assert head == "feat/slice"
-    show = subprocess.run(
-        ["git", "show", "--name-only", "--format=%s", "HEAD"],
-        cwd=repo, capture_output=True, text=True, check=True
+    # Dirty tree left for Hub; no mechanical commit/PR on this path.
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True, check=True
     ).stdout
-    assert "src/new_work.py" in show
-    assert "__pycache__" not in show
-    assert ".pytest_cache" not in show
-    assert pr_log.is_file()
+    assert "src/new_work.py" in dirty
 
 
-def test_hard_cap_clean_tree_still_fails(tmp_path: Path):
+def test_hard_cap_empty_decision_parks_awaiting(tmp_path: Path):
     ctx, dirs = _patched_dirs(tmp_path / "state")
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -246,17 +257,16 @@ def test_hard_cap_clean_tree_still_fails(tmp_path: Path):
     with ctx:
         _write_pack(dirs, slice_id, repo)
         _seed_goal(dirs, goal_id, repo)
-        _rc, calls = _run(dirs, repo, slice_id, goal_id, HARD, pr_bin)
+        _rc, calls = _run(
+            dirs, repo, slice_id, goal_id, HARD, pr_bin, pause_decision=None
+        )
+        # No mock → real auto_supervisor gets empty → awaiting
         goal, chain = _load(dirs, goal_id, slice_id)
-    assert goal["status"] == "failed"
-    assert chain["state"] == "failed"
-    assert "without summary" in chain["error"]
-    assert "hard_cap" in chain["error"]
-    text = _handoff_text(chain)
-    assert "硬上限" in text
-    assert "没有可提交改动" in text
-    assert calls == [f"impl-trial-{slice_id}-r1"]
-    assert not (tmp_path / "pr.log").exists()
+    assert chain["state"] == "awaiting_supervisor"
+    assert "paused_wallclock" in str(chain.get("awaiting_reason") or "")
+    assert goal["status"] == "running"
+    assert calls[0] == f"impl-trial-{slice_id}-r1"
+    assert any(c.startswith("supervisor-goal-") for c in calls)
 
 
 def test_plain_exit_does_not_close_out(tmp_path: Path):
@@ -286,7 +296,8 @@ def test_plain_exit_does_not_close_out(tmp_path: Path):
     assert "src/new_work.py" in dirty
 
 
-def test_idle_timeout_does_not_close_out(tmp_path: Path):
+def test_idle_timeout_routes_to_supervisor_pause(tmp_path: Path):
+    """Idle wall-clock → same paused_wallclock path as hard cap (G1)."""
     ctx, dirs = _patched_dirs(tmp_path / "state")
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -298,15 +309,14 @@ def test_idle_timeout_does_not_close_out(tmp_path: Path):
     with ctx:
         _write_pack(dirs, slice_id, repo)
         _seed_goal(dirs, goal_id, repo)
-        _rc, calls = _run(dirs, repo, slice_id, goal_id, IDLE, pr_bin)
+        _rc, calls = _run(
+            dirs, repo, slice_id, goal_id, IDLE, pr_bin, pause_decision="continue_same"
+        )
         goal, chain = _load(dirs, goal_id, slice_id)
-        handoffs = list(dirs["summaries"].glob("*sup-handoff*"))
-    assert goal["status"] == "failed"
-    assert chain["state"] == "failed"
-    assert "without summary" in chain["error"]
-    assert "hard_cap" not in chain["error"]
-    assert not chain.get("handoff_summary")
-    assert handoffs == []
+    assert chain["state"] == "awaiting_supervisor"
+    assert chain.get("pause_resume_mode") == "continue_same"
+    assert (chain.get("last_pause") or {}).get("kind") == "paused_wallclock"
+    assert goal["status"] == "running"
     assert calls == [f"impl-trial-{slice_id}-r1"]
     dirty = subprocess.run(
         ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True, check=True
@@ -314,40 +324,31 @@ def test_idle_timeout_does_not_close_out(tmp_path: Path):
     assert "src/new_work.py" in dirty
 
 
-def test_max_steps_with_changes_writes_handoff(tmp_path: Path):
+def test_max_steps_routes_to_supervisor_close(tmp_path: Path):
     ctx, dirs = _patched_dirs(tmp_path / "state")
     repo = tmp_path / "repo"
     _init_repo(repo)
     _dirty(repo)
     slice_id = "unit-steps-dirty"
     goal_id = "goal-steps-dirty"
-    pr_log = tmp_path / "pr.log"
     pr_bin = tmp_path / "dsh-trial-pr"
-    _pr_script(pr_bin, pr_log)
+    _pr_script(pr_bin, tmp_path / "pr.log")
     with ctx:
         _write_pack(dirs, slice_id, repo)
         _seed_goal(dirs, goal_id, repo)
-        _rc, calls = _run(dirs, repo, slice_id, goal_id, STEPS, pr_bin)
+        _rc, calls = _run(
+            dirs, repo, slice_id, goal_id, STEPS, pr_bin, pause_decision="close"
+        )
         goal, chain = _load(dirs, goal_id, slice_id)
     assert goal["status"] == "closeout"
     assert chain["state"] == "closeout"
     assert chain["state"] != "PASS"
+    assert (chain.get("last_pause") or {}).get("kind") == "paused_limit"
     assert len(chain["rounds"]) == 1
     assert calls == [f"impl-trial-{slice_id}-r1"]
-    text = _handoff_text(chain)
-    assert "步数上限" in text
-    assert "max_steps" in text
-    assert goal_id in text
-    assert slice_id in text
-    assert f"impl-trial-{slice_id}-r1" in text
-    assert "src/new_work.py" in text
-    assert "python3 -m pytest -q" in text and "exit=0" in text
-    assert "https://github.com/fengrunda/memory-as-training/pull/4242" in text
-    assert "不要重跑整片" in text
-    assert pr_log.is_file()
 
 
-def test_max_steps_clean_tree_fails_but_handoff_says_so(tmp_path: Path):
+def test_max_steps_empty_decision_parks_awaiting(tmp_path: Path):
     ctx, dirs = _patched_dirs(tmp_path / "state")
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -360,18 +361,11 @@ def test_max_steps_clean_tree_fails_but_handoff_says_so(tmp_path: Path):
         _seed_goal(dirs, goal_id, repo)
         _rc, calls = _run(dirs, repo, slice_id, goal_id, STEPS, pr_bin)
         goal, chain = _load(dirs, goal_id, slice_id)
-    assert goal["status"] == "failed"
-    assert chain["state"] == "failed"
-    assert chain["state"] != "PASS"
-    assert "without summary" in chain["error"]
-    assert "max_steps" in chain["error"]
-    text = _handoff_text(chain)
-    assert "步数上限" in text
-    assert "真撞" in text
-    assert "没有可提交改动" in text
-    assert "不要收成 PASS" in text
-    assert calls == [f"impl-trial-{slice_id}-r1"]
-    assert not (tmp_path / "pr.log").exists()
+    assert chain["state"] == "awaiting_supervisor"
+    assert "paused_limit" in str(chain.get("awaiting_reason") or "")
+    assert goal["status"] == "running"
+    assert calls[0] == f"impl-trial-{slice_id}-r1"
+    assert any(c.startswith("supervisor-goal-") for c in calls)
 
 
 def test_limit_kind_ignores_prompt_and_idle():
@@ -380,3 +374,10 @@ def test_limit_kind_ignores_prompt_and_idle():
     assert tb.limit_stop_kind(IDLE) is None
     assert tb.limit_stop_kind(PLAIN) is None
     assert tb.limit_stop_kind("timeout after 3600s hard cap") == "hard_cap"
+
+
+def test_classify_pause_maps_wallclock_and_steps():
+    assert tb.PS.classify_pause_reason(log_text=HARD) == "paused_wallclock"
+    assert tb.PS.classify_pause_reason(log_text=IDLE) == "paused_wallclock"
+    assert tb.PS.classify_pause_reason(log_text=STEPS) is None  # needs max_steps map or marker
+    assert tb.PS.classify_pause_reason(summary_status="paused_limit") == "paused_limit"

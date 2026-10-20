@@ -69,3 +69,13 @@ node --test "test/**/*.test.mjs"
 # 注意：本机 Node 22.19 把 `node --test test`（目录参数）当模块解析而报
 # MODULE_NOT_FOUND（dsh-role-bridge 同样如此），所以用 glob 或显式文件路径。
 ```
+
+## 硬阈值（G1，2026-10-20）
+
+`config.hardFactor` 默认 `2`：到 `ceil(budget * hardFactor)` 步时：
+
+1. 注入 `paused_limit` 收尾提示；
+2. `tools/pre-execute` **拦截**后续工具（仍允许 `write` / `edit` / `design_pack_read` 以便落 summary）；
+3. 工头应写 `status=paused_limit`；broker 交监理五选一，不机械 closeout。
+
+设 `hardFactor: 0` 或 `<=1` 可关闭硬拦截（仅保留软提醒）。

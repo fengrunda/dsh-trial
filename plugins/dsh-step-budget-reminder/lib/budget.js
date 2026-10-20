@@ -1,18 +1,13 @@
 /**
- * Pure step-budget logic for dsh-step-budget-reminder: budget resolution,
- * threshold computation, and threshold crossing detection. No cordis, no I/O —
- * everything here is directly unit-testable.
+ * Pure step-budget logic for dsh-step-budget-reminder.
+ * Soft reminders at budget and budget*secondFactor; hard mark at budget*hardFactor.
  * @module dsh-step-budget-reminder/budget
  */
 
-/** Default multiplier for the second (escalated) reminder. */
 export const DEFAULT_SECOND_FACTOR = 1.5;
+/** Default hard threshold multiplier (G1): 2× budget. */
+export const DEFAULT_HARD_FACTOR = 2;
 
-/**
- * Parse a single budget value: a positive integer, otherwise "no budget" (0).
- * @param value - raw candidate (`config.budget` or an environment string).
- * @returns the parsed budget, or 0 when absent/invalid/non-positive.
- */
 export function parseBudgetValue(value) {
 	if (typeof value === "number") {
 		return Number.isInteger(value) && value > 0 ? value : 0;
@@ -26,13 +21,6 @@ export function parseBudgetValue(value) {
 	return 0;
 }
 
-/**
- * Resolve the effective budget: `config.budget` wins, then the
- * `DSH_STEP_BUDGET` environment variable at apply time, then none.
- * @param env - environment source (defaults to `process.env`).
- * @param config - plugin config; only `budget` is read.
- * @returns the effective budget; 0 means "no budget — stay inert".
- */
 export function parseBudget(env, config) {
 	const fromConfig = parseBudgetValue(config?.budget);
 	if (fromConfig > 0) return fromConfig;
@@ -40,11 +28,8 @@ export function parseBudget(env, config) {
 }
 
 /**
- * Compute the two reminder thresholds: the budget itself and the escalated
- * multiple, rounded up so it is always an integer step count.
- * @param budget - effective budget (> 0).
- * @param factor - second-threshold multiplier (default 1.5).
- * @returns `[first, second]`, or an empty list when there is no budget.
+ * Soft thresholds only (first + second). Hard is separate.
+ * @returns `[first, second?]`
  */
 export function thresholds(budget, factor = DEFAULT_SECOND_FACTOR) {
 	if (!Number.isInteger(budget) || budget <= 0) return [];
@@ -56,42 +41,56 @@ export function thresholds(budget, factor = DEFAULT_SECOND_FACTOR) {
 	return second > budget ? [budget, second] : [budget];
 }
 
-/**
- * Per-agent step counter that reports each threshold exactly once, in order.
- * A budget of 0 yields {@link StepCounter.NONE} forever (the plugin is inert).
- */
+/** Hard step count (ceil), or 0 when disabled. */
+export function hardThreshold(budget, hardFactor = DEFAULT_HARD_FACTOR) {
+	if (!Number.isInteger(budget) || budget <= 0) return 0;
+	const f =
+		typeof hardFactor === "number" && Number.isFinite(hardFactor) && hardFactor > 1
+			? hardFactor
+			: DEFAULT_HARD_FACTOR;
+	return Math.ceil(budget * f);
+}
+
 export class StepCounter {
-	/** Sentinel returned when no reminder is due this step. */
 	static NONE = null;
 
 	#marks;
+	#hardAt;
 	#delivered = new Set();
 	#steps = 0;
+	#hardFired = false;
 
 	/**
-	 * @param budget - effective budget; 0 disables the counter.
-	 * @param factor - second-threshold multiplier (default 1.5).
+	 * @param budget
+	 * @param factor - soft second multiplier
+	 * @param hardFactor - hard multiplier (default 2); <=1 disables hard
 	 */
-	constructor(budget, factor = DEFAULT_SECOND_FACTOR) {
+	constructor(budget, factor = DEFAULT_SECOND_FACTOR, hardFactor = DEFAULT_HARD_FACTOR) {
 		this.#marks = thresholds(budget, factor).map((at, index) => ({
 			at,
 			kind: index === 0 ? "first" : "second",
 		}));
+		this.#hardAt =
+			typeof hardFactor === "number" && hardFactor > 1
+				? hardThreshold(budget, hardFactor)
+				: 0;
 	}
 
-	/** Steps seen so far. */
 	get steps() {
 		return this.#steps;
 	}
 
-	/** Thresholds this counter can still report, in ascending order. */
+	get hardReached() {
+		return this.#hardFired;
+	}
+
 	get pendingMarks() {
 		return this.#marks.filter((mark) => !this.#delivered.has(mark.kind));
 	}
 
 	/**
-	 * Register one loop step.
-	 * @returns `'first'`, `'second'`, or `null` when nothing is due.
+	 * @returns `'first' | 'second' | 'hard' | null`
+	 * hard is reported once when steps >= hardAt (after soft marks for the same step).
 	 */
 	step() {
 		this.#steps += 1;
@@ -99,8 +98,14 @@ export class StepCounter {
 			(candidate) =>
 				!this.#delivered.has(candidate.kind) && this.#steps >= candidate.at,
 		);
-		if (!mark) return StepCounter.NONE;
-		this.#delivered.add(mark.kind);
-		return mark.kind;
+		if (mark) {
+			this.#delivered.add(mark.kind);
+			return mark.kind;
+		}
+		if (this.#hardAt > 0 && !this.#hardFired && this.#steps >= this.#hardAt) {
+			this.#hardFired = true;
+			return "hard";
+		}
+		return StepCounter.NONE;
 	}
 }

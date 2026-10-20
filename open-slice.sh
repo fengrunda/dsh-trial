@@ -401,6 +401,14 @@ if [[ ( "$PROMPT_MODE" == "foreman" || "$PROMPT_MODE" == "gate" ) \
   fi
 fi
 
+# 审核原则短注入（Runda 18:04）：只补注意力/轮次口径，不重写人格；DSH_GATE_PRINCIPLES=0 可关。
+if [[ "$PROMPT_MODE" == "gate" && "${DSH_GATE_PRINCIPLES:-1}" != "0" ]]; then
+  PROMPT="$PROMPT"$'\n\n''## 审核原则（Runda 18:04）
+- 注意力不丢、不偏、符合设计即可；不反复挑细节。
+- 小改动一般一轮审完；仅有 P2 时 PASS，findings 里附备注。
+- 工头已跑的定点测试只读复核，不必重跑。'
+fi
+
 if [[ "$PRINT_PROMPT" -eq 1 ]]; then
   # Print-only: build the prompt but touch nothing on disk and never call ask.
   printf '%s\n' "$PROMPT"
@@ -421,21 +429,53 @@ if [[ -z "$INF_ROLE" ]]; then
 fi
 [[ -n "$INF_ROLE" ]] && ensure_role_pack_bridge "$INF_ROLE"
 
-# Gate 推理档位热分级：默认低档，高风险/大 diff 才 high。逻辑在独立小脚本里，
-# 每张票重新执行 open-slice.sh 即热生效；DSH_GATE_TIERING=0 可关闭。
+# Gate 分流与推理档位热分级：收尾片可免审，其余默认低档，只有显式风险/高风险
+# 路径才 high（行数不再抬档）。逻辑在 broker/gate_effort.py，每张票重新执行
+# open-slice.sh 即热生效；DSH_GATE_TIERING=0 全部关闭，DSH_GATE_SKIP=0 只关免审。
 GATE_TIER_NOTE=""
+GATE_SKIP=""
 if [[ ( "$INF_ROLE" == "gate" || "${ROLE:-}" == "gate" ) \
-      && -z "$REASONING_EFFORT" && "${DSH_GATE_TIERING:-1}" != "0" ]]; then
-  _tier_out="$(python3 "$(dirname "$0")/broker/gate_effort.py" "$PACK_ABS" "$CWD" 2>/dev/null || true)"
-  if [[ -n "$_tier_out" ]]; then
-    _tier_effort="${_tier_out%%$'\t'*}"
-    _tier_reason=""
-    [[ "$_tier_out" == *$'\t'* ]] && _tier_reason="${_tier_out#*$'\t'}"
-    if [[ -n "$_tier_effort" ]]; then
-      REASONING_EFFORT="$_tier_effort"
-      GATE_TIER_NOTE="gate_tier=$_tier_effort ($_tier_reason)"
+      && "${DSH_GATE_TIERING:-1}" != "0" ]]; then
+  _cls_out="$(python3 "$(dirname "$0")/broker/gate_effort.py" --classify "$PACK_ABS" "$CWD" 2>/dev/null || true)"
+  if [[ -n "$_cls_out" ]]; then
+    _cls_action="${_cls_out%%$'\t'*}"
+    _cls_rest="${_cls_out#*$'\t'}"
+    _cls_effort="${_cls_rest%%$'\t'*}"
+    _cls_reason=""
+    [[ "$_cls_rest" == *$'\t'* ]] && _cls_reason="${_cls_rest#*$'\t'}"
+    if [[ "$_cls_action" == "skip" && "${DSH_GATE_SKIP:-1}" != "0" ]]; then
+      GATE_SKIP="$_cls_reason"
+    elif [[ "$_cls_action" == "skip" ]]; then
+      # 显式关闭免审：退化为 review + low，继续走 ask。
+      [[ -z "$REASONING_EFFORT" ]] && REASONING_EFFORT="low"
+      GATE_TIER_NOTE="gate_tier=low (skip disabled: $_cls_reason)"
+    elif [[ "$_cls_action" == "review" && -z "$REASONING_EFFORT" && -n "$_cls_effort" ]]; then
+      REASONING_EFFORT="$_cls_effort"
+      GATE_TIER_NOTE="gate_tier=$_cls_effort ($_cls_reason)"
     fi
   fi
+fi
+
+if [[ -n "$GATE_SKIP" ]]; then
+  mkdir -p "$(dirname "$SUMMARY_OUT")"
+  cat > "$SUMMARY_OUT" <<EOF
+# Gate 免审（收尾片）
+
+本片按 gate_skip 规则免审：只开 PR，无新业务 commit，不启动 gate 会话。
+
+\`\`\`json
+{
+  "verdict": "PASS",
+  "findings": [],
+  "unmet_acceptance": [],
+  "notes": "gate_skip: $GATE_SKIP",
+  "skip_reason": "$GATE_SKIP"
+}
+\`\`\`
+EOF
+  echo "gate_skip=$GATE_SKIP"
+  echo "summary=$SUMMARY_OUT"
+  exit 0
 fi
 
 # 每切片/每票新 ACP 会话，切片间只经 thin-state 摘要（broker 往 pack 追加 digest，勿 resume 旧会话）

@@ -48,8 +48,20 @@ def test_small_safe_diff_is_low():
     assert gate_effort.decide(None, ["src/util.py"], 12)[0] == "low"
 
 
-def test_large_diff_is_high():
-    assert gate_effort.decide(None, ["src/util.py"], 401)[0] == "high"
+def test_large_diff_no_longer_raises_tier():
+    assert gate_effort.decide(None, ["src/util.py"], 747)[0] == "low"
+
+
+def test_risk_label_tenant_is_high():
+    effort, reason = gate_effort.decide("tenant,takeover", ["src/util.py"], 3)
+    assert effort == "high"
+    assert "risk=" in reason
+
+
+def test_explicit_low_beats_high_risk_path():
+    effort, reason = gate_effort.decide("low", ["src/auth/session.py"], 3)
+    assert effort == "low"
+    assert "risk=low" in reason
 
 
 def _write_pack(d: Path, name: str, body: str) -> Path:
@@ -248,6 +260,48 @@ def test_diff_block_counts_hunk_lines_starting_with_double_dash_or_plus():
     paths, changed = gate_effort._diff_block_stats(text)
     assert paths == ["src/x.py"]
     assert changed == 4
+
+
+def test_classify_skip_closing_pr_only(tmp_path):
+    _write_pack(
+        tmp_path,
+        "s1.pack.md",
+        "---\nslice_id: s1\n---\n\n不要调 `submit_for_review`；直接开 PR。\n",
+    )
+    gate = _write_pack(tmp_path, "s1.rev2.pack.md", GATE_HEAD + "---\n")
+    c = gate_effort.classify(gate, tmp_path)
+    assert c["action"] == "skip"
+    assert c["effort"] is None
+    assert "closing_slice_pr_only" in c["reason"]
+
+
+def test_classify_skip_gate_frontmatter(tmp_path):
+    _orig_pack(tmp_path)
+    gate = _write_pack(
+        tmp_path,
+        "s1.rev2.pack.md",
+        GATE_HEAD.replace("role: gate\n", "role: gate\nskip_gate: true\n") + "---\n",
+    )
+    c = gate_effort.classify(gate, tmp_path)
+    assert c["action"] == "skip"
+    assert "frontmatter" in c["reason"]
+
+
+def test_classify_review_keeps_effort(tmp_path):
+    _orig_pack(tmp_path)
+    gate = _write_pack(tmp_path, "s1.rev2.pack.md", GATE_HEAD + "---\n")
+    c = gate_effort.classify(gate, tmp_path)
+    assert c["action"] == "review"
+    assert c["effort"] == "low"
+
+
+def test_cli_classify_prints_three_fields(tmp_path, capsys):
+    _orig_pack(tmp_path)
+    gate = _write_pack(tmp_path, "s1.rev2.pack.md", GATE_HEAD + "---\n")
+    rc = gate_effort.main(["gate_effort.py", "--classify", str(gate), str(tmp_path)])
+    out = capsys.readouterr().out.rstrip("\n")
+    assert rc == 0
+    assert out.split("\t")[:2] == ["review", "low"]
 
 
 def test_cli_bad_input_prints_empty_and_exits_zero(capsys):

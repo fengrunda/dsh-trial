@@ -3,12 +3,17 @@
 
 broker 每张票都会重新执行 open-slice.sh，因此分级逻辑放在这里即可热生效，
 无需重启 broker。约定：默认低档，只有生产写入、鉴权/租户、对外接口、
-迁移/部署类改动（或大 diff）才用 high。
+迁移/部署类改动才用 high；改动行数本身不再抬档。
 
 事实：dsh-acp-ask.py 的 normalize_effort 把 medium 映射为 high（适配器只认
 off/low/high/max），所以实际只有 low / high 两档有意义；medium risk 取 low。
 
+收尾片（只开 PR、无新业务 commit）可在 classify() 里判为 skip，由 open-slice.sh
+直接写 PASS 摘要、不调用 gate。
+
 CLI: python3 gate_effort.py <gate_pack> <cwd>  # 打印 "<effort>\\t<reason>"
+     python3 gate_effort.py --classify <gate_pack> <cwd>
+     # 打印 "<action>\\t<effort|empty>\\t<reason>"
 任何异常都打印空行并 exit 0 —— 失败=不覆盖，保持原有 env。
 """
 from __future__ import annotations
@@ -46,9 +51,13 @@ def decide(
     paths: list[str],
     changed_lines: int,
     *,
-    big_lines: int = 400,
+    big_lines: int = 400,  # 保留兼容参数；行数不再单独抬档
 ) -> tuple[str, str]:
-    """按 risk / 路径 / 改动行数决定档位。"""
+    """按显式 risk / risk 标签 / 改动路径决定档位。
+
+    显式 low/medium/high 优先；标签型 risk（如 tenant,takeover）与路径共用
+    同一套高风险正则。大 diff 不再抬 high。
+    """
     r = (risk or "").strip().lower()
     if r == "high":
         return "high", "risk=high"
@@ -56,12 +65,13 @@ def decide(
         return "low", "risk=low"
     if r == "medium":
         return "low", "risk=medium->low (adapter has no medium)"
+    for label in (x.strip() for x in r.split(",")):
+        if label and HIGH_RISK_RE.search(label):
+            return "high", f"high-risk risk={label}"
     for p in paths:
         if HIGH_RISK_RE.search(p or ""):
             return "high", f"high-risk path={p}"
-    if changed_lines > big_lines:
-        return "high", f"changed_lines={changed_lines}>{big_lines}"
-    return "low", f"small diff ({changed_lines} lines)"
+    return "low", f"no high-risk signal ({changed_lines} lines; size not tiered)"
 
 
 _DIFF_META_PREFIXES = (
@@ -153,12 +163,21 @@ def _git_diff_stats(cwd: str, base: str, head: str) -> tuple[list[str], int]:
     return paths, changed
 
 
-def from_gate_pack(pack_path: str | Path, cwd: str | Path) -> tuple[str, str]:
-    """读 gate pack → 原 pack risk / diff → 档位。"""
-    pack = Path(pack_path)
-    text = pack.read_text(encoding="utf-8", errors="replace")
-    meta = _parse_frontmatter(text)
+def _orig_pack_text(pack: Path, meta: dict[str, str]) -> str | None:
+    orig_name = (meta.get("original_pack") or "").strip()
+    if not orig_name:
+        return None
+    try:
+        return (pack.parent / Path(orig_name).name).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
 
+
+def _pack_effort(
+    pack: Path, text: str, meta: dict[str, str], cwd: str | Path
+) -> tuple[str, str]:
     explicit = (meta.get("gate_effort") or "").strip().lower()
     normalized = {
         "low": "low",
@@ -171,15 +190,9 @@ def from_gate_pack(pack_path: str | Path, cwd: str | Path) -> tuple[str, str]:
         return normalized, "pack gate_effort"
 
     risk: str | None = None
-    orig_name = (meta.get("original_pack") or "").strip()
-    if orig_name:
-        orig = pack.parent / Path(orig_name).name
-        try:
-            risk = _parse_frontmatter(
-                orig.read_text(encoding="utf-8", errors="replace")
-            ).get("risk")
-        except OSError:
-            risk = None
+    orig_text = _orig_pack_text(pack, meta)
+    if orig_text is not None:
+        risk = _parse_frontmatter(orig_text).get("risk")
 
     paths: list[str] = []
     changed = 0
@@ -195,12 +208,64 @@ def from_gate_pack(pack_path: str | Path, cwd: str | Path) -> tuple[str, str]:
     return decide(risk, paths, changed)
 
 
+def _frontmatter_skip(meta: dict[str, str]) -> bool:
+    return (
+        (meta.get("skip_gate") or "").strip().lower() in {"1", "true", "yes", "on"}
+        or (meta.get("gate") or "").strip().lower() == "skip"
+        or (meta.get("review") or "").strip().lower() == "skip"
+    )
+
+
+def _closing_signal(text: str | None) -> str | None:
+    """收尾片强信号：明确不要走 gate，只要开 PR。"""
+    if not text:
+        return None
+    no_submit = re.search(r"不要.*submit_for_review", text)
+    pr_only = re.search(r"开\s*PR|dsh-trial-pr|push-and-pr", text, re.IGNORECASE)
+    if no_submit and pr_only:
+        return "closing_slice_pr_only"
+    if re.search(r"supervisor-close", text, re.IGNORECASE) and re.search(
+        r"核对|不是\s*gate", text
+    ):
+        return "supervisor_close_check"
+    return None
+
+
+def classify(pack_path: str | Path, cwd: str | Path) -> dict:
+    """返回 {action: skip|review, effort: low|high|None, reason: str}。"""
+    pack = Path(pack_path)
+    text = pack.read_text(encoding="utf-8", errors="replace")
+    meta = _parse_frontmatter(text)
+    orig_text = _orig_pack_text(pack, meta)
+
+    if _frontmatter_skip(meta) or _frontmatter_skip(_parse_frontmatter(orig_text or "")):
+        return {"action": "skip", "effort": None, "reason": "frontmatter_skip"}
+    reason = _closing_signal(orig_text if orig_text is not None else text)
+    if reason:
+        return {"action": "skip", "effort": None, "reason": reason}
+    effort, reason = _pack_effort(pack, text, meta, cwd)
+    return {"action": "review", "effort": effort, "reason": reason}
+
+
+def from_gate_pack(pack_path: str | Path, cwd: str | Path) -> tuple[str, str]:
+    """读 gate pack → 原 pack risk / diff → 档位。"""
+    pack = Path(pack_path)
+    text = pack.read_text(encoding="utf-8", errors="replace")
+    return _pack_effort(pack, text, _parse_frontmatter(text), cwd)
+
+
 def main(argv: list[str]) -> int:
     try:
-        if len(argv) < 3:
-            raise ValueError("usage: gate_effort.py <gate_pack> <cwd>")
-        effort, reason = from_gate_pack(argv[1], argv[2])
-        print(f"{effort}\t{reason}")
+        if len(argv) >= 2 and argv[1] == "--classify":
+            if len(argv) < 4:
+                raise ValueError("usage: gate_effort.py --classify <gate_pack> <cwd>")
+            c = classify(argv[2], argv[3])
+            print(f"{c['action']}\t{c['effort'] or ''}\t{c['reason']}")
+        else:
+            if len(argv) < 3:
+                raise ValueError("usage: gate_effort.py <gate_pack> <cwd>")
+            effort, reason = from_gate_pack(argv[1], argv[2])
+            print(f"{effort}\t{reason}")
     except Exception:
         print()
     return 0

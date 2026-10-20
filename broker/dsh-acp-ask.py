@@ -37,8 +37,8 @@ One-shot without role/ticket stays on ``~/.dsh`` (or existing DSH_HOME).
 Env
 ---
 DSH_BIN, DSH_HOME, DSH_ROLE, DSH_HOMES_ROOT, DSH_PERMISSION_MODE,
-DSH_ACP_PROMPT_IDLE_TIMEOUT (default 900): reset while ACP stdout shows
-progress. DSH_ACP_PROMPT_TIMEOUT (default 3600): hard cap on process
+DSH_ACP_PROMPT_IDLE_TIMEOUT (default 1800 / 30m soft wall): reset while ACP stdout shows
+progress. DSH_ACP_PROMPT_TIMEOUT (default 3600 / 1h hard): hard cap on process
 uptime (time.monotonic) for one session/prompt so a true hang cannot hold
 the broker forever and a host suspend / wall-clock jump cannot trip it.
 Loads $DSH_HOME/.env into the child without overwriting existing env.
@@ -297,7 +297,7 @@ def prompt_timeouts_from_env(env: dict[str, str] | None = None) -> tuple[int, in
     The hard cap is never shorter than the idle window.
     """
     src = env if env is not None else os.environ
-    idle = int(src.get("DSH_ACP_PROMPT_IDLE_TIMEOUT", "900"))
+    idle = int(src.get("DSH_ACP_PROMPT_IDLE_TIMEOUT", "1800"))
     hard = int(src.get("DSH_ACP_PROMPT_TIMEOUT", "3600"))
     if idle <= 0:
         idle = hard

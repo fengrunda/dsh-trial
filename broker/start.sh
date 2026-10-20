@@ -23,8 +23,8 @@ export PATH="$DSH_HOME/bin:${HOME}/.local/bin:${PATH}"
 export DSH_HOME
 # Job timeout is computed by trial-broker (ask wait + prompt hard cap + 120)
 # unless TRIAL_BROKER_JOB_TIMEOUT is already a non-empty override.
-# Prompt: idle 900s resets on ACP stdout; 3600s is the hard cap.
-export DSH_ACP_PROMPT_IDLE_TIMEOUT="${DSH_ACP_PROMPT_IDLE_TIMEOUT:-900}"
+# Prompt: idle 1800s (30m soft wall) resets on ACP stdout; 3600s (1h) hard cap.
+export DSH_ACP_PROMPT_IDLE_TIMEOUT="${DSH_ACP_PROMPT_IDLE_TIMEOUT:-1800}"
 export DSH_ACP_PROMPT_TIMEOUT="${DSH_ACP_PROMPT_TIMEOUT:-3600}"
 export DSH_ACP_ASK="${DSH_ACP_ASK:-$ROOT/dsh-acp-ask.py}"
 export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"

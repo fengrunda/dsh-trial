@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -137,6 +138,116 @@ def test_gate_effort_frontmatter_wins(tmp_path):
     effort, reason = gate_effort.from_gate_pack(gate, tmp_path)
     assert effort == "low"
     assert reason == "pack gate_effort"
+
+
+def test_gate_effort_frontmatter_whitelist_normalized(tmp_path):
+    for raw, expected in [
+        ("low", "low"),
+        ("off", "off"),
+        ("medium", "low"),
+        ("high", "high"),
+        ("max", "high"),
+    ]:
+        gate = _write_pack(
+            tmp_path,
+            f"s1.rev2.{raw}.pack.md",
+            GATE_HEAD.replace("role: gate\n", f"role: gate\ngate_effort: {raw}\n")
+            + "---\n",
+        )
+        effort, reason = gate_effort.from_gate_pack(gate, tmp_path)
+        assert effort == expected, raw
+        assert reason == "pack gate_effort"
+
+
+def test_gate_effort_frontmatter_invalid_ignored(tmp_path):
+    _orig_pack(tmp_path, risk="high")
+    gate = _write_pack(
+        tmp_path,
+        "s1.rev2.invalid.pack.md",
+        GATE_HEAD.replace("role: gate\n", "role: gate\ngate_effort: urgent\n") + "---\n",
+    )
+    effort, reason = gate_effort.from_gate_pack(gate, tmp_path)
+    assert effort == "high"
+    assert reason == "risk=high"
+
+
+def test_header_without_sha_falls_back_to_diff_block(tmp_path):
+    _orig_pack(tmp_path)
+    gate = _write_pack(
+        tmp_path,
+        "s1.rev2.pack.md",
+        GATE_HEAD
+        + "---\n\n## New diff (base...head merge-base; truncated=true)\n"
+        + "```diff\n"
+        + "diff --git a/src/migrations/0002_x.sql b/src/migrations/0002_x.sql\n"
+        + "--- a/src/migrations/0002_x.sql\n"
+        + "+++ b/src/migrations/0002_x.sql\n"
+        + "+create table t (id int);\n"
+        + "```\n",
+    )
+    effort, reason = gate_effort.from_gate_pack(gate, tmp_path)
+    assert effort == "high"
+    assert "migrations" in reason
+
+
+def test_empty_numstat_falls_back_to_diff_block(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "test")
+    (repo / "tracked.txt").write_text("a\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-q", "-m", "base")
+    # 未提交改动 + base==head：numstat 成功但输出为空。
+    (repo / "tracked.txt").write_text("a\nb\n", encoding="utf-8")
+    sha = git("rev-parse", "HEAD").strip()
+    _orig_pack(tmp_path)
+
+    gate = _write_pack(
+        tmp_path,
+        "s1.rev2.pack.md",
+        GATE_HEAD
+        + f"---\n\n## Diff (base...head merge-base; base={sha} head={sha}; truncated=false)\n"
+        + "```diff\n"
+        + "diff --git a/src/migrations/0002_x.sql b/src/migrations/0002_x.sql\n"
+        + "index 1111111..2222222 100644\n"
+        + "--- a/src/migrations/0002_x.sql\n"
+        + "+++ b/src/migrations/0002_x.sql\n"
+        + "+create table t (id int);\n"
+        + "```\n",
+    )
+    effort, reason = gate_effort.from_gate_pack(gate, repo)
+    assert effort == "high"
+    assert "migrations" in reason
+
+
+def test_diff_block_counts_hunk_lines_starting_with_double_dash_or_plus():
+    text = (
+        "```diff\n"
+        "diff --git a/src/x.py b/src/x.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/x.py\n"
+        "+++ b/src/x.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        "--- old\n"
+        "+++ new\n"
+        "-plain\n"
+        "+plain\n"
+        "```\n"
+    )
+    paths, changed = gate_effort._diff_block_stats(text)
+    assert paths == ["src/x.py"]
+    assert changed == 4
 
 
 def test_cli_bad_input_prints_empty_and_exits_zero(capsys):

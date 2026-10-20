@@ -64,11 +64,26 @@ def decide(
     return "low", f"small diff ({changed_lines} lines)"
 
 
+_DIFF_META_PREFIXES = (
+    "index ",
+    "new file mode ",
+    "deleted file mode ",
+    "old mode ",
+    "new mode ",
+    "similarity index ",
+    "rename from ",
+    "rename to ",
+    "Binary files ",
+)
+
+
 def _diff_block_stats(text: str) -> tuple[list[str], int]:
     """回退：从 ```diff 块里统计 diff --git 路径与 +/- 行数。"""
     paths: list[str] = []
     changed = 0
     in_block = False
+    in_header = False  # 刚过 diff --git，仍可能处于文件头
+    seen_minus = False
     for line in text.splitlines():
         if line.strip().startswith("```"):
             if in_block:
@@ -83,9 +98,27 @@ def _diff_block_stats(text: str) -> tuple[list[str], int]:
             m = re.match(r"diff --git a/(\S+) b/(\S+)", line)
             if m:
                 paths.append(m.group(2))
-        elif line.startswith("+++") or line.startswith("---"):
+            in_header = True
+            seen_minus = False
             continue
-        elif line.startswith("+"):
+        if in_header:
+            if not seen_minus and (
+                line.startswith("--- a/") or line.startswith("--- /dev/null")
+            ):
+                seen_minus = True
+                continue
+            if seen_minus and (
+                line.startswith("+++ b/") or line.startswith("+++ /dev/null")
+            ):
+                in_header = False
+                seen_minus = False
+                continue
+            if not seen_minus and line.startswith(_DIFF_META_PREFIXES):
+                continue
+            # 不是文件头：结束头部状态，按普通 diff 行处理。
+            in_header = False
+            seen_minus = False
+        if line.startswith("+"):
             changed += 1
         elif line.startswith("-"):
             changed += 1
@@ -101,6 +134,9 @@ def _git_diff_stats(cwd: str, base: str, head: str) -> tuple[list[str], int]:
     )
     if proc.returncode != 0:
         raise RuntimeError(f"git diff failed: {proc.returncode}")
+    if not proc.stdout.strip():
+        # base==head / 改动未提交等：空输出不能当 0 行，回退去数 diff 块。
+        raise RuntimeError("git diff produced empty numstat")
     paths: list[str] = []
     changed = 0
     for line in proc.stdout.splitlines():
@@ -124,8 +160,15 @@ def from_gate_pack(pack_path: str | Path, cwd: str | Path) -> tuple[str, str]:
     meta = _parse_frontmatter(text)
 
     explicit = (meta.get("gate_effort") or "").strip().lower()
-    if explicit:
-        return explicit, "pack gate_effort"
+    normalized = {
+        "low": "low",
+        "off": "off",
+        "medium": "low",
+        "high": "high",
+        "max": "high",
+    }.get(explicit)
+    if normalized:
+        return normalized, "pack gate_effort"
 
     risk: str | None = None
     orig_name = (meta.get("original_pack") or "").strip()

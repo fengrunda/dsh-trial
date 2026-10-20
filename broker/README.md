@@ -177,7 +177,8 @@ trial-broker 在**每 job 结束**与**空闲轮询（≥1h）**时调用 GC（`
 
 ## Gate 推理档位分级
 
-- Gate 票默认 `low`；原 pack frontmatter 的 `risk: low|medium|high` 优先（无 risk 时按路径/改动量启发式：`migrat|auth|tenant|api/|openapi|webhook|deploy|prod` 或 diff > 400 行 ⇒ `high`）。
+- Gate 票默认 `low`；原 pack frontmatter 的 `risk: low|medium|high` 优先（无 risk 时按路径/改动量启发式，路径规则见 `broker/gate_effort.py` 的 `HIGH_RISK_RE`：迁移、鉴权/租户、`api/`、openapi、webhook、部署、生产路径；或 diff > 400 行 ⇒ `high`）。
+- frontmatter 显式 `gate_effort` 会做白名单归一：`off`/`low` 原样，`medium`→`low`，`high`/`max`→`high`，非法值忽略并回落到 risk/启发式。
 - 分级由 `broker/gate_effort.py` 在 `open-slice.sh` 里对每张票热生效（无需重启 broker），只影响 gate 票且未显式传 `--reasoning-effort` 时。
 - `DSH_GATE_TIERING=0` 关闭分级；介质档位注意：适配器只认 off/low/high/max，`medium` 实际等于 `high`，故 medium risk 取 `low`。
 

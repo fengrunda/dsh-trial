@@ -33,13 +33,21 @@ def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
     if not lines or lines[0].strip() != "---":
         return {}, text
     fm: dict[str, str] = {}
+    last_key = ""
     for idx in range(1, len(lines)):
         line = lines[idx]
         if line.strip() == "---":
             return fm, "\n".join(lines[idx + 1:])
+        stripped = line.strip()
+        if last_key and stripped.startswith("- "):
+            item = stripped[2:].strip().strip("'\"")
+            if item:
+                fm[last_key] = f"{fm.get(last_key, '')} {item}".strip()
+            continue
         if ":" in line and not line.lstrip().startswith("#"):
             key, _, value = line.partition(":")
-            fm[key.strip().lower()] = value.strip().strip("'\"")
+            last_key = key.strip().lower()
+            fm[last_key] = value.strip().strip("'\"")
     return {}, text
 
 
@@ -84,9 +92,18 @@ def _collect_commands(body: str) -> list[str]:
         if not cmd:
             continue
         probe = re.sub(r"^cd\s+\S+\s*&&\s*", "", cmd)
-        if probe.startswith("pytest") or probe.startswith("python3 -m pytest"):
-            if cmd not in cmds:
-                cmds.append(cmd)
+        tokens = probe.split()
+        if tokens[:3] == ["python3", "-m", "pytest"]:
+            rest = tokens[3:]
+        elif tokens[:1] == ["pytest"]:
+            rest = tokens[1:]
+        else:
+            continue
+        # 裸 pytest（只有 flag、无任何 path/目录/:: 目标）是全量，不收为定点命令。
+        if not any(not tok.startswith("-") for tok in rest):
+            continue
+        if cmd not in cmds:
+            cmds.append(cmd)
     return cmds
 
 
@@ -102,12 +119,10 @@ def _diff_changed_files(body: str) -> list[str]:
 
 def _map_tests(changed: list[str], tracked: list[str]) -> list[str]:
     found: list[str] = []
-    tracked_set = set(tracked)
     for path in changed:
         if _is_test_file(path):
-            if path in tracked_set or not tracked:
-                if path not in found:
-                    found.append(path)
+            if path not in found:
+                found.append(path)
             continue
         if not path.endswith(".py"):
             continue
@@ -185,18 +200,32 @@ def build_section(mode: str, pack_path: str, cwd: str) -> str:
             cmds.append(cmd)
 
     if fm.get("full_suite", "").strip().lower() in _TRUTHY:
-        by_dir: dict[str, str] = {}
+        by_dir: dict[str, list[str]] = {}
         for path in _git_ls_files(cwd):
             if _is_test_file(path):
-                by_dir.setdefault(str(Path(path).parent), path)
-        dirs = sorted(d for d in by_dir)
+                by_dir.setdefault(str(Path(path).parent), [])
+                if path not in by_dir[str(Path(path).parent)]:
+                    by_dir[str(Path(path).parent)].append(path)
+        dirs = sorted(by_dir)
         if not dirs:
             return _section([HEADING, "", "无测试文件，不跑测试。", "", HARD_RULE])
+        batches: list[str] = []
+        for d in dirs:
+            # 目录 d 的后代目录也在分组里时，`pytest d` 会递归收集到它们，
+            # 因此 d 这一批只列它自身直接包含的测试文件，避免重复跑。
+            has_child = any(
+                o != d and (d == "." or o.startswith(d + "/")) for o in dirs
+            )
+            if has_child:
+                files = sorted(by_dir[d])
+                batches.append(f"python3 -m pytest -q {' '.join(files)}")
+            else:
+                batches.append(f"python3 -m pytest -q {d}")
         return _section([
             HEADING, "",
             "本 pack 显式要求全量：按下列目录分批跑（逐批记录结果，"
             "某批失败不阻断后续批次）：",
-            *_cmd_line([f"python3 -m pytest -q {d}" for d in dirs]),
+            *_cmd_line(batches),
             "",
             HARD_RULE,
         ])

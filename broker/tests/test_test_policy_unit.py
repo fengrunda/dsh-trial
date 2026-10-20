@@ -79,6 +79,57 @@ def test_full_suite_batched_by_dir(tmp_path):
     assert test_policy.HARD_RULE in out
 
 
+def test_full_suite_dedups_nested_dirs(tmp_path):
+    repo = _git_repo(tmp_path / "repo", [
+        "test_root.py",
+        "pkg_a/test_one.py",
+        "pkg_a/nested/test_two.py",
+        "pkg_a/nested/test_three.py",
+    ])
+    pack = _pack(tmp_path, "full_suite: true\n")
+    out = test_policy.build_section("foreman", str(pack), str(repo))
+    # 根目录和 pkg_a 都有后代目录在分组里：只列自身直接文件。
+    assert "- `python3 -m pytest -q test_root.py`" in out
+    assert "- `python3 -m pytest -q pkg_a/test_one.py`" in out
+    assert "- `python3 -m pytest -q pkg_a/nested`" in out
+    assert "- `python3 -m pytest -q .`" not in out
+    assert "- `python3 -m pytest -q pkg_a`" not in out
+
+
+def test_block_list_frontmatter(tmp_path):
+    fm = "tests:\n  - a/test_a.py\n  - b/test_b.py\ntest_paths:\n  - c/test_c.py\n"
+    pack = _pack(tmp_path, fm)
+    out = test_policy.build_section("foreman", str(pack), str(tmp_path))
+    assert "python3 -m pytest -q a/test_a.py" in out
+    assert "python3 -m pytest -q b/test_b.py" in out
+    assert "python3 -m pytest -q c/test_c.py" in out
+
+
+def test_gate_fallback_untracked_test_file(tmp_path):
+    repo = _git_repo(tmp_path / "repo", ["src/foo.py"])
+    diff = (
+        "```diff\n"
+        "diff --git a/tests/test_new.py b/tests/test_new.py\n"
+        "--- a/tests/test_new.py\n+++ b/tests/test_new.py\n"
+        "```\n"
+    )
+    pack = _pack(tmp_path, "", diff)
+    out = test_policy.build_section("gate", str(pack), str(repo))
+    assert "python3 -m pytest -q tests/test_new.py" in out
+
+
+def test_bare_pytest_not_collected(tmp_path):
+    body = (
+        "全量是 `pytest -q` 或 `python3 -m pytest -q`，"
+        "带 cd 的 `cd broker && pytest -q` 同理。\n"
+    )
+    pack = _pack(tmp_path, "tests:\n", body)
+    out = test_policy.build_section("foreman", str(pack), str(tmp_path))
+    assert "- `pytest -q`" not in out
+    assert "- `python3 -m pytest -q`" not in out
+    assert "cd broker && pytest -q" not in out
+
+
 def test_gate_fallback_maps_diff_to_tests(tmp_path):
     repo = _git_repo(tmp_path / "repo", [
         "src/foo.py", "src/test_bar.py", "tests/test_foo_unit.py",

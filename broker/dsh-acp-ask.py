@@ -52,6 +52,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -308,6 +309,86 @@ def prompt_timeouts_from_env(env: dict[str, str] | None = None) -> tuple[int, in
 def bump_idle_deadline(now: float, idle_timeout: float, hard_deadline: float) -> float:
     """Next idle deadline after progress. Never past the hard cap."""
     return min(now + idle_timeout, hard_deadline)
+
+
+ENV_RETRY_CONTINUE_PROMPT = (
+    "（上一请求因上游/环境故障中断，已自动重试，不计轮次）"
+    "请从中断处继续完成本票任务，不要重做已完成的步骤。"
+)
+
+
+def classify_transient(err: str) -> str | None:
+    """Return a short reason when *err* is an upstream/environment failure.
+
+    Timeouts, early process exits and ordinary 4xx parameter errors are
+    deliberately not transient: retrying them only burns the ticket budget.
+    """
+    low = err.lower()
+    if re.search(r"role\s*.?developer.? is not supported", low):
+        return "developer_role_400"
+    if re.search(r"turn failed: 429|rate.?limit", low):
+        return "rate_limit"
+    if re.search(
+        r"turn failed: 5\d\d|bad gateway|service unavailable|gateway timeout", low
+    ):
+        return "upstream_5xx"
+    if re.search(r"transport|connection error|econnreset|socket hang up", low):
+        return "transport"
+    return None
+
+
+def _env_retry_count() -> int:
+    try:
+        n = int(os.environ.get("DSH_ACP_ENV_RETRY", "2"))
+    except (TypeError, ValueError):
+        return 2
+    return max(0, n)
+
+
+def _env_retry_backoff() -> float:
+    try:
+        return max(0.0, float(os.environ.get("DSH_ACP_ENV_RETRY_BACKOFF", "20")))
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def prompt_with_env_retry(
+    client,
+    sid: str,
+    prompt: str,
+    *,
+    retries: int | None = None,
+    base_backoff: float | None = None,
+    sleep: Callable[[float], Any] = time.sleep,
+) -> str:
+    """Send a prompt, retrying transient upstream failures in the same session."""
+    if retries is None:
+        retries = _env_retry_count()
+    retries = max(0, int(retries))
+    if base_backoff is None:
+        base_backoff = _env_retry_backoff()
+    text = prompt
+    attempt = 0
+    while True:
+        try:
+            return client.session_prompt(sid, text)
+        except RuntimeError as e:
+            reason = classify_transient(str(e))
+            if reason is None:
+                raise
+            if attempt >= retries:
+                raise RuntimeError(
+                    f"env_blocked({reason}, retries={retries}): {e}"
+                ) from e
+            attempt += 1
+            backoff = base_backoff * (2 ** (attempt - 1))
+            print(
+                f"env-retry n={attempt}/{retries} reason={reason} "
+                f"backoff={backoff:g}s",
+                file=sys.stderr,
+            )
+            sleep(backoff)
+            text = ENV_RETRY_CONTINUE_PROMPT
 
 
 class AcpClient:
@@ -842,7 +923,7 @@ def _run_prompts(
         for i, prompt in enumerate(prompts, 1):
             if len(prompts) > 1:
                 print(f"--- round {i}/{len(prompts)} ---", file=sys.stderr)
-            text = client.session_prompt(sid, prompt)
+            text = prompt_with_env_retry(client, sid, prompt)
             outputs.append(text)
             if len(prompts) > 1:
                 print(f"===== ROUND {i} =====")

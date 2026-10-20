@@ -46,9 +46,9 @@ class _FakeClient:
 
 def test_prompt_timeout_defaults_are_idle_plus_hard_cap():
     idle, hard = ask.prompt_timeouts_from_env({})
-    assert idle == 900
+    assert idle == 1800
     assert hard == 3600
-    assert T.DEFAULT_LIMITS["prompt_idle_timeout_sec"] == 900
+    assert T.DEFAULT_LIMITS["prompt_idle_timeout_sec"] == 1800
     assert T.DEFAULT_LIMITS["prompt_timeout_sec"] == 3600
     assert T.DEFAULT_LIMITS["prompt_idle_timeout_sec"] > T.DEFAULT_LIMITS["ask_supervisor_timeout_sec"]
 
@@ -73,7 +73,7 @@ def test_legacy_1800_wall_without_idle_key_becomes_hard_cap():
         finally:
             T.LIMITS_PATH = old
     assert loaded["prompt_timeout_sec"] == 3600
-    assert loaded["prompt_idle_timeout_sec"] == 900
+    assert loaded["prompt_idle_timeout_sec"] == 1800
     assert loaded["max_slices"] == 3
 
 
@@ -99,10 +99,10 @@ def test_spawn_env_points_at_repo_ask_and_sets_both_timeouts():
         "impl",
         ticket="impl-unit",
         prompt_timeout_sec=3600,
-        prompt_idle_timeout_sec=900,
+        prompt_idle_timeout_sec=1800,
     )
     assert env["DSH_ACP_PROMPT_TIMEOUT"] == "3600"
-    assert env["DSH_ACP_PROMPT_IDLE_TIMEOUT"] == "900"
+    assert env["DSH_ACP_PROMPT_IDLE_TIMEOUT"] == "1800"
     assert env["DSH_ACP_ASK"] == str(ROOT / "dsh-acp-ask.py")
     assert env["DSH_ACP_ASK"] != str(Path.home() / ".dsh" / "bin" / "dsh-acp-ask.py")
 

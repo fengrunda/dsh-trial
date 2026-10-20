@@ -4,9 +4,10 @@
   "max_rounds": 2,
   "ask_supervisor_timeout_sec": 600,
   "ask_supervisor_poll_ms": 2000,
-  "prompt_timeout_sec": 1800,
+  "prompt_timeout_sec": 3600,
   "inplace_rework_max_prompt": 20000,
   "inplace_rework_max_findings": 3,
   "impl_max_steps": 30,
-  "notes": "Template for $DSH_HOME/supervisor/trial/limits.json. Copy and tune; no tenant secrets."
+  "notes": "Template for $DSH_HOME/supervisor/trial/limits.json. prompt_idle_timeout_sec=1800 (30m soft wall → paused_wallclock); prompt_timeout_sec=3600 (1h hard cap). Copy and tune; no tenant secrets.",
+  "prompt_idle_timeout_sec": 1800
 }

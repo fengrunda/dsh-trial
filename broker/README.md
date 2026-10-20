@@ -175,6 +175,12 @@ trial-broker 在**每 job 结束**与**空闲轮询（≥1h）**时调用 GC（`
 - 仅 P2 ⇒ 允许 PASS。  
 - 机器块建议含 `unmet_acceptance` 列表。
 
+## Gate 推理档位分级
+
+- Gate 票默认 `low`；原 pack frontmatter 的 `risk: low|medium|high` 优先（无 risk 时按路径/改动量启发式：`migrat|auth|tenant|api/|openapi|webhook|deploy|prod` 或 diff > 400 行 ⇒ `high`）。
+- 分级由 `broker/gate_effort.py` 在 `open-slice.sh` 里对每张票热生效（无需重启 broker），只影响 gate 票且未显式传 `--reasoning-effort` 时。
+- `DSH_GATE_TIERING=0` 关闭分级；介质档位注意：适配器只认 off/low/high/max，`medium` 实际等于 `high`，故 medium risk 取 `low`。
+
 ## 验收
 
 见 `/workspace/docs/2026-09-24-dsh-trial-acceptance.md`。

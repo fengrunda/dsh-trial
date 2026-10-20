@@ -410,6 +410,23 @@ if [[ -z "$INF_ROLE" ]]; then
 fi
 [[ -n "$INF_ROLE" ]] && ensure_role_pack_bridge "$INF_ROLE"
 
+# Gate 推理档位热分级：默认低档，高风险/大 diff 才 high。逻辑在独立小脚本里，
+# 每张票重新执行 open-slice.sh 即热生效；DSH_GATE_TIERING=0 可关闭。
+GATE_TIER_NOTE=""
+if [[ ( "$INF_ROLE" == "gate" || "${ROLE:-}" == "gate" ) \
+      && -z "$REASONING_EFFORT" && "${DSH_GATE_TIERING:-1}" != "0" ]]; then
+  _tier_out="$(python3 "$(dirname "$0")/broker/gate_effort.py" "$PACK_ABS" "$CWD" 2>/dev/null || true)"
+  if [[ -n "$_tier_out" ]]; then
+    _tier_effort="${_tier_out%%$'\t'*}"
+    _tier_reason=""
+    [[ "$_tier_out" == *$'\t'* ]] && _tier_reason="${_tier_out#*$'\t'}"
+    if [[ -n "$_tier_effort" ]]; then
+      REASONING_EFFORT="$_tier_effort"
+      GATE_TIER_NOTE="gate_tier=$_tier_effort ($_tier_reason)"
+    fi
+  fi
+fi
+
 # 每切片/每票新 ACP 会话，切片间只经 thin-state 摘要（broker 往 pack 追加 digest，勿 resume 旧会话）
 ARGS=(--profile "$PROFILE" --ticket "$TICKET" --cwd "$CWD" --prompt "$PROMPT" --new)
 [[ -n "$ROLE" ]] && ARGS+=(--role "$ROLE")
@@ -426,6 +443,9 @@ fi
 {
   echo "=== open-slice $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
   echo "ticket=$TICKET profile=$PROFILE cwd=$CWD pack=$PACK_ABS summary=$SUMMARY_OUT mode=${PROMPT_MODE} role=${ROLE:-$INF_ROLE}"
+  if [[ -n "$GATE_TIER_NOTE" ]]; then
+    echo "$GATE_TIER_NOTE"
+  fi
   echo "ask=$ASK_BIN"
   echo "=== prompt ==="
   echo "$PROMPT"

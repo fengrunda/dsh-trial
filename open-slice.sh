@@ -269,6 +269,7 @@ build_prompt_supervisor_plan() {
 1. 拆 **1..max_slices** 个最小 slice（max_slices 见 brief pack frontmatter，缺省 1）；每个 slice 写一个有界 pack（相对名见 brief 的 suggested_pack，或自定 <slice>.pack.md）。
 2. Pack 必须经文件写入：@@DSH_HOME@@/supervisor/thin-state/packs/<name>.pack.md（可用 write/edit；禁止 bash cat 大段灌上下文）。
 3. Pack 的 Steps/Done when 须可执行、可验收；**不要**故意留歧义。仅当实现歧义**真实影响** Done-when（缺参/冲突/不可验证）时，才要求工头用 ask_supervisor；文案风格等无关紧要的细节自行合理默认并写进 pack。
+   - Pack frontmatter 写 `tests:`（定点测试 path 列表，如 `tests/test_x.py`，逗号或 YAML 数组均可）；只有跨模块改动或切 tip 前才写 `full_suite: true`（按目录分批全量），日常 slice 不要写。
 4. 更新或创建 Goal 状态文件：@@DSH_HOME@@/supervisor/thin-state/goals/<goal_id>.json （goal_id 见 brief）。
 5. 关票摘要写到：「@@SUMMARY_OUT@@」，文末 **一个** fenced json（多 slice 用 emit_chains）：
 ```json
@@ -388,6 +389,16 @@ else
     supervisor-max-rounds) PROMPT="$(build_prompt_supervisor_max_rounds)" ;;
     *) echo "unknown --prompt-mode: $PROMPT_MODE" >&2; exit 2 ;;
   esac
+fi
+
+# 三层测试口径热注入：foreman/gate 只跑 pack 列出的定点测试，全量交 CI。
+# 逻辑在 broker/pytest_scope.py，每张票重新执行本脚本即热生效；DSH_TEST_POLICY=0 可关闭。
+if [[ ( "$PROMPT_MODE" == "foreman" || "$PROMPT_MODE" == "gate" ) \
+      && "${DSH_TEST_POLICY:-1}" != "0" ]]; then
+  _test_policy="$(python3 "$(dirname "$0")/broker/pytest_scope.py" --mode "$PROMPT_MODE" "$PACK_ABS" "$CWD" 2>/dev/null || true)"
+  if [[ -n "$_test_policy" ]]; then
+    PROMPT="$PROMPT"$'\n\n'"$_test_policy"
+  fi
 fi
 
 if [[ "$PRINT_PROMPT" -eq 1 ]]; then

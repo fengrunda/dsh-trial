@@ -273,7 +273,11 @@ def _meta_baseline(
 def _resolve_baseline(
     meta: dict[str, str], orig_text: str | None, text: str, cwd: str | Path
 ) -> str | None:
-    """按优先级取第一个能解析且不等于当前 HEAD 的基线；全失败返回 None。"""
+    """按优先级取第一个能解析的基线；全失败返回 None。
+
+    候选解析结果等于当前 HEAD 时**保留**：真收尾片 gate PASS 后无新 commit，
+    此时基线..HEAD 为空 diff，正是 skip 条件。只禁止字面 HEAD 候选与 range 右侧。
+    """
     sources = (meta, _parse_frontmatter(orig_text or ""), _parse_frontmatter(text))
     candidates: list[str] = []
     # 1) 上一轮 gate 记录的真实 HEAD。
@@ -296,8 +300,6 @@ def _resolve_baseline(
     m = DIFF_HEADER_RE.search(text)
     if m:
         candidates.append(m.group(1))
-    ok, head_out = _git(cwd, "rev-parse", "HEAD")
-    head = head_out.strip() if ok else ""
     seen: set[str] = set()
     for cand in candidates:
         if not cand or cand in seen:
@@ -306,11 +308,7 @@ def _resolve_baseline(
         ok, out = _git(cwd, "rev-parse", "--verify", f"{cand}^{{commit}}")
         if not ok or not out.strip():
             continue
-        resolved = out.strip()
-        if head and resolved == head:
-            # 解析结果等于当前 HEAD：自基线 diff 恒空，会制造假收尾，弃用。
-            continue
-        return resolved
+        return out.strip()
     return None
 
 

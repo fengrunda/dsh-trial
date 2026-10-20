@@ -380,8 +380,8 @@ def test_last_commit_beats_bad_range_right_side(tmp_path):
     assert "src_change" in c["reason"]
 
 
-def test_baseline_equal_head_is_rejected(tmp_path):
-    """所有候选都解析为当前 HEAD -> no_baseline，禁止 skip。"""
+def test_literal_head_or_no_candidate_is_no_baseline(tmp_path):
+    """只有字面 HEAD（range 左侧）且无其他有效候选 -> no_baseline，禁止 skip。"""
     repo, git, _ = _git_repo(tmp_path)
     (repo / "src").mkdir()
     (repo / "src" / "foo.py").write_text("x = 1\n", encoding="utf-8")
@@ -398,6 +398,60 @@ def test_baseline_equal_head_is_rejected(tmp_path):
     c = gate_effort.classify(gate, repo)
     assert c["action"] == "review", c
     assert "no_baseline" in c["reason"]
+
+
+def test_closing_slice_last_commit_equal_head_skips(tmp_path):
+    """真实收尾片：last_commit 恰为 HEAD（gate PASS 后无新 commit）-> 空 diff skip。"""
+    repo, _git, sha = _git_repo(tmp_path)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "x.md").write_text("doc\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-q", "-m", "docs only")
+    head = _git("rev-parse", "HEAD").strip()
+    assert head != sha
+    _write_pack(
+        tmp_path,
+        "s2.pack.md",
+        "---\nslice_id: s2\n"
+        "---\n\n"
+        f"last_commit={head}\n\n"
+        "不要调 `submit_for_review`；直接开 PR。\n",
+    )
+    gate = _write_pack(
+        tmp_path,
+        "s2.rev1.pack.md",
+        GATE_HEAD.replace("original_pack: s1.pack.md", "original_pack: s2.pack.md")
+        + "---\n",
+    )
+    c = gate_effort.classify(gate, repo)
+    assert c["action"] == "skip", c
+    assert "closing_ok" in c["reason"]
+    assert f"baseline={head}" in c["reason"]
+
+
+def test_fake_closing_range_with_src_after_base_reviews(tmp_path):
+    """假收尾：`old..HEAD` + 之后改 src、无 last_commit -> 仍 review。"""
+    repo, git, sha = _git_repo(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "foo.py").write_text("x = 1\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-q", "-m", "fake src")
+    _write_pack(
+        tmp_path,
+        "s2.pack.md",
+        "---\nslice_id: s2\n"
+        f"base_for_review: {sha}..HEAD\n"
+        "---\n\n不要调 `submit_for_review`；直接开 PR。\n",
+    )
+    gate = _write_pack(
+        tmp_path,
+        "s2.rev1.pack.md",
+        GATE_HEAD.replace("original_pack: s1.pack.md", "original_pack: s2.pack.md")
+        + "---\n",
+    )
+    c = gate_effort.classify(gate, repo)
+    assert c["action"] == "review", c
+    assert "src_change" in c["reason"]
 
 
 def test_classify_blocks_fake_closing_with_defaults_change(tmp_path):

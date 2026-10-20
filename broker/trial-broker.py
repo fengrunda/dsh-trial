@@ -108,6 +108,7 @@ import threading
 import trial_lib as T
 import pause_supervisor as PS
 import trial_mailbox as TM
+import gate_effort as GE
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -3000,6 +3001,274 @@ max_bytes_hint: {MAX_PACK_BYTES}
                 path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
     _enforce_pack_bytes(path)
     return name
+
+
+
+
+def _pack_meta_text(pack_name: str) -> tuple[dict, str]:
+    """Read pack frontmatter + body for gate-grain decisions."""
+    path = PACKS / Path(pack_name).name
+    if not path.is_file():
+        return {}, ""
+    try:
+        body = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}, ""
+    return GE._parse_frontmatter(body), body
+
+
+def _foreman_changed_paths(block: dict | None) -> list[str]:
+    block = block or {}
+    raw = block.get("changed_files") or block.get("files") or []
+    if isinstance(raw, str):
+        return [raw]
+    out: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+        elif isinstance(item, dict):
+            p = item.get("path") or item.get("file") or item.get("name")
+            if p:
+                out.append(str(p))
+    return out
+
+
+def _plan_goal_gate_policies(
+    goal_grain: str,
+    slice_specs: list[dict],
+) -> list[str]:
+    """Assign per-slice gate_policy before running chains.
+
+    Last non-skip / non-forced-per_slice slice under per_goal becomes the
+    ``per_goal`` bearer (aggregated LLM gate). Earlier matching slices
+    ``defer``. High-risk / pack ``gate: per_slice`` stay ``per_slice``.
+    """
+    n = len(slice_specs)
+    tentative: list[str] = []
+    reasons: list[str] = []
+    for spec in slice_specs:
+        meta, body = _pack_meta_text(str(spec.get("pack") or ""))
+        # Pre-impl: no changed paths yet; high-risk from pack risk/tags only.
+        pol, why = GE.resolve_slice_gate_policy(
+            goal_grain,
+            pack_meta=meta,
+            pack_text=body,
+            risk=meta.get("risk"),
+            paths=None,
+            is_goal_bearer=False,
+            from_goal=True,
+        )
+        tentative.append(pol)
+        reasons.append(why)
+    if goal_grain != GE.GATE_GRAIN_PER_GOAL:
+        return tentative
+    # Pick the last defer candidate as bearer (skip / per_slice stay put).
+    bearer = None
+    for i in range(n - 1, -1, -1):
+        if tentative[i] == GE.GATE_POLICY_DEFER:
+            bearer = i
+            break
+    if bearer is None:
+        return tentative
+    out = list(tentative)
+    out[bearer] = GE.GATE_POLICY_PER_GOAL
+    return out
+
+
+def build_goal_gate_pack(
+    *,
+    goal_id: str,
+    bearer_slice_id: str,
+    round_n: int,
+    deferred_slice_ids: list[str],
+    slice_specs: list[dict],
+    bearer_pack_name: str,
+    bearer_block: dict,
+    bearer_summary_text: str,
+    cwd: Path,
+    label: str | None = None,
+) -> str:
+    """One Goal-end gate pack: each slice summary + single base...HEAD diff."""
+    all_ids = list(dict.fromkeys([*deferred_slice_ids, bearer_slice_id]))
+    spec_by = {str(s.get("slice")): s for s in (slice_specs or []) if isinstance(s, dict)}
+    # Earliest foreman base among deferred + bearer; head = current HEAD.
+    bases: list[str] = []
+    summaries_blob: list[str] = []
+    acceptance_blob: list[str] = []
+    for sid in all_ids:
+        chain = _read_chain(sid) or {}
+        rounds = list(chain.get("rounds") or [])
+        last = rounds[-1] if rounds else {}
+        fb = dict(last.get("foreman_block") or {})
+        if sid == bearer_slice_id and bearer_block:
+            fb = dict(bearer_block)
+        b = str(fb.get("base") or "").strip()
+        if b:
+            bases.append(b)
+        impl_sum = last.get("impl_summary")
+        text = ""
+        if impl_sum and Path(str(impl_sum)).is_file():
+            try:
+                text = Path(str(impl_sum)).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+        if sid == bearer_slice_id and bearer_summary_text and not text:
+            text = bearer_summary_text
+        fm_json = json.dumps(fb, ensure_ascii=False, indent=2)
+        summaries_blob.append(
+            f"### Slice `{sid}`\n"
+            f"- impl_summary: `{Path(str(impl_sum)).name if impl_sum else '(bearer)'}`\n"
+            f"- status: {fb.get('status')}\n"
+            f"- commit: {fb.get('commit')} base: {fb.get('base')}\n\n"
+            f"```json\n{fm_json}\n```\n\n"
+            f"<details><summary>summary excerpt</summary>\n\n"
+            f"{(text or '')[:1500]}\n\n</details>\n"
+        )
+        acc = (spec_by.get(sid) or {}).get("acceptance") or chain.get("acceptance")
+        acc_txt, _ = _gate_acceptance_text(acc)
+        if acc_txt:
+            acceptance_blob.append(f"### `{sid}`\n{acc_txt}")
+    head = _git_rev(cwd) or "HEAD"
+    base = bases[0] if bases else (_git_rev(cwd, "HEAD~1") or "")
+    # Prefer oldest base (first slice) for whole-PR diff.
+    diff = _git_diff(cwd, base if base else None, head)
+    diff, truncated = _truncate_bytes(diff, MAX_DIFF_BYTES)
+    tag = label or f"goal-r{round_n}"
+    name = f"{bearer_slice_id}-gate-{tag}.pack.md"
+    path = PACKS / name
+    body = f"""---
+slice_id: {bearer_slice_id}
+goal: {goal_id}
+kind: goal-gate-pack
+gate_mode: per_goal
+round: {round_n}
+role: gate
+original_pack: {Path(bearer_pack_name).name}
+deferred_slices: {",".join(deferred_slice_ids)}
+summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_pack(name)}.md
+max_bytes_hint: {MAX_PACK_BYTES}
+---
+
+# Goal gate pack · {goal_id} · bearer {bearer_slice_id} ({tag})
+
+审整 Goal（合并审）：核对各片 Done when / 工头摘要 + **一次** `git diff`（base...HEAD）。
+高风险片若已 per_slice 过审，本包仅覆盖 deferred 片 + bearer。
+
+## Slices in this review
+{chr(10).join(f"- `{s}`" for s in all_ids) or "(none)"}
+
+## Acceptance by slice
+{chr(10).join(acceptance_blob) or "(none provided)"}
+
+## Foreman summaries (all slices)
+{chr(10).join(summaries_blob)}
+
+## Diff (base...head; base={base or "HEAD"} head={head}; truncated={str(truncated).lower()})
+```diff
+{diff}
+```
+
+## Done when
+- Write verdict to summary_out with machine json block (verdict PASS|HOLD + findings).
+- 一次审整 PR：注意力不丢不偏、符合设计；P2 措辞不默认 HOLD。
+- 禁止通读全仓；只核上述 diff 与各片摘要。
+- Delta-only review; no room_*; do not modify business src.
+"""
+    path.write_text(body, encoding="utf-8")
+    for _ in range(4):
+        try:
+            _enforce_pack_bytes(path)
+            break
+        except ValueError:
+            cur = path.read_text(encoding="utf-8")
+            if len(cur.encode()) > MAX_PACK_BYTES:
+                keep = MAX_PACK_BYTES - 80
+                cut, _ = _truncate_bytes(cur, keep)
+                path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
+    _enforce_pack_bytes(path)
+    return name
+
+
+def _synthetic_gate_pass(
+    *,
+    chain: dict,
+    round_rec: dict,
+    slice_id: str,
+    round_n: int,
+    gate_mode: str,
+    reason: str,
+    job: dict,
+    dest: Path,
+    goal_obj: dict | None,
+) -> int:
+    """Mark chain PASS without spawning an LLM gate (defer / skip)."""
+    gate_ticket = f"gate-trial-{slice_id}-r{round_n}-{gate_mode}"
+    gate_summary_name = f"{slice_id}-gate-r{round_n}-{gate_mode}"
+    gate_summary = SUMMARIES / f"{gate_summary_name}.md"
+    block = {
+        "verdict": VERDICT_PASS,
+        "findings": [],
+        "gate_mode": gate_mode,
+        "skip_reason": reason,
+        "notes": f"broker synthetic PASS ({gate_mode}: {reason})",
+    }
+    try:
+        gate_summary.parent.mkdir(parents=True, exist_ok=True)
+        gate_summary.write_text(
+            f"# {gate_summary_name} (broker {gate_mode})\n\n"
+            f"<!-- {reason} -->\n\n"
+            "```json\n"
+            + json.dumps(block, ensure_ascii=False, indent=2)
+            + "\n```\n",
+            encoding="utf-8",
+        )
+    except OSError as e:
+        chain["state"] = "failed"
+        chain["error"] = f"synthetic gate write: {e}"
+        _write_chain(chain)
+        _terminal_outbox(job, chain, dest, ok=False)
+        return 1
+    round_rec.update({
+        "gate_ticket": gate_ticket,
+        "gate_exit": 0,
+        "gate_summary": str(gate_summary),
+        "gate_assert_clean": True,
+        "gate_peak": 0,
+        "gate_steps": 0,
+        "gate_artifacts": {"synthetic": True, "gate_mode": gate_mode},
+        "verdict": VERDICT_PASS,
+        "gate_block": block,
+        "gate_mode": gate_mode,
+        "gate_defer_reason": reason,
+    })
+    chain["last_verdict"] = VERDICT_PASS
+    chain["state"] = VERDICT_PASS
+    chain["gate_mode"] = gate_mode
+    _write_chain(chain)
+    if goal_obj is not None:
+        T.record_ticket_metric(goal_obj, {
+            "role": "gate",
+            "ticket": gate_ticket,
+            "slice": slice_id,
+            "exit": 0,
+            "peak_prompt": 0,
+            "steps": 0,
+            "kind": "gate",
+            "verdict": VERDICT_PASS,
+            "gate_mode": gate_mode,
+        })
+        _write_goal(goal_obj)
+    if (job.get("from_goal") or job.get("goal")) and not job.get("defer_supervisor_close"):
+        try:
+            maybe_supervisor_close(job, chain)
+        except Exception as e:  # noqa: BLE001
+            print(f"[trial-broker] supervisor close error: {e}", flush=True)
+    out = _terminal_outbox(job, chain, dest, ok=True)
+    print(
+        f"[trial-broker] chain {slice_id} PASS ({gate_mode}: {reason}) outbox={out.name}",
+        flush=True,
+    )
+    return 0
 
 
 # --- Gate findings are the primary task in fix / rework packs (Change ①) ---
@@ -6608,7 +6877,51 @@ def run_chain_rounds(
             )
             return 0
 
-        # Gate
+        # Gate (per_goal / defer / skip / per_slice)
+        gate_policy = str(job.get("gate_policy") or GE.GATE_POLICY_PER_SLICE)
+        pack_meta, pack_body = _pack_meta_text(str(original_pack or ""))
+        paths_now = _foreman_changed_paths(block)
+        # Re-evaluate after impl: high-risk paths / fake skip_gate with src → upgrade.
+        if gate_policy in (GE.GATE_POLICY_DEFER, GE.GATE_POLICY_SKIP, GE.GATE_POLICY_PER_GOAL):
+            refreshed, refresh_why = GE.resolve_slice_gate_policy(
+                GE.GATE_GRAIN_PER_GOAL if gate_policy != GE.GATE_POLICY_PER_SLICE else GE.GATE_GRAIN_PER_SLICE,
+                pack_meta=pack_meta,
+                pack_text=pack_body,
+                risk=pack_meta.get("risk"),
+                paths=paths_now,
+                is_goal_bearer=(gate_policy == GE.GATE_POLICY_PER_GOAL),
+                from_goal=bool(job.get("from_goal") or job.get("goal")),
+            )
+            # Never demote a planned per_goal bearer to defer here; only upgrade
+            # defer/skip → per_slice when risk appears after impl.
+            if gate_policy == GE.GATE_POLICY_DEFER and refreshed == GE.GATE_POLICY_PER_SLICE:
+                print(
+                    f"[trial-broker] chain {slice_id} gate_policy defer→per_slice ({refresh_why})",
+                    flush=True,
+                )
+                gate_policy = GE.GATE_POLICY_PER_SLICE
+            elif gate_policy == GE.GATE_POLICY_SKIP and refreshed != GE.GATE_POLICY_SKIP:
+                # Mid-flight cannot join the Goal bearer deferred list → force per_slice.
+                if refreshed == GE.GATE_POLICY_DEFER:
+                    refreshed = GE.GATE_POLICY_PER_SLICE
+                print(
+                    f"[trial-broker] chain {slice_id} gate_policy skip→{refreshed} ({refresh_why})",
+                    flush=True,
+                )
+                gate_policy = refreshed
+        if gate_policy in (GE.GATE_POLICY_DEFER, GE.GATE_POLICY_SKIP):
+            return _synthetic_gate_pass(
+                chain=chain,
+                round_rec=round_rec,
+                slice_id=slice_id,
+                round_n=round_n,
+                gate_mode=gate_policy,
+                reason=f"policy={gate_policy}",
+                job=job,
+                dest=dest,
+                goal_obj=goal_obj,
+            )
+
         gate_ticket = f"gate-trial-{slice_id}-r{round_n}"
         gate_summary_name = f"{slice_id}-gate-r{round_n}"
         if resume:
@@ -6648,16 +6961,32 @@ def run_chain_rounds(
             )
         else:
             try:
-                gate_pack = build_gate_pack(
-                    slice_id=slice_id,
-                    round_n=round_n,
-                    original_pack_name=original_pack,
-                    acceptance=job.get("acceptance") or chain.get("acceptance"),
-                    foreman_block=block,
-                    foreman_summary_text=parsed["text"],
-                    cwd=cwd,
-                    label=gate_label,
-                )
+                if gate_policy == GE.GATE_POLICY_PER_GOAL:
+                    gate_pack = build_goal_gate_pack(
+                        goal_id=str(goal_id or job.get("goal") or ""),
+                        bearer_slice_id=slice_id,
+                        round_n=round_n,
+                        deferred_slice_ids=list(job.get("gate_deferred_slices") or []),
+                        slice_specs=list(job.get("goal_slice_specs") or []),
+                        bearer_pack_name=original_pack,
+                        bearer_block=block,
+                        bearer_summary_text=parsed["text"],
+                        cwd=cwd,
+                        label=gate_label if gate_label.startswith("goal-") else f"goal-{gate_label}",
+                    )
+                    round_rec["gate_mode"] = GE.GATE_POLICY_PER_GOAL
+                else:
+                    gate_pack = build_gate_pack(
+                        slice_id=slice_id,
+                        round_n=round_n,
+                        original_pack_name=original_pack,
+                        acceptance=job.get("acceptance") or chain.get("acceptance"),
+                        foreman_block=block,
+                        foreman_summary_text=parsed["text"],
+                        cwd=cwd,
+                        label=gate_label,
+                    )
+                    round_rec["gate_mode"] = GE.GATE_POLICY_PER_SLICE
             except ValueError as e:
                 chain["state"] = "failed"
                 chain["error"] = f"gate pack build: {e}"
@@ -7037,6 +7366,12 @@ def _chain_job_from_chain(
         "auto_supervisor_answer": job.get("auto_supervisor_answer", True),
         "max_supervisor_tickets": job.get("max_supervisor_tickets") or 8,
         "defer_supervisor_close": True,
+        "gate_policy": chain.get("gate_policy") or job.get("gate_policy") or GE.GATE_POLICY_PER_SLICE,
+        "gate_grain": chain.get("gate_grain") or job.get("gate_grain"),
+        "gate_deferred_slices": list(
+            chain.get("gate_deferred_slices") or job.get("gate_deferred_slices") or []
+        ),
+        "goal_slice_specs": list(job.get("goal_slice_specs") or []),
     }
 
 
@@ -7193,6 +7528,25 @@ def _execute_goal_slices(
     if on_slice_fail not in ("continue", "stop"):
         on_slice_fail = "stop"
 
+    # Gate grain (default per_goal). Standalone / explicit per_slice unchanged.
+    try:
+        lim = T.resolve_limits(goal=goal_state) if goal_state else T.load_global_limits()
+    except Exception:
+        lim = T.load_global_limits()
+    goal_grain = GE.resolve_goal_gate_grain(goal=goal_state, job=job, limits=lim)
+    planned_policies = _plan_goal_gate_policies(goal_grain, slice_specs)
+    # Deferred slice ids that the bearer must include (all prior defer).
+    deferred_for_bearer: list[str] = [
+        str(spec["slice"])
+        for spec, pol in zip(slice_specs, planned_policies)
+        if pol == GE.GATE_POLICY_DEFER
+    ]
+    print(
+        f"[trial-broker] goal {goal_id} gate_grain={goal_grain} "
+        f"policies={list(zip([str(s.get('slice')) for s in slice_specs], planned_policies))}",
+        flush=True,
+    )
+
     all_pass = True
     rc = 0
     parked_awaiting = False
@@ -7276,6 +7630,18 @@ def _execute_goal_slices(
         goal_state["slices"] = list(dict.fromkeys(list(goal_state.get("slices") or []) + [slice_id]))
         _write_goal(goal_state)
 
+        # Index of this spec in the planned list (stable order).
+        try:
+            spec_idx = next(
+                i for i, s in enumerate(slice_specs) if str(s.get("slice")) == slice_id
+            )
+        except StopIteration:
+            spec_idx = 0
+        slice_gate_policy = (
+            planned_policies[spec_idx]
+            if spec_idx < len(planned_policies)
+            else GE.GATE_POLICY_PER_SLICE
+        )
         chain_job = {
             "id": job.get("id") or f"goal-chain-{slice_id}",
             "type": "chain",
@@ -7296,6 +7662,15 @@ def _execute_goal_slices(
             "max_supervisor_tickets": job.get("max_supervisor_tickets") or 8,
             # close the Goal once, after every slice is PASS (never per slice)
             "defer_supervisor_close": True,
+            "gate_policy": slice_gate_policy,
+            "gate_grain": goal_grain,
+            "goal_slice_specs": list(slice_specs),
+            # Bearer reviews every deferred slice + itself.
+            "gate_deferred_slices": (
+                list(deferred_for_bearer)
+                if slice_gate_policy == GE.GATE_POLICY_PER_GOAL
+                else []
+            ),
         }
         resuming_chain = resume and existing_state == "running"
         if resuming_chain:
@@ -7319,6 +7694,10 @@ def _execute_goal_slices(
         chain["max_supervisor_tickets"] = chain_job.get("max_supervisor_tickets")
         chain["defer_supervisor_close"] = True
         chain["plan_ticket"] = plan_ticket or chain.get("plan_ticket")
+        chain["gate_policy"] = slice_gate_policy
+        chain["gate_grain"] = goal_grain
+        if slice_gate_policy == GE.GATE_POLICY_PER_GOAL:
+            chain["gate_deferred_slices"] = list(deferred_for_bearer)
         _write_chain(chain)
         if resuming_chain:
             print(
@@ -7974,6 +8353,9 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         "notify_dry_run": chain.get("notify_dry_run") if chain.get("notify_dry_run") is not None else job.get("notify_dry_run"),
         "notify_prefix": chain.get("notify_prefix") or job.get("notify_prefix"),
         "goal": parent_goal_id,
+        "gate_policy": chain.get("gate_policy") or GE.GATE_POLICY_PER_SLICE,
+        "gate_grain": chain.get("gate_grain"),
+        "gate_deferred_slices": list(chain.get("gate_deferred_slices") or []),
     }
     if parent_goal_id:
         resume_job["from_goal"] = True

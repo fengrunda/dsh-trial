@@ -186,8 +186,11 @@ def test_two_slices_all_pass():
                 assert modes.count("supervisor-plan") == 1
                 assert modes.count("supervisor-close") == 1, modes
                 assert modes.count("foreman") == 2
-                assert modes.count("gate") == 2
-                print("OK two slices all PASS", goal["slices"])
+                # Default gate_grain=per_goal → s1 defer + s2 bearer = 1 LLM gate
+                assert modes.count("gate") == 1, modes
+                c1 = json.loads((dirs["chains"] / "unit-ms-s1.json").read_text())
+                assert c1.get("gate_mode") == "defer", c1.get("gate_mode")
+                print("OK two slices all PASS (per_goal)", goal["slices"])
 
 
 def test_emit_chains_over_max_slices_hits_limit():

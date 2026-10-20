@@ -18,6 +18,7 @@ CLI: python3 gate_effort.py <gate_pack> <cwd>  # 打印 "<effort>\\t<reason>"
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -392,3 +393,146 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+
+
+# ---------------------------------------------------------------------------
+# Gate grain (per_goal vs per_slice) — used by trial-broker chain/goal loop.
+# Default per_goal (Runda 2026-10-20). Scheme C (script PASS) is out of scope.
+# ---------------------------------------------------------------------------
+GATE_GRAIN_PER_GOAL = "per_goal"
+GATE_GRAIN_PER_SLICE = "per_slice"
+GATE_POLICY_DEFER = "defer"
+GATE_POLICY_SKIP = "skip"
+GATE_POLICY_PER_GOAL = "per_goal"
+GATE_POLICY_PER_SLICE = "per_slice"
+_GRAIN_ALIASES = {
+    "per_goal": GATE_GRAIN_PER_GOAL,
+    "goal": GATE_GRAIN_PER_GOAL,
+    "merge": GATE_GRAIN_PER_GOAL,
+    "per_slice": GATE_GRAIN_PER_SLICE,
+    "slice": GATE_GRAIN_PER_SLICE,
+}
+
+
+def _norm_grain(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    key = str(raw).strip().lower()
+    if not key:
+        return None
+    return _GRAIN_ALIASES.get(key)
+
+
+def resolve_goal_gate_grain(
+    *,
+    goal: dict | None = None,
+    job: dict | None = None,
+    limits: dict | None = None,
+    env: dict | None = None,
+) -> str:
+    """Goal-level default grain.
+
+    Precedence (first hit wins): env DSH_GATE_GRAIN → job.gate/gate_grain →
+    goal.gate/gate_grain → limits.gate_grain/gate → **per_goal**.
+    """
+    env = env if env is not None else os.environ
+    for raw in (
+        (env or {}).get("DSH_GATE_GRAIN"),
+        (job or {}).get("gate_grain"),
+        (job or {}).get("gate"),
+        (goal or {}).get("gate_grain"),
+        (goal or {}).get("gate"),
+        (limits or {}).get("gate_grain"),
+        (limits or {}).get("gate"),
+    ):
+        g = _norm_grain(raw if isinstance(raw, str) else None)
+        if g:
+            return g
+    return GATE_GRAIN_PER_GOAL
+
+
+def pack_gate_override(meta: dict[str, str] | None, text: str | None = None) -> str | None:
+    """Pack-level gate override: per_slice / per_goal / skip / None."""
+    meta = meta or {}
+    if _frontmatter_skip(meta):
+        return GATE_POLICY_SKIP
+    g = _norm_grain(meta.get("gate"))
+    if g:
+        return g
+    if text and _closing_signal(text):
+        return GATE_POLICY_SKIP
+    return None
+
+
+def is_high_risk_slice(
+    *,
+    risk: str | None = None,
+    paths: list[str] | None = None,
+    meta: dict[str, str] | None = None,
+) -> tuple[bool, str]:
+    """True when pack risk / tags / paths hit HIGH_RISK_RE (same as effort high)."""
+    meta = meta or {}
+    r = (risk if risk is not None else meta.get("risk") or "").strip()
+    effort, reason = decide(r or None, list(paths or []), 0)
+    if effort == "high":
+        return True, reason
+    return False, reason
+
+
+def changed_paths_look_src(paths: list[str] | None) -> bool:
+    """True if any path would fail the closing diff gate (src/settings/…)."""
+    for p in paths or []:
+        if not p:
+            continue
+        if BLOCK_PATH_RE.search(p) and not ALLOW_PATH_RE.search(p):
+            return True
+    return False
+
+
+def resolve_slice_gate_policy(
+    goal_grain: str,
+    *,
+    pack_meta: dict[str, str] | None = None,
+    pack_text: str | None = None,
+    risk: str | None = None,
+    paths: list[str] | None = None,
+    is_goal_bearer: bool = False,
+    from_goal: bool = True,
+) -> tuple[str, str]:
+    """Per-slice policy for the chain gate step.
+
+    Returns ``(policy, reason)`` where policy is one of:
+      per_slice — open LLM gate for this slice alone
+      per_goal  — this slice is the Goal gate bearer (aggregated pack)
+      defer     — impl done → synthetic PASS; wait for Goal gate
+      skip      — closing / skip_gate → synthetic PASS; no Goal gate slot
+
+    Standalone chains (not from_goal) always per_slice.
+    """
+    if not from_goal:
+        return GATE_POLICY_PER_SLICE, "standalone_chain"
+
+    meta = pack_meta or {}
+    override = pack_gate_override(meta, pack_text)
+    if override == GATE_POLICY_SKIP:
+        # Fake closing with src changes must still be reviewed.
+        if changed_paths_look_src(paths):
+            if goal_grain == GATE_GRAIN_PER_GOAL and not is_goal_bearer:
+                return GATE_POLICY_DEFER, "skip_blocked_src→defer"
+            return GATE_POLICY_PER_SLICE, "skip_blocked_src→per_slice"
+        return GATE_POLICY_SKIP, "pack_skip"
+    if override == GATE_GRAIN_PER_SLICE:
+        return GATE_POLICY_PER_SLICE, "pack_gate=per_slice"
+
+    high, why = is_high_risk_slice(risk=risk, paths=paths, meta=meta)
+    if high:
+        return GATE_POLICY_PER_SLICE, f"high_risk:{why}"
+
+    grain = goal_grain if goal_grain in (GATE_GRAIN_PER_GOAL, GATE_GRAIN_PER_SLICE) else GATE_GRAIN_PER_GOAL
+    if grain == GATE_GRAIN_PER_SLICE:
+        return GATE_POLICY_PER_SLICE, "goal_grain=per_slice"
+    if is_goal_bearer:
+        return GATE_POLICY_PER_GOAL, "goal_bearer"
+    return GATE_POLICY_DEFER, "per_goal_defer"
+
+

@@ -171,3 +171,62 @@ def test_load_global_limits_drops_non_dict_role_tables(monkeypatch, tmp_path):
     assert "step_budget_by_role" not in limits
     assert T.role_reasoning_effort("impl", limits) == "low"
     assert T.role_step_budget("impl", limits) == 80
+
+
+# ---------------------------------------------------------------------------
+# save_global_limits must not drop per-role tables / notes
+# ---------------------------------------------------------------------------
+def test_save_global_limits_preserves_role_tables_and_notes(monkeypatch, tmp_path):
+    path = tmp_path / "limits.json"
+    monkeypatch.setattr(T, "LIMITS_PATH", path)
+    monkeypatch.setattr(T, "TRIAL_SUP", tmp_path)
+    path.write_text(
+        json.dumps(
+            {
+                "max_slices": 5,
+                "reasoning_effort_by_role": {"impl": "high"},
+                "step_budget_by_role": {"impl": 12},
+                "notes": "keep me",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 1) scalar-only save keeps the preserved keys from disk
+    T.save_global_limits({"max_slices": 7, "max_rounds": 4})
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["max_slices"] == 7
+    assert saved["max_rounds"] == 4
+    assert saved["reasoning_effort_by_role"] == {"impl": "high"}
+    assert saved["step_budget_by_role"] == {"impl": 12}
+    assert saved["notes"] == "keep me"
+    assert isinstance(saved["updated_at"], str) and saved["updated_at"]
+
+    # 2) explicit values win, untouched scalars survive
+    T.save_global_limits(
+        {
+            "reasoning_effort_by_role": {"gate": "max"},
+            "step_budget_by_role": {"gate": 60},
+            "notes": "updated",
+        }
+    )
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["reasoning_effort_by_role"] == {"gate": "max"}
+    assert saved["step_budget_by_role"] == {"gate": 60}
+    assert saved["notes"] == "updated"
+    assert saved["max_slices"] == 7
+
+    # 2b) an explicit scalar wins over the value kept from disk
+    T.save_global_limits({"max_slices": 2})
+    assert json.loads(path.read_text(encoding="utf-8"))["max_slices"] == 2
+
+    # 3) no old file -> preserved keys are simply absent (no null placeholders)
+    fresh = tmp_path / "fresh" / "limits.json"
+    monkeypatch.setattr(T, "LIMITS_PATH", fresh)
+    monkeypatch.setattr(T, "TRIAL_SUP", fresh.parent)
+    T.save_global_limits({"max_slices": 2})
+    saved = json.loads(fresh.read_text(encoding="utf-8"))
+    assert saved["max_slices"] == 2
+    assert saved["max_rounds"] == T.DEFAULT_LIMITS["max_rounds"]
+    for key in ("reasoning_effort_by_role", "step_budget_by_role", "notes"):
+        assert key not in saved, key

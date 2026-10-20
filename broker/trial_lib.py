@@ -121,10 +121,32 @@ def load_global_limits() -> dict:
     return dict(DEFAULT_LIMITS)
 
 
+# Keys that are not part of DEFAULT_LIMITS but must survive a partial save
+# (e.g. an operator only passing scalar flags).
+PRESERVED_LIMITS_KEYS = ("reasoning_effort_by_role", "step_budget_by_role", "notes")
+
+
 def save_global_limits(limits: dict) -> Path:
     TRIAL_SUP.mkdir(parents=True, exist_ok=True)
+    limits = limits or {}
     body = dict(DEFAULT_LIMITS)
+    # Read the current file once; an unreadable / invalid file means "no old value".
+    on_disk: dict = {}
+    try:
+        if LIMITS_PATH.is_file():
+            data = json.loads(LIMITS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                on_disk = data
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        on_disk = {}
+    # Three-layer merge: defaults -> current disk values -> explicit input.
+    body.update({k: on_disk[k] for k in DEFAULT_LIMITS if k in on_disk})
     body.update({k: limits[k] for k in DEFAULT_LIMITS if k in limits})
+    for key in PRESERVED_LIMITS_KEYS:
+        if key in limits:
+            body[key] = limits[key]
+        elif key in on_disk:
+            body[key] = on_disk[key]
     body["updated_at"] = now_iso()
     LIMITS_PATH.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
     return LIMITS_PATH

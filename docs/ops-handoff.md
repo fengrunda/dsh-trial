@@ -6,11 +6,11 @@
 - 状态 ~/.dsh/supervisor/{trial,thin-state}；配置 ~/.dsh/supervisor/trial/limits.json；日志 ~/.dsh/broker-dsh-trial/trial-broker.log；role homes ~/.dsh-homes/{supervisor,impl,gate}。
 - 并发：max_concurrent_goals=2，同 cwd 串行。线上两 Goal 并发尚未实测。
 - 模型：trial（acp-trial / acp-lite-trial）= newapicy1/kimi-for-coding（NEWAPICY1_API_KEY）；产品 acp / acp-lite / acp-hub-read / settings agent-default-model 仍为 deepseek-official/deepseek-flash。
-- 推理强度（limits.json reasoning_effort_by_role，默认同）：supervisor=low，impl=low，gate=high。DeepSeek 只有 low/high/max，medium=high。运维票用 `--reasoning-effort` 或 DSH_REASONING_EFFORT。
+- 推理强度（limits.json reasoning_effort_by_role，默认同）：supervisor=low，impl=low，gate=low。DeepSeek 只有 low/high/max，medium=high。运维票用 `--reasoning-effort` 或 DSH_REASONING_EFFORT。
 - 步数软提醒（插件 dsh-step-budget-reminder，不硬停）：supervisor 30 / impl 80 / gate 60（step_budget_by_role）。
 - acp-trial / acp-lite-trial：压缩 thresholdRatio 0.15 / retainRatio 0.05（kimi ~39k）；精简工具（38→21 / 37→20）；contextClear {enabled, compaction-coupled, keepRecentResults 8, clearReasoning on}。插件软链指 pin worktree /workspace/dsh-trial-plugins（tag plugins-pin-20261008d = 79a9070，已 push）。产品 profile acp / acp-lite / acp-lite-offload / acp-hub-read 未改（压缩阈值实际约 150k）。
 - broker 今日修复：gate 去重账本 thin-state/review-ledger.json；标题安全化与 review_seq；续跑判断票是否真结束；watchdog 只计 broker 子进程；gate pack 独立命名；submit_for_review 前置 summary 检查；看板刷新钩子 ~/.dsh/bin/khub-dsh-complete-notify.py。
-- 巡检 routine「dsh trial 底座」**已恢复**（工作日 10:35 / 14:35 / 18:35 Asia/Shanghai）。观察焦点：质量链路（gate 单派 / reasoning low·low·high / contextClear / 双 Goal 并发）+ token。
+- 巡检 routine「dsh trial 底座」**已恢复**（工作日 10:35 / 14:35 / 18:35 Asia/Shanghai）。观察焦点：质量链路（gate 单派 / reasoning low·low·low / contextClear / 双 Goal 并发）+ token。
 
 
 ## 运维笔记（2026-10-12 15:00 Asia/Shanghai）
@@ -45,7 +45,7 @@
 - contextClear：profile 里 enabled:false，或软链指回 plugins-pin-20261008c，或还原 cordis.patch.yml / package.json 的 .bak-20261008-ctxclear / -reasoning / -pre-compact60k。
 
 ## 待办 / 待观察
-1. Hub 下一个真实 Goal 上核对：gate 每轮只派一次；票日志 reasoning_effort 为 low/low/high；压缩时有 contextClear 生效记录；两 Goal 并发。
+1. Hub 下一个真实 Goal 上核对：gate 每轮只派一次；票日志 reasoning_effort 为 low/low/low（pack risk=high 时 gate 仍可由 gate_effort 升 high）；压缩时有 contextClear 生效记录；两 Goal 并发。
 2. review 路径同一份代码重复提交仍会再审（账本只用于 chain 路径去重）。
 3. token 记账：监理 plan/close 未计入；指标用 peak×steps，应改实际累加。
 4. live 引擎已切 5327988（2026-10-12 12:13 CST）：旧 9c114ca2c1f1ed0aea6acd926e66a151cbf2d63f → 新 5327988598f9edcdb77f1799ec6c3803a7548e2b（= origin/main tip，#163 个人版主体记忆 s1）；health `{"status":"ok","redis":"pong"}`；127.0.0.1:8000 pid 1459702；经 khub-engine-with-llm-env。租户仍 host-jinyinhua-qa；未 reseed / 未动 GraphStore 数据目录。

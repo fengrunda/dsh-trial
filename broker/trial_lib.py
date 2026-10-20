@@ -158,8 +158,9 @@ def max_concurrent_goals(limits: dict | None = None) -> int:
 # handed to the tool layer as env (DSH_REASONING_EFFORT / DSH_STEP_BUDGET).
 # NOTE: DeepSeek really only has low/high/max today — "medium" is not a real
 # level and is treated as "high" downstream. So supervisor/impl default to
-# "low" to actually save effort, while gate stays at "high".
-DEFAULT_REASONING_EFFORT_BY_ROLE = {"supervisor": "low", "impl": "low", "gate": "high"}
+# "low" to actually save effort; gate also defaults low (risk=high still
+# raised by open-slice gate_effort hot path).
+DEFAULT_REASONING_EFFORT_BY_ROLE = {"supervisor": "low", "impl": "low", "gate": "low"}
 
 # Soft reminder only (>0 enables the plugin hint); never a hard kill.
 DEFAULT_STEP_BUDGET_BY_ROLE = {"supervisor": 30, "impl": 80, "gate": 60}

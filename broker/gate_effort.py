@@ -41,7 +41,7 @@ ALLOW_PATH_RE = re.compile(
     r"^(docs/|\.github/)|evidence|\.md$|CHANGELOG|(^|/)PR(?:[/_.-]|$)",
     re.IGNORECASE,
 )
-BASELINE_KEYS = ("base_for_review", "prior_head", "last_gate_head", "gate_pass_sha")
+BASELINE_KEYS = ("prior_head", "last_gate_head", "gate_pass_sha", "base_for_review")
 
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
@@ -254,42 +254,63 @@ def _git(cwd: str | Path, *args: str) -> tuple[bool, str]:
     return proc.returncode == 0, proc.stdout
 
 
-def _meta_baseline(meta: dict[str, str]) -> str | None:
-    for key in BASELINE_KEYS:
+def _meta_baseline(
+    meta: dict[str, str], keys: tuple[str, ...] = BASELINE_KEYS
+) -> str | None:
+    """取元数据里的基线候选；range 一律取**左侧**（起点），绝不取右侧 HEAD。"""
+    for key in keys:
         val = (meta.get(key) or "").strip().strip("`'\"")
         if key == "base_for_review" and ".." in val:
-            val = val.split("..", 1)[1].strip()
-        if val:
-            return val
+            # `old..HEAD` / `old...HEAD` 的右侧只是声称的终点，不是基线。
+            val = val.split("..", 1)[0].strip()
+        if not val or val.lower() == "head":
+            # 字面 HEAD 候选无效，留给下一个候选。
+            continue
+        return val
     return None
 
 
 def _resolve_baseline(
     meta: dict[str, str], orig_text: str | None, text: str, cwd: str | Path
 ) -> str | None:
-    """按优先级取第一个能解析的基线；全失败返回 None（此时禁止 skip）。"""
+    """按优先级取第一个能解析且不等于当前 HEAD 的基线；全失败返回 None。"""
+    sources = (meta, _parse_frontmatter(orig_text or ""), _parse_frontmatter(text))
     candidates: list[str] = []
-    for fm in (meta, _parse_frontmatter(orig_text or ""), _parse_frontmatter(text)):
-        val = _meta_baseline(fm)
+    # 1) 上一轮 gate 记录的真实 HEAD。
+    for fm in sources:
+        val = _meta_baseline(fm, ("prior_head", "last_gate_head", "gate_pass_sha"))
         if val:
             candidates.append(val)
+    # 2) 正文 last_commit=。
     for body in (orig_text or "", text):
         m = re.search(r"last_commit=([0-9a-f]{7,40})", body, re.IGNORECASE)
         if m:
             candidates.append(m.group(1))
             break
+    # 3) base_for_review（range 已取左侧；字面 HEAD 已在上游被丢弃）。
+    for fm in sources:
+        val = _meta_baseline(fm, ("base_for_review",))
+        if val:
+            candidates.append(val)
+    # 4) Diff 行只提供 base 作为对比起点（head 仅是本片声称的 HEAD）。
     m = DIFF_HEADER_RE.search(text)
     if m:
-        # 只有 Diff 行时，用 base 作为对比起点（head 仅是本片声称的 HEAD）。
         candidates.append(m.group(1))
+    ok, head_out = _git(cwd, "rev-parse", "HEAD")
+    head = head_out.strip() if ok else ""
     seen: set[str] = set()
     for cand in candidates:
         if not cand or cand in seen:
             continue
         seen.add(cand)
         ok, out = _git(cwd, "rev-parse", "--verify", f"{cand}^{{commit}}")
-        if ok and out.strip():
-            return out.strip()
+        if not ok or not out.strip():
+            continue
+        resolved = out.strip()
+        if head and resolved == head:
+            # 解析结果等于当前 HEAD：自基线 diff 恒空，会制造假收尾，弃用。
+            continue
+        return resolved
     return None
 
 

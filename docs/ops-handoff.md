@@ -53,6 +53,12 @@
 6. 遗留 worktree：wt-conc / wt-dedup / wt-limits / wt-notify 已合入，可删。mailbox 孤儿 t3c-gate-1 已归档（2026-10-12）；hub-logic goal review_seq 已到 55。
 7. web profile 的 desk 已修好（555578a），dsh web 当前未运行。
 
+## gate_grain=per_goal（2026-10-20）
+- 默认 Goal 末次一张 LLM gate（汇总各片 summary + 一次 diff）；`pack gate: per_slice` / `risk: high` / 高风险路径仍 per_slice。
+- 与 `skip_gate` + diff 门禁兼容（收尾免审不占 Goal gate）。
+- limits 键 `gate_grain`；env `DSH_GATE_GRAIN`；Goal/job `gate` 可覆盖。方案 C 本周不做。
+- **需合 PR + 重启 broker** 才进热路径（与 PR#11 awaiting guard 同空窗）。
+
 ## 规矩
 - 底座冻结几天：只修阻塞 Hub 的故障，其他优化攒着，等真实数据后一次做。
 - 底座代码改动交给 Cursor 云端代理（grok-4.7，reasoning_effort medium，fast false），出 PR；Grok 只写 Goal、看报告和测试结果，不读 diff。合入后由箱上 commit/push、空闲时重启、验证。

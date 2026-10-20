@@ -51,6 +51,10 @@ DEFAULT_LIMITS = {
     # to spawned agents as DSH_OFFLOAD_THRESHOLD_CHARS; full text lands under
     # the ticket's artifacts dir (DSH_OFFLOAD_DIR).
     "offload_threshold_chars": 4000,
+    # Gate grain: per_goal (default) = one LLM gate at Goal end; per_slice = each
+    # slice. High-risk / pack gate:per_slice still force per-slice. Hot-read via
+    # load_global_limits each Goal; needs broker code that understands the key.
+    "gate_grain": "per_goal",
 }
 
 # Product profiles → trial profiles (ask_supervisor installed only here)

@@ -3911,6 +3911,50 @@ def _parse_supervisor_summary(summary_path: Path) -> dict:
 # (running, awaiting_supervisor, empty) is still in flight.
 _CHAIN_TERMINAL_STATES = frozenset({"PASS", "failed", "escalated", "cancelled"})
 
+# Parked waiting for a supervisor five-way (or Hub chain-reply). A Goal with
+# any such slice must not auto-advance to the next planned slice on restart,
+# reschedule, or on_slice_fail=continue.
+_CHAIN_PARKED_AWAITING_STATES = frozenset(
+    {
+        "awaiting_supervisor",
+        FOREMAN_STATUS_PAUSED_LIMIT,  # paused_limit
+        FOREMAN_STATUS_PAUSED_WALLCLOCK,  # paused_wallclock
+        "paused",
+    }
+)
+
+
+def _chain_is_parked_awaiting(chain: dict | None) -> bool:
+    """True when this chain must stay parked for supervisor / Hub reply."""
+    if not isinstance(chain, dict):
+        return False
+    state = str(chain.get("state") or "").strip()
+    return state in _CHAIN_PARKED_AWAITING_STATES
+
+
+def _goal_has_parked_awaiting_slice(goal: dict) -> tuple[bool, str]:
+    """Return (parked, slice_id) if any owned slice is awaiting supervisor.
+
+    Also honors ``goal.last_chain_state`` / ``goal.current_slice`` when the
+    chain file is missing but the Goal itself records an awaiting park
+    (ops dial-back / thin-state drift).
+    """
+    if not isinstance(goal, dict):
+        return False, ""
+    for sid in _goal_slice_ids(goal):
+        chain = _read_chain(sid)
+        if _chain_is_parked_awaiting(chain):
+            return True, sid
+    cur = str(goal.get("current_slice") or "").strip()
+    if cur:
+        chain = _read_chain(cur)
+        if _chain_is_parked_awaiting(chain):
+            return True, cur
+    last = str(goal.get("last_chain_state") or "").strip()
+    if last in _CHAIN_PARKED_AWAITING_STATES and cur:
+        return True, cur
+    return False, ""
+
 
 def _goal_slice_ids(goal: dict) -> list[str]:
     ids: list[str] = []
@@ -7151,6 +7195,7 @@ def _execute_goal_slices(
 
     all_pass = True
     rc = 0
+    parked_awaiting = False
     last_chain: dict | None = None
     last_chain_job: dict | None = None
     # Slices already PASS: fresh slices get a thin-state digest appended to
@@ -7171,18 +7216,37 @@ def _execute_goal_slices(
                 flush=True,
             )
             continue
-        if resume and existing_state == "awaiting_supervisor":
-            # Parked on a Hub answer: the chain-reply job resumes it, a broker
-            # restart must not re-open the impl ticket (or double the ask).
+        if (resume or skip_passed) and _chain_is_parked_awaiting(existing):
+            # Parked on supervisor / Hub five-way (awaiting_supervisor,
+            # paused_wallclock / paused_limit). Restart / reschedule must NOT
+            # skip this slice and open the next planned pack (hub-k7c s2
+            # incident 2026-10-20). Stop the Goal here; chain-reply resumes.
             last_chain = existing
             last_chain_job = _chain_job_from_chain(job, existing, slice_id, spec, goal_id)
             all_pass = False
+            parked_awaiting = True
+            goal_state = _read_goal(goal_id) or goal_state
+            goal_state["current_slice"] = slice_id
+            goal_state["last_chain_state"] = str(
+                (existing or {}).get("state") or "awaiting_supervisor"
+            )
+            if str(goal_state.get("status") or "") not in (
+                "done",
+                "failed",
+                "cancelled",
+                "escalated",
+            ):
+                goal_state["status"] = "running"
+            reason = str((existing or {}).get("awaiting_reason") or existing_state)
+            if reason:
+                goal_state["awaiting_reason"] = reason
+            _write_goal(goal_state)
             print(
-                f"[trial-broker] goal {goal_id} slice={slice_id} awaiting Hub reply; "
-                "left parked",
+                f"[trial-broker] goal {goal_id} slice={slice_id} parked "
+                f"({existing_state or 'awaiting'}); not opening next slice",
                 flush=True,
             )
-            continue
+            break
         if resume and existing_state in ("failed", "escalated", "cancelled"):
             all_pass = False
             goal_state["last_chain_state"] = existing_state
@@ -7291,6 +7355,33 @@ def _execute_goal_slices(
             _write_goal(goal_state)
             done_slices.append(slice_id)
             continue
+        if _chain_is_parked_awaiting(final_chain):
+            # Hot path: pause / max_rounds / questions parked mid-Goal. Never
+            # advance to the next slice even when on_slice_fail=continue.
+            goal_state = _read_goal(goal_id) or goal_state
+            goal_state["current_slice"] = slice_id
+            goal_state["last_chain_state"] = state or "awaiting_supervisor"
+            if str(goal_state.get("status") or "") not in (
+                "done",
+                "failed",
+                "cancelled",
+                "escalated",
+            ):
+                goal_state["status"] = "running"
+            reason = str(final_chain.get("awaiting_reason") or state)
+            if reason:
+                goal_state["awaiting_reason"] = reason
+            if final_chain.get("handoff_summary"):
+                goal_state["handoff_summary"] = final_chain["handoff_summary"]
+            _write_goal(goal_state)
+            all_pass = False
+            parked_awaiting = True
+            print(
+                f"[trial-broker] slice {slice_id} parked ({state}); "
+                "not opening next slice",
+                flush=True,
+            )
+            break
         if state == "closeout":
             # Limit stop with work in the tree. Not failed, not a new impl, not PASS.
             goal_state = _read_goal(goal_id) or goal_state
@@ -7361,8 +7452,10 @@ def _execute_goal_slices(
         except Exception as e:  # noqa: BLE001 — close best-effort
             print(f"[trial-broker] supervisor close error: {e}", flush=True)
     # Goal-level notify only (single chain never notifies Hub).
-    _notify_goal_terminal(goal_id)
-    if all_pass or (len(slice_specs) == 1 and rc == 0):
+    # Parked awaiting is not terminal — do not wake Hub as complete/fail.
+    if not parked_awaiting:
+        _notify_goal_terminal(goal_id)
+    if parked_awaiting or all_pass or (len(slice_specs) == 1 and rc == 0):
         return 0
     return 1
 
@@ -8987,14 +9080,26 @@ def _goal_processing_file(goal: dict, goal_id: str) -> Path | None:
     return fallback
 
 
-def _escalate_orphan_goal(goal: dict, goal_id: str, status: str) -> None:
+def _escalate_orphan_goal(goal: dict, goal_id: str, status: str) -> bool:
     """Escalate a non-terminal Goal whose processing job / live ticket is gone.
 
     A Goal stuck in planning/running/closeout with no processing job can never
     finish on its own: nothing will ever write its terminal state. Marking it
     escalated is the only way to advance it (the incident: an orphan ran
     forever because the old code merely logged ``left alone``).
+
+    Exception: a Goal parked in ``awaiting_supervisor`` / pause_* is waiting
+    for a chain-reply or supervisor five-way — leave it alone (do not escalate
+    and do not open the next slice).
     """
+    parked, sid = _goal_has_parked_awaiting_slice(goal)
+    if parked:
+        print(
+            f"[trial-broker] goal {goal_id} orphan sweep skipped: slice={sid or '?'} "
+            f"parked awaiting (status={status}); leave for chain-reply",
+            flush=True,
+        )
+        return False
     goal["status"] = "escalated"
     goal["escalate_reason"] = "orphan_running_no_processing"
     goal["error"] = "running/planning/closeout but processing job missing; no live ticket"
@@ -9013,6 +9118,7 @@ def _escalate_orphan_goal(goal: dict, goal_id: str, status: str) -> None:
         f"[trial-broker] escalate orphan goal {goal_id} (no processing job) status={status}",
         flush=True,
     )
+    return True
 
 
 def reconcile_orphan_running_goals() -> list[str]:
@@ -9038,8 +9144,8 @@ def reconcile_orphan_running_goals() -> list[str]:
         goal_id = str(goal.get("goal") or path.stem)
         if _goal_processing_file(goal, goal_id) is not None:
             continue
-        _escalate_orphan_goal(goal, goal_id, status)
-        escalated.append(goal_id)
+        if _escalate_orphan_goal(goal, goal_id, status):
+            escalated.append(goal_id)
     return escalated
 
 

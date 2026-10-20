@@ -33,6 +33,16 @@ DIFF_HEADER_RE = re.compile(
 )
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*(\n|$)", re.DOTALL)
 
+# 收尾免审 diff 门禁：业务实质路径 / 允许的文档与 PR 元数据路径。
+BLOCK_PATH_RE = re.compile(
+    r"(^|/)src/|settings|defaults|openapi|swagger|runbook", re.IGNORECASE
+)
+ALLOW_PATH_RE = re.compile(
+    r"^(docs/|\.github/)|evidence|\.md$|CHANGELOG|(^|/)PR(?:[/_.-]|$)",
+    re.IGNORECASE,
+)
+BASELINE_KEYS = ("base_for_review", "prior_head", "last_gate_head", "gate_pass_sha")
+
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
     m = FRONTMATTER_RE.match(text)
@@ -231,6 +241,86 @@ def _closing_signal(text: str | None) -> str | None:
     return None
 
 
+def _git(cwd: str | Path, *args: str) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        return False, ""
+    return proc.returncode == 0, proc.stdout
+
+
+def _meta_baseline(meta: dict[str, str]) -> str | None:
+    for key in BASELINE_KEYS:
+        val = (meta.get(key) or "").strip().strip("`'\"")
+        if key == "base_for_review" and ".." in val:
+            val = val.split("..", 1)[1].strip()
+        if val:
+            return val
+    return None
+
+
+def _resolve_baseline(
+    meta: dict[str, str], orig_text: str | None, text: str, cwd: str | Path
+) -> str | None:
+    """按优先级取第一个能解析的基线；全失败返回 None（此时禁止 skip）。"""
+    candidates: list[str] = []
+    for fm in (meta, _parse_frontmatter(orig_text or ""), _parse_frontmatter(text)):
+        val = _meta_baseline(fm)
+        if val:
+            candidates.append(val)
+    for body in (orig_text or "", text):
+        m = re.search(r"last_commit=([0-9a-f]{7,40})", body, re.IGNORECASE)
+        if m:
+            candidates.append(m.group(1))
+            break
+    m = DIFF_HEADER_RE.search(text)
+    if m:
+        # 只有 Diff 行时，用 base 作为对比起点（head 仅是本片声称的 HEAD）。
+        candidates.append(m.group(1))
+    seen: set[str] = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        ok, out = _git(cwd, "rev-parse", "--verify", f"{cand}^{{commit}}")
+        if ok and out.strip():
+            return out.strip()
+    return None
+
+
+def _closing_diff_gate(
+    meta: dict[str, str], orig_text: str | None, text: str, cwd: str | Path
+) -> tuple[bool, str]:
+    """收尾候选的第二道门：相对基线不得含 src/契约/defaults 等实质变更。"""
+    baseline = _resolve_baseline(meta, orig_text, text, cwd)
+    if not baseline:
+        return False, "gate_skip_blocked: no_baseline"
+    ok, head_out = _git(cwd, "rev-parse", "HEAD")
+    if not ok or not head_out.strip():
+        return False, "gate_skip_blocked: no_baseline"
+    head = head_out.strip()
+    ok, out = _git(cwd, "diff", "--name-status", f"{baseline}...{head}")
+    if not ok:
+        return False, "gate_skip_blocked: no_baseline"
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status, path = parts[0][:1].upper(), parts[-1].strip()
+        if not path or status == "D":  # 删除不算新增业务实质
+            continue
+        if BLOCK_PATH_RE.search(path):
+            return False, f"gate_skip_blocked: src_change={path} (baseline={baseline})"
+        if not ALLOW_PATH_RE.search(path):
+            return False, f"gate_skip_blocked: non_doc_change={path} (baseline={baseline})"
+    return True, f"gate_skip: closing_ok (baseline={baseline} no_src)"
+
+
 def classify(pack_path: str | Path, cwd: str | Path) -> dict:
     """返回 {action: skip|review, effort: low|high|None, reason: str}。"""
     pack = Path(pack_path)
@@ -238,11 +328,21 @@ def classify(pack_path: str | Path, cwd: str | Path) -> dict:
     meta = _parse_frontmatter(text)
     orig_text = _orig_pack_text(pack, meta)
 
+    trigger: str | None = None
     if _frontmatter_skip(meta) or _frontmatter_skip(_parse_frontmatter(orig_text or "")):
-        return {"action": "skip", "effort": None, "reason": "frontmatter_skip"}
-    reason = _closing_signal(orig_text if orig_text is not None else text)
-    if reason:
-        return {"action": "skip", "effort": None, "reason": reason}
+        trigger = "frontmatter_skip"
+    else:
+        trigger = _closing_signal(orig_text if orig_text is not None else text)
+    if trigger:
+        ok, gate_reason = _closing_diff_gate(meta, orig_text, text, cwd)
+        if ok:
+            return {"action": "skip", "effort": None, "reason": f"{gate_reason}; {trigger}"}
+        effort, _ = _pack_effort(pack, text, meta, cwd)
+        return {
+            "action": "review",
+            "effort": effort,
+            "reason": f"{gate_reason}; {trigger}",
+        }
     effort, reason = _pack_effort(pack, text, meta, cwd)
     return {"action": "review", "effort": effort, "reason": reason}
 

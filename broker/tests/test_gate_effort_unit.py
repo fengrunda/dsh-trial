@@ -87,6 +87,37 @@ original_pack: s1.pack.md
 """
 
 
+def _git_repo(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "test")
+    (repo / "tracked.txt").write_text("a\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-q", "-m", "base")
+    return repo, git, git("rev-parse", "HEAD").strip()
+
+
+def _closing_pack(d: Path, baseline: str) -> None:
+    _write_pack(
+        d,
+        "s1.pack.md",
+        "---\nslice_id: s1\n"
+        f"base_for_review: {baseline}\n"
+        "---\n\n不要调 `submit_for_review`；直接开 PR。\n",
+    )
+
+
 def test_from_gate_pack_falls_back_to_diff_block(tmp_path):
     _orig_pack(tmp_path)
     gate = _write_pack(
@@ -263,26 +294,69 @@ def test_diff_block_counts_hunk_lines_starting_with_double_dash_or_plus():
 
 
 def test_classify_skip_closing_pr_only(tmp_path):
-    _write_pack(
-        tmp_path,
-        "s1.pack.md",
-        "---\nslice_id: s1\n---\n\n不要调 `submit_for_review`；直接开 PR。\n",
-    )
+    repo, _, sha = _git_repo(tmp_path)
+    _closing_pack(tmp_path, sha)
     gate = _write_pack(tmp_path, "s1.rev2.pack.md", GATE_HEAD + "---\n")
-    c = gate_effort.classify(gate, tmp_path)
+    c = gate_effort.classify(gate, repo)
     assert c["action"] == "skip"
     assert c["effort"] is None
     assert "closing_slice_pr_only" in c["reason"]
+    assert "gate_skip: closing_ok" in c["reason"]
+
+
+def test_classify_skip_closing_docs_only(tmp_path):
+    repo, git, sha = _git_repo(tmp_path)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "x.md").write_text("doc\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-q", "-m", "docs only")
+    _closing_pack(tmp_path, sha)
+    gate = _write_pack(tmp_path, "s1.rev2.pack.md", GATE_HEAD + "---\n")
+    c = gate_effort.classify(gate, repo)
+    assert c["action"] == "skip"
+    assert "gate_skip: closing_ok" in c["reason"]
+
+
+def test_classify_blocks_fake_closing_with_src_change(tmp_path):
+    repo, git, sha = _git_repo(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "foo.py").write_text("x = 1\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-q", "-m", "fake src")
+    _closing_pack(tmp_path, sha)
+    gate = _write_pack(tmp_path, "s1.rev2.pack.md", GATE_HEAD + "---\n")
+    c = gate_effort.classify(gate, repo)
+    assert c["action"] == "review"
+    assert "src_change" in c["reason"]
+    assert c["effort"] in {"low", "high"}
+
+
+def test_classify_blocks_fake_closing_with_defaults_change(tmp_path):
+    repo, git, sha = _git_repo(tmp_path)
+    (repo / "config").mkdir()
+    (repo / "config" / "defaults.yaml").write_text("a: 1\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-q", "-m", "fake defaults")
+    _closing_pack(tmp_path, sha)
+    gate = _write_pack(tmp_path, "s1.rev2.pack.md", GATE_HEAD + "---\n")
+    c = gate_effort.classify(gate, repo)
+    assert c["action"] == "review"
+    assert "src_change" in c["reason"]
 
 
 def test_classify_skip_gate_frontmatter(tmp_path):
+    repo, _, sha = _git_repo(tmp_path)
     _orig_pack(tmp_path)
     gate = _write_pack(
         tmp_path,
         "s1.rev2.pack.md",
-        GATE_HEAD.replace("role: gate\n", "role: gate\nskip_gate: true\n") + "---\n",
+        GATE_HEAD.replace(
+            "role: gate\n",
+            f"role: gate\nskip_gate: true\nbase_for_review: {sha}\n",
+        )
+        + "---\n",
     )
-    c = gate_effort.classify(gate, tmp_path)
+    c = gate_effort.classify(gate, repo)
     assert c["action"] == "skip"
     assert "frontmatter" in c["reason"]
 

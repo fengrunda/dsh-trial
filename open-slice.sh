@@ -392,10 +392,10 @@ else
 fi
 
 # 三层测试口径热注入：foreman/gate 只跑 pack 列出的定点测试，全量交 CI。
-# 逻辑在 broker/test_policy.py，每张票重新执行本脚本即热生效；DSH_TEST_POLICY=0 可关闭。
+# 逻辑在 broker/pytest_scope.py，每张票重新执行本脚本即热生效；DSH_TEST_POLICY=0 可关闭。
 if [[ ( "$PROMPT_MODE" == "foreman" || "$PROMPT_MODE" == "gate" ) \
       && "${DSH_TEST_POLICY:-1}" != "0" ]]; then
-  _test_policy="$(python3 "$(dirname "$0")/broker/test_policy.py" --mode "$PROMPT_MODE" "$PACK_ABS" "$CWD" 2>/dev/null || true)"
+  _test_policy="$(python3 "$(dirname "$0")/broker/pytest_scope.py" --mode "$PROMPT_MODE" "$PACK_ABS" "$CWD" 2>/dev/null || true)"
   if [[ -n "$_test_policy" ]]; then
     PROMPT="$PROMPT"$'\n\n'"$_test_policy"
   fi

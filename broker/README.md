@@ -187,7 +187,7 @@ trial-broker 在**每 job 结束**与**空闲轮询（≥1h）**时调用 GC（`
 - slice pack frontmatter 用 `tests:`（或 `test_paths:`）列定点测试 path；正文里反引号包住的 `pytest …` / `python3 -m pytest …` 命令也会被原样收集。
 - 只有跨模块改动或切 tip 前才写 `full_suite: true`：按测试所在目录分批 `python3 -m pytest -q <dir>`，失败不阻断后续批次；日常 slice 不要写。
 - 都没写时兜底：gate 按 pack diff 里的改动文件映射 `test_<stem>*.py` / `<stem>_test.py`，找不到则「无对应测试，不跑测试，只读审查」；foreman 输出按改动文件找对应测试的规则，找不到写 `no_targeted_tests`。
-- 逻辑在 `broker/test_policy.py`，由 `open-slice.sh` 对每张 foreman/gate 票热注入（只需重跑脚本，无需重启 broker）；`DSH_TEST_POLICY=0` 关闭。
+- 逻辑在 `broker/pytest_scope.py`，由 `open-slice.sh` 对每张 foreman/gate 票热注入（只需重跑脚本，无需重启 broker）；`DSH_TEST_POLICY=0` 关闭。
 
 ## 验收
 

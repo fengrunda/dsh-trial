@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for broker/test_policy.py (three-tier test policy injection)."""
+"""Unit tests for broker/pytest_scope.py (three-tier test policy injection)."""
 from __future__ import annotations
 
 import subprocess
@@ -10,7 +10,7 @@ _BROKER_ROOT = Path(__file__).resolve().parent.parent
 if str(_BROKER_ROOT) not in sys.path:
     sys.path.insert(0, str(_BROKER_ROOT))
 
-import test_policy  # noqa: E402
+import pytest_scope  # noqa: E402
 
 
 def _write(path: Path, text: str) -> Path:
@@ -38,10 +38,10 @@ def test_parse_tests_three_styles(tmp_path):
                                  "tests: [a/test_a.py, b/test_b.py]",
                                  "tests: a/test_a.py b/test_b.py")):
         pack = _pack(tmp_path / f"case{idx}", value)
-        out = test_policy.build_section("foreman", str(pack), str(tmp_path))
+        out = pytest_scope.build_section("foreman", str(pack), str(tmp_path))
         assert "python3 -m pytest -q a/test_a.py" in out
         assert "python3 -m pytest -q b/test_b.py" in out
-        assert test_policy.HARD_RULE in out
+        assert pytest_scope.HARD_RULE in out
 
 
 def test_collect_backtick_commands(tmp_path):
@@ -51,7 +51,7 @@ def test_collect_backtick_commands(tmp_path):
         "别跑 `pytest -q` 之外的东西。"
     )
     pack = _pack(tmp_path, "tests:\n", body)
-    out = test_policy.build_section("foreman", str(pack), str(tmp_path))
+    out = pytest_scope.build_section("foreman", str(pack), str(tmp_path))
     assert "`pytest tests/test_x.py -q`" in out
     assert "`cd broker && python3 -m pytest tests/test_y.py -q`" in out
 
@@ -60,9 +60,9 @@ def test_original_pack_fallback(tmp_path):
     _write(tmp_path / "orig.pack.md",
            "---\ntests: src/test_orig.py\n---\n\nbody\n")
     pack = _pack(tmp_path, "original_pack: orig.pack.md\n")
-    out = test_policy.build_section("gate", str(pack), str(tmp_path))
+    out = pytest_scope.build_section("gate", str(pack), str(tmp_path))
     assert "python3 -m pytest -q src/test_orig.py" in out
-    assert test_policy.GATE_NOTE in out
+    assert pytest_scope.GATE_NOTE in out
 
 
 def test_full_suite_batched_by_dir(tmp_path):
@@ -71,12 +71,12 @@ def test_full_suite_batched_by_dir(tmp_path):
         "pkg_b/nested/test_three.py", "pkg_c/other_test.py",
     ])
     pack = _pack(tmp_path, "full_suite: true\n")
-    out = test_policy.build_section("foreman", str(pack), str(repo))
+    out = pytest_scope.build_section("foreman", str(pack), str(repo))
     assert "本 pack 显式要求全量" in out
     assert "- `python3 -m pytest -q pkg_a`" in out
     assert "- `python3 -m pytest -q pkg_b/nested`" in out
     assert "- `python3 -m pytest -q pkg_c`" in out
-    assert test_policy.HARD_RULE in out
+    assert pytest_scope.HARD_RULE in out
 
 
 def test_full_suite_dedups_nested_dirs(tmp_path):
@@ -87,7 +87,7 @@ def test_full_suite_dedups_nested_dirs(tmp_path):
         "pkg_a/nested/test_three.py",
     ])
     pack = _pack(tmp_path, "full_suite: true\n")
-    out = test_policy.build_section("foreman", str(pack), str(repo))
+    out = pytest_scope.build_section("foreman", str(pack), str(repo))
     # 根目录和 pkg_a 都有后代目录在分组里：只列自身直接文件。
     assert "- `python3 -m pytest -q test_root.py`" in out
     assert "- `python3 -m pytest -q pkg_a/test_one.py`" in out
@@ -99,7 +99,7 @@ def test_full_suite_dedups_nested_dirs(tmp_path):
 def test_block_list_frontmatter(tmp_path):
     fm = "tests:\n  - a/test_a.py\n  - b/test_b.py\ntest_paths:\n  - c/test_c.py\n"
     pack = _pack(tmp_path, fm)
-    out = test_policy.build_section("foreman", str(pack), str(tmp_path))
+    out = pytest_scope.build_section("foreman", str(pack), str(tmp_path))
     assert "python3 -m pytest -q a/test_a.py" in out
     assert "python3 -m pytest -q b/test_b.py" in out
     assert "python3 -m pytest -q c/test_c.py" in out
@@ -114,7 +114,7 @@ def test_gate_fallback_untracked_test_file(tmp_path):
         "```\n"
     )
     pack = _pack(tmp_path, "", diff)
-    out = test_policy.build_section("gate", str(pack), str(repo))
+    out = pytest_scope.build_section("gate", str(pack), str(repo))
     assert "python3 -m pytest -q tests/test_new.py" in out
 
 
@@ -124,7 +124,7 @@ def test_bare_pytest_not_collected(tmp_path):
         "带 cd 的 `cd broker && pytest -q` 同理。\n"
     )
     pack = _pack(tmp_path, "tests:\n", body)
-    out = test_policy.build_section("foreman", str(pack), str(tmp_path))
+    out = pytest_scope.build_section("foreman", str(pack), str(tmp_path))
     assert "- `pytest -q`" not in out
     assert "- `python3 -m pytest -q`" not in out
     assert "cd broker && pytest -q" not in out
@@ -143,7 +143,7 @@ def test_gate_fallback_maps_diff_to_tests(tmp_path):
         "```\n"
     )
     pack = _pack(tmp_path, "original_pack: missing.pack.md\n", diff)
-    out = test_policy.build_section("gate", str(pack), str(repo))
+    out = pytest_scope.build_section("gate", str(pack), str(repo))
     assert "python3 -m pytest -q tests/test_foo_unit.py src/test_bar.py" in out
 
 
@@ -151,21 +151,21 @@ def test_gate_fallback_without_tests(tmp_path):
     repo = _git_repo(tmp_path / "repo", ["src/foo.py", "README.md"])
     diff = "```diff\ndiff --git a/src/foo.py b/src/foo.py\n--- a/src/foo.py\n+++ b/src/foo.py\n```\n"
     pack = _pack(tmp_path, "", diff)
-    out = test_policy.build_section("gate", str(pack), str(repo))
+    out = pytest_scope.build_section("gate", str(pack), str(repo))
     assert "无对应测试，不跑测试，只读审查" in out
     assert "pytest" not in out
 
 
 def test_foreman_without_tests_rule(tmp_path):
     pack = _pack(tmp_path, "risk: low\n")
-    out = test_policy.build_section("foreman", str(pack), str(tmp_path))
+    out = pytest_scope.build_section("foreman", str(pack), str(tmp_path))
     assert "no_targeted_tests" in out
     assert "test_foo*.py" in out
 
 
 def test_cli_error_prints_empty_exit_zero(tmp_path):
     proc = subprocess.run(
-        [sys.executable, str(_BROKER_ROOT / "test_policy.py"),
+        [sys.executable, str(_BROKER_ROOT / "pytest_scope.py"),
          "--mode", "bogus", str(tmp_path / "nope.md"), str(tmp_path)],
         capture_output=True, text=True,
     )

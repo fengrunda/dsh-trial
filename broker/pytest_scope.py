@@ -5,7 +5,7 @@
 显式 `full_suite: true`（跨模块改动 / 切 tip 前）才分批全量。
 broker 每张票重新执行 open-slice.sh，因此放在这里即可热生效。
 
-CLI: python3 test_policy.py --mode foreman|gate <pack_path> <cwd>
+CLI: python3 pytest_scope.py --mode foreman|gate <pack_path> <cwd>
 任何异常都打印空并 exit 0 —— 失败=不注入，保持原 prompt。
 """
 from __future__ import annotations
@@ -243,7 +243,7 @@ def build_section(mode: str, pack_path: str, cwd: str) -> str:
 def main(argv: list[str]) -> int:
     try:
         if len(argv) < 4 or argv[1] != "--mode":
-            raise ValueError("usage: test_policy.py --mode foreman|gate <pack> <cwd>")
+            raise ValueError("usage: pytest_scope.py --mode foreman|gate <pack> <cwd>")
         mode = argv[2]
         if mode not in ("foreman", "gate"):
             raise ValueError(f"bad mode: {mode}")

@@ -104,6 +104,15 @@ dsh-trial limits show
 底层仍是 `./broker/start.sh` / `./broker/stop.sh` / `python3 ./broker/trial-broker.py --status`。  
 Job 形态：单票 / `chain` / `chain-reply` / `goal`（详见 `broker/README.md` 与 `broker/trial-broker.py` 文档字符串）。
 
+## Gate 分流与推理档位
+
+`open-slice.sh` 在 gate 模式调用 `broker/gate_effort.py --classify` 做两步判断（热生效）：
+
+- **免审（skip）**：原 pack / gate pack frontmatter 写 `skip_gate: true`、`gate: skip` 或 `review: skip`；或原 pack 正文明确「不要 `submit_for_review`」且要求「开 PR」/ `dsh-trial-pr` / `push-and-pr`；或标题/Done when 明确 supervisor-close 只是核对、不是 gate。命中后直接写 `verdict=PASS` 摘要、不调用 gate，日志打印 `gate_skip=<reason>`；`DSH_GATE_SKIP=0` 关闭免审（退化为 low 继续审）。
+- **档位**：显式 `risk: low|medium|high` 优先（medium→low）；标签型 `risk`（逗号分隔，如 `tenant,takeover`）或改动路径命中 `migrat|auth|tenant|api/|openapi|webhook|deploy|prod` 才 high；其余一律 low。**改动行数不再抬 high**（大 diff 也是 low）。`DSH_GATE_TIERING=0` 关闭整个分流/分级。
+
+gate prompt 末尾默认追加一段「审核原则」短注入（注意力不偏、小改动一轮、定点测试只读复核）；`DSH_GATE_PRINCIPLES=0` 可关闭。
+
 ## 与插件的关系
 
 ```

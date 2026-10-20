@@ -130,6 +130,46 @@ def test_bare_pytest_not_collected(tmp_path):
     assert "cd broker && pytest -q" not in out
 
 
+def test_flag_values_are_not_positional_targets(tmp_path):
+    body = (
+        "`pytest -q -k smoke` / `python3 -m pytest -q -n auto` / "
+        "`pytest -q -p no:cacheprovider` 都不收；"
+        "`pytest -q -k smoke tests/test_a.py` 要收。\n"
+    )
+    pack = _pack(tmp_path, "tests:\n", body)
+    out = pytest_scope.build_section("foreman", str(pack), str(tmp_path))
+    assert "- `pytest -q -k smoke`" not in out
+    assert "- `python3 -m pytest -q -n auto`" not in out
+    assert "- `pytest -q -p no:cacheprovider`" not in out
+    assert "- `pytest -q -k smoke tests/test_a.py`" in out
+
+
+def test_deleted_test_file_not_selected(tmp_path):
+    repo = _git_repo(tmp_path / "repo", ["src/foo.py", "tests/test_foo.py"])
+    (repo / "tests/test_foo.py").unlink()
+    diff = (
+        "```diff\n"
+        "diff --git a/src/foo.py b/src/foo.py\n"
+        "--- a/src/foo.py\n+++ b/src/foo.py\n"
+        "diff --git a/tests/test_foo.py b/tests/test_foo.py\n"
+        "--- a/tests/test_foo.py\n+++ /dev/null\n"
+        "```\n"
+    )
+    pack = _pack(tmp_path, "", diff)
+    out = pytest_scope.build_section("gate", str(pack), str(repo))
+    assert "test_foo.py" not in out
+    assert "无对应测试" in out
+
+
+def test_goal_block_items_not_merged(tmp_path):
+    pack = _pack(tmp_path, "goal: |\n  - x\ntests:\n  - a/test_a.py\n")
+    fm, _ = pytest_scope._split_frontmatter(pack.read_text(encoding="utf-8"))
+    assert "x" not in fm["goal"]
+    assert "a/test_a.py" in fm["tests"]
+    out = pytest_scope.build_section("foreman", str(pack), str(tmp_path))
+    assert "python3 -m pytest -q a/test_a.py" in out
+
+
 def test_gate_fallback_maps_diff_to_tests(tmp_path):
     repo = _git_repo(tmp_path / "repo", [
         "src/foo.py", "src/test_bar.py", "tests/test_foo_unit.py",

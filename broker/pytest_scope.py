@@ -39,7 +39,7 @@ def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
         if line.strip() == "---":
             return fm, "\n".join(lines[idx + 1:])
         stripped = line.strip()
-        if last_key and stripped.startswith("- "):
+        if last_key in ("tests", "test_paths") and stripped.startswith("- "):
             item = stripped[2:].strip().strip("'\"")
             if item:
                 fm[last_key] = f"{fm.get(last_key, '')} {item}".strip()
@@ -85,7 +85,23 @@ def _git_ls_files(cwd: str) -> list[str]:
     return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
 
 
-def _collect_commands(body: str) -> list[str]:
+_VALUE_FLAGS = {
+    "-k", "-m", "-p", "-n", "-c", "-o", "-W",
+    "--rootdir", "--deselect", "--ignore", "--maxfail",
+    "--tb", "--durations",
+}
+
+
+def _looks_like_path(tok: str, cwd: str) -> bool:
+    if "/" in tok or tok.endswith(".py") or "::" in tok:
+        return True
+    try:
+        return bool(cwd) and (Path(cwd) / tok).is_dir()
+    except OSError:
+        return False
+
+
+def _collect_commands(body: str, cwd: str = "") -> list[str]:
     cmds: list[str] = []
     for match in _BACKTICK_RE.finditer(body):
         cmd = match.group(1).strip()
@@ -99,8 +115,22 @@ def _collect_commands(body: str) -> list[str]:
             rest = tokens[1:]
         else:
             continue
-        # 裸 pytest（只有 flag、无任何 path/目录/:: 目标）是全量，不收为定点命令。
-        if not any(not tok.startswith("-") for tok in rest):
+        # 跳过 flag 及其分离式取值，剩下像路径的位置参数才算定点目标；
+        # 裸 pytest（只有 flag、无 path/目录/:: 目标）是全量，不收。
+        positional: list[str] = []
+        skip_next = False
+        for tok in rest:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok == "--":
+                continue
+            if tok.startswith("-"):
+                if tok in _VALUE_FLAGS:
+                    skip_next = True
+                continue
+            positional.append(tok)
+        if not any(_looks_like_path(tok, cwd) for tok in positional):
             continue
         if cmd not in cmds:
             cmds.append(cmd)
@@ -110,17 +140,33 @@ def _collect_commands(body: str) -> list[str]:
 def _diff_changed_files(body: str) -> list[str]:
     files: list[str] = []
     for block in _DIFF_BLOCK_RE.findall(body):
-        for match in _DIFF_HEADER_RE.finditer(block):
+        for segment in re.split(r"(?=^diff --git )", block, flags=re.MULTILINE):
+            match = _DIFF_HEADER_RE.search(segment)
+            if not match:
+                continue
+            if re.search(r"^\+\+\+ /dev/null\s*$", segment, re.MULTILINE):
+                continue  # 删除的文件不算改动
             path = match.group(2)
             if path not in files:
                 files.append(path)
     return files
 
 
-def _map_tests(changed: list[str], tracked: list[str]) -> list[str]:
+def _exists(cwd: str, path: str) -> bool:
+    if not cwd:
+        return True
+    try:
+        return (Path(cwd) / path).is_file()
+    except OSError:
+        return False
+
+
+def _map_tests(changed: list[str], tracked: list[str], cwd: str = "") -> list[str]:
     found: list[str] = []
     for path in changed:
         if _is_test_file(path):
+            # diff 里直接出现的新增/修改测试文件（含尚未 tracked 的）照收；
+            # 删除项已由 +++ /dev/null 过滤。
             if path not in found:
                 found.append(path)
             continue
@@ -131,7 +177,7 @@ def _map_tests(changed: list[str], tracked: list[str]) -> list[str]:
             name = Path(cand).name
             if name == f"test_{stem}.py" or name.startswith(f"test_{stem}_") \
                     or name == f"{stem}_test.py":
-                if cand not in found:
+                if _exists(cwd, cand) and cand not in found:
                     found.append(cand)
     return found
 
@@ -146,7 +192,7 @@ def _section(lines: list[str]) -> str:
 
 def _fallback_gate(pack_text: str, cwd: str) -> str:
     changed = _diff_changed_files(pack_text)
-    tests = _map_tests(changed, _git_ls_files(cwd))
+    tests = _map_tests(changed, _git_ls_files(cwd), cwd)
     if not tests:
         return _section([
             HEADING, "",
@@ -193,7 +239,7 @@ def build_section(mode: str, pack_path: str, cwd: str) -> str:
 
     tests = _parse_list(fm.get("tests", "")) + _parse_list(fm.get("test_paths", ""))
     tests = list(dict.fromkeys(tests))
-    cmds = _collect_commands(body)
+    cmds = _collect_commands(body, cwd)
     for path in tests:
         cmd = f"python3 -m pytest -q {path}"
         if cmd not in cmds:

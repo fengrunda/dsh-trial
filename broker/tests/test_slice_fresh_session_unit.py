@@ -211,14 +211,18 @@ def test_second_slice_pack_gets_prior_digest_once():
 
 
 def test_open_slice_args_force_new_session():
+    """Default is a fresh session; only an explicit resume reuses one (G1)."""
     script = (ROOT.parent / "open-slice.sh").read_text(encoding="utf-8")
-    for line in script.splitlines():
+    lines = script.splitlines()
+    for i, line in enumerate(lines):
         if line.startswith("ARGS=(--profile"):
-            assert "--new" in line, line
+            tail = "\n".join(lines[i:i + 6])
+            assert "--resume" in tail and "--new" in tail, tail
+            assert "RESUME" in tail, tail
             break
     else:
         raise AssertionError("ARGS=(--profile ...) line not found in open-slice.sh")
-    print("OK open-slice.sh forces --new per ticket/slice")
+    print("OK open-slice.sh defaults to --new, --resume only when asked")
 
 
 if __name__ == "__main__":

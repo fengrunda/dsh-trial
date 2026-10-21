@@ -1,5 +1,7 @@
 # dsh运维 交接（2026-10-12 14:52 Asia/Shanghai）
 
+> Gate per_goal 单一审 + 口径/软顶 28 的交接见 [ops-handoff-gate-ab.md](ops-handoff-gate-ab.md)（含热更/重启清单与回滚）。
+
 ## 2026-10-21 max_gate_rounds 触顶与 max_rounds 同轨
 - gate_rounds_by_slice 触顶不再机械 escalate：Goal 停 awaiting_supervisor（awaiting_reason=max_gate_rounds），
   自动开监理决策短票 inplace(+1 有界) / split / escalate；工头随后写的 summary(status=blocked) 同样留在该决策道（不 notify Hub、不重开票）。

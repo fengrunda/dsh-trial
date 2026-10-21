@@ -4667,6 +4667,54 @@ def _adopt_misplaced_summary(expected: Path) -> bool:
     return expected.is_file()
 
 
+def _align_gate_summary_to_pack(pack_name: str, summary_name: str) -> tuple[str, Path]:
+    """Read path follows the pack's ``summary_out``, not a parallel name.
+
+    per_goal packs are named ``<slice>-gate-goal-rN.pack.md`` and tell the
+    gate to write ``-gate-goal-rN.md``. The chain used to keep reading
+    ``-gate-rN.md``, miss the file, and record an empty HOLD.
+    """
+    declared = _pack_declared_summary(pack_name)
+    name = summary_name
+    if declared:
+        name = declared[:-3] if declared.endswith(".md") else declared
+    return name, SUMMARIES / f"{name}.md"
+
+
+def _resolve_written_gate_summary(expected: Path, slice_id: str) -> Path:
+    """Return ``expected`` or a same-slice gate summary that actually has a verdict."""
+    if expected.is_file() and expected.stat().st_size > 0:
+        return expected
+    _adopt_misplaced_summary(expected)
+    if expected.is_file() and expected.stat().st_size > 0:
+        return expected
+    best: Path | None = None
+    best_mtime = -1.0
+    try:
+        candidates = list(SUMMARIES.glob(f"{slice_id}-gate*.md"))
+    except OSError:
+        candidates = []
+    for cand in candidates:
+        try:
+            if cand.stat().st_size <= 0:
+                continue
+            text = cand.read_text(encoding="utf-8", errors="replace")
+            mtime = cand.stat().st_mtime
+        except OSError:
+            continue
+        if not re.search(r'"verdict"\s*:\s*"(?:PASS|HOLD)"', text):
+            continue
+        if mtime >= best_mtime:
+            best, best_mtime = cand, mtime
+    if best is not None:
+        print(
+            f"[trial-broker] gate summary alias {expected.name} → {best.name}",
+            flush=True,
+        )
+        return best
+    return expected
+
+
 def _review_pass_via_ask_archive(slice_id: str) -> tuple[bool, str]:
     """Recover submit_for_review PASS when metrics recorded slice as ``slice``.
 
@@ -7798,7 +7846,7 @@ def run_chain_rounds(
 
             round_rec["gate_pack"] = gate_pack
         if reuse_gate or dedup_rec is not None:
-            _adopt_misplaced_summary(gate_summary)
+            gate_summary = _resolve_written_gate_summary(gate_summary, slice_id)
             if dedup_rec is not None:
                 gec = 0
                 gate_art = {"dedup_of": gate_ticket}
@@ -7818,6 +7866,9 @@ def run_chain_rounds(
                     flush=True,
                 )
         else:
+            gate_summary_name, gate_summary = _align_gate_summary_to_pack(
+                gate_pack, gate_summary_name
+            )
             gec = run_open_slice(
                 ticket=gate_ticket,
                 pack_name=gate_pack,
@@ -7831,7 +7882,7 @@ def run_chain_rounds(
                 watch_mailbox=False,
                 slot=resolve_slot(job=job),
             )
-            _adopt_misplaced_summary(gate_summary)
+            gate_summary = _resolve_written_gate_summary(gate_summary, slice_id)
             gate_art = write_artifacts(
                 {**job, "ticket": gate_ticket, "role": "gate"},
                 gate_log, gate_summary, gec, ticket=gate_ticket,

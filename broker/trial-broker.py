@@ -2365,6 +2365,99 @@ def _park_gate_awaiting_supervisor(
     return {"goal": goal_id, "cwd": cwd, "supervisor_profile": profile}
 
 
+def _resolve_mid_slice_gate_policy(ask: dict, goal: dict | None) -> tuple[str, str]:
+    """Per-slice gate policy for a mid-ticket ``submit_for_review`` (pure).
+
+    Same knobs as the chain Gate段: ``gate_grain`` from goal/limits, pack
+    frontmatter override, risk, paths and the Goal bearer slot. A submission
+    that is not a Goal slice (standalone chain) always opens the LLM gate.
+    """
+    goal = goal or {}
+    grain = GE.resolve_goal_gate_grain(
+        goal=goal or None,
+        job=goal or None,
+        limits=T.resolve_limits(goal=goal or None),
+    )
+    pack_name = str(goal.get("current_pack") or ask.get("pack") or "")
+    from_goal = bool(goal) and bool(pack_name) and (PACKS / Path(pack_name).name).is_file()
+    pack_meta, pack_text = _pack_meta_text(pack_name) if pack_name else ({}, "")
+
+    raw_paths = ask.get("changed_files")
+    paths: list[str] = []
+    if isinstance(raw_paths, list):
+        paths = [str(p).strip() for p in raw_paths if isinstance(p, str) and str(p).strip()]
+    if not paths:
+        paths = _foreman_changed_paths(ask)
+
+    risk = str(ask.get("risk") or pack_meta.get("risk") or "").strip() or None
+
+    slice_id = _resolve_ask_slice_id(ask, goal, fallback="slice")
+    pending = [str(s) for s in (goal.get("pending_slices") or [])]
+    is_goal_bearer = bool(goal.get("goal_gate_bearer")) or (
+        len(pending) == 1 and pending[0] == slice_id
+    )
+    return GE.resolve_slice_gate_policy(
+        grain,
+        pack_meta=pack_meta,
+        pack_text=pack_text,
+        risk=risk,
+        paths=paths,
+        is_goal_bearer=is_goal_bearer,
+        from_goal=from_goal,
+    )
+
+
+def _defer_mid_slice_submit(
+    path: Path,
+    *,
+    ask_id: str,
+    slice_id: str,
+    goal: dict | None,
+    policy: str,
+    reason: str,
+    round_n: int,
+) -> None:
+    """Answer a per_goal-deferred submit with a synthetic PASS.
+
+    No gate session, no ``review_seq`` bump, no ``last_reviewed_sha``: the
+    changes stay unreviewed *by this gate* on purpose — the Goal bearer's
+    aggregated pack is where they get read.
+    """
+    (MAILBOX / "answers").mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(
+        MAILBOX / "answers" / f"{ask_id}.json",
+        {
+            "ask_id": ask_id,
+            "status": "pass",
+            "verdict": VERDICT_PASS,
+            "synthetic": True,
+            "gate_policy": policy,
+            "reason": reason,
+            "findings": [],
+            "round": round_n,
+            "instruction": "片中免审：改动已记入 Goal 末聚合审；按 pack 继续下一步即可",
+        },
+    )
+    if goal is not None:
+        goal.setdefault("gate_deferred", []).append(
+            {"slice": slice_id, "policy": policy, "round": round_n, "reason": reason}
+        )
+        goal["gate_pending"] = True
+        _write_goal(goal)
+    # archive pending, exactly like the reviewed path does after the verdict
+    try:
+        arch = MAILBOX / "archive"
+        arch.mkdir(parents=True, exist_ok=True)
+        if path.is_file():
+            path.rename(arch / f"{ask_id}.pending.json")
+    except OSError:
+        pass
+    print(
+        f"[trial-broker] submit_for_review {ask_id} → synthetic PASS ({policy}:{reason})",
+        flush=True,
+    )
+
+
 def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cwd: str, goal: dict | None) -> None:
     """Open delta gate short-ticket; write PASS/HOLD(+rework_mode) answer for submit_for_review."""
     t0 = time.monotonic()  # 处理耗时 → wait_ms / by_kind.wait_ms_total
@@ -2584,6 +2677,22 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
 
         _atomic_write_json(answer_path, answer)
         _write_goal(goal)
+        return
+
+    # per_goal: mid-Goal slices defer to the Goal's aggregated gate. Answer a
+    # synthetic PASS here — no gate session and no round, because nothing was
+    # reviewed (no review_seq / gate_rounds / last_reviewed_sha bump).
+    mid_policy, mid_reason = _resolve_mid_slice_gate_policy(ask, goal)
+    if mid_policy in (GE.GATE_POLICY_DEFER, GE.GATE_POLICY_SKIP):
+        _defer_mid_slice_submit(
+            path,
+            ask_id=ask_id,
+            slice_id=slice_id,
+            goal=goal,
+            policy=mid_policy,
+            reason=mid_reason,
+            round_n=round_n,
+        )
         return
 
     # Build a gate pack: delta-only when prior findings exist on goal/chain

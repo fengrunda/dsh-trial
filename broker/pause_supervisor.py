@@ -20,6 +20,23 @@ PAUSE_DECISIONS = frozenset({
     "escalate",
 })
 
+# Goal 级 supervisor 复用会话常把 pause 包答成触顶三选一。
+# inplace = 同一切片有界继续，对应 pause 的 continue_same。
+_MAX_ROUNDS_PAUSE_ALIASES = {
+    "inplace": "continue_same",
+    "split": "split",
+    "escalate": "escalate",
+}
+
+_PROSE_DECISION_OPTS = (
+    "continue_same",
+    "new_ticket",
+    "close",
+    "split",
+    "escalate",
+    "inplace",
+)
+
 _HARD_CAP_RE = re.compile(r"timeout after \d+s hard cap", re.I)
 _IDLE_RE = re.compile(r"timeout after \d+s idle", re.I)
 _STEP_HARD_RE = re.compile(
@@ -52,21 +69,53 @@ def classify_pause_reason(
     return None
 
 
+def _canonical_pause_decision(raw: object) -> str | None:
+    token = str(raw or "").strip().lower()
+    if token in PAUSE_DECISIONS:
+        return token
+    if token == "inplace":
+        return "continue_same"
+    return None
+
+
 def parse_pause_decision(block: dict | None, text: str = "") -> str | None:
+    """Five-way pause decision, plus max_rounds schema aliases.
+
+    Reused supervisor sessions often answer a pause pack with
+    ``action=max_rounds_decision`` and ``decision=inplace|split|escalate``.
+    Map that onto continue_same / split / escalate so the chain does not
+    stay awaiting_supervisor. Canonical pause_decision + five-way unchanged.
+    """
     block = block if isinstance(block, dict) else {}
+    action = str(block.get("action") or "").strip().lower()
+    if action == "max_rounds_decision":
+        nested = str(block.get("decision") or "").strip().lower()
+        mapped = _MAX_ROUNDS_PAUSE_ALIASES.get(nested)
+        if mapped:
+            return mapped
+        if nested in PAUSE_DECISIONS:
+            return nested
+
     for key in ("decision", "verdict", "choice", "action"):
         raw = str(block.get(key) or "").strip().lower()
-        if raw in PAUSE_DECISIONS:
-            return raw
+        mapped = _canonical_pause_decision(raw)
+        if mapped:
+            return mapped
         # allow action=pause_decision with nested decision
         if raw == "pause_decision":
-            nested = str(block.get("decision") or "").strip().lower()
-            if nested in PAUSE_DECISIONS:
+            nested = _canonical_pause_decision(block.get("decision"))
+            if nested:
                 return nested
+
+    # Prose tokens, same shape as parse_max_rounds_decision.
+    answer = str(block.get("answer") or "").strip().lower()
+    for opt in _PROSE_DECISION_OPTS:
+        if answer == opt or answer.startswith(opt + " ") or f"decision={opt}" in answer:
+            return _canonical_pause_decision(opt)
     blob = (text or "").lower()
-    for opt in PAUSE_DECISIONS:
+    for opt in _PROSE_DECISION_OPTS:
         if f'"decision": "{opt}"' in blob or f'"decision":"{opt}"' in blob:
-            return opt
+            return _canonical_pause_decision(opt)
     return None
 
 
@@ -137,7 +186,9 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-sup-pause-r{ro
 - **escalate**: 真正升级到 Hub/人（仅此选项通知人）
 
 ## Instruction
-写 summary，机器块：
+本包只接受 pause 五选一。禁止 `action=max_rounds_decision`，禁止 `decision=inplace`。
+inplace 是触顶三选一的用词，写在本包是错的；原会话继续请用 continue_same。
+写 summary，机器块只许这一种：
 ```json
 {{
   "action": "pause_decision",

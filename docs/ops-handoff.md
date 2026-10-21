@@ -1,5 +1,7 @@
 # dsh运维 交接（2026-10-12 14:52 Asia/Shanghai）
 
+> Gate per_goal 单一审 + 口径/软顶 28 的交接见 [ops-handoff-gate-ab.md](ops-handoff-gate-ab.md)（含热更/重启清单与回滚）。
+
 ## 2026-10-21 max_gate_rounds 触顶与 max_rounds 同轨
 - gate_rounds_by_slice 触顶不再机械 escalate：Goal 停 awaiting_supervisor（awaiting_reason=max_gate_rounds），
   自动开监理决策短票 inplace(+1 有界) / split / escalate；工头随后写的 summary(status=blocked) 同样留在该决策道（不 notify Hub、不重开票）。
@@ -13,7 +15,7 @@
 - 并发：max_concurrent_goals=2，同 cwd 串行。线上两 Goal 并发尚未实测。
 - 模型：trial（acp-trial / acp-lite-trial）= newapicy1/kimi-for-coding（NEWAPICY1_API_KEY）；产品 acp / acp-lite / acp-hub-read / settings agent-default-model 仍为 deepseek-official/deepseek-flash。
 - 推理强度（limits.json reasoning_effort_by_role，默认同）：supervisor=high，impl=high，gate=high（Runda 2026-10-21）。DeepSeek 只有 low/high/max，medium=high。运维票用 `--reasoning-effort` 或 DSH_REASONING_EFFORT。
-- 步数软提醒（插件 dsh-step-budget-reminder，不硬停）：supervisor 30 / impl 80 / gate 60（step_budget_by_role）。
+- 步数软提醒（插件 dsh-step-budget-reminder，不硬停）：supervisor 30 / impl 80 / gate 28（step_budget_by_role；gate 另可用 limits `gate_max_steps` 覆盖，到点写 status=paused_limit 交监理五选一）。gate 摘要写 `status=paused_limit` 时**必须**带 `used_steps` 与 `remaining` 两键（勿空 HOLD）。
 - acp-trial / acp-lite-trial：压缩 thresholdRatio 0.15 / retainRatio 0.05（kimi ~39k）；精简工具（38→21 / 37→20）；contextClear {enabled, compaction-coupled, keepRecentResults 8, clearReasoning on}。插件软链指 pin worktree /workspace/dsh-trial-plugins（tag plugins-pin-20261008d = 79a9070，已 push）。产品 profile acp / acp-lite / acp-lite-offload / acp-hub-read 未改（压缩阈值实际约 150k）。
 - broker 今日修复：gate 去重账本 thin-state/review-ledger.json；标题安全化与 review_seq；续跑判断票是否真结束；watchdog 只计 broker 子进程；gate pack 独立命名；submit_for_review 前置 summary 检查；看板刷新钩子 ~/.dsh/bin/khub-dsh-complete-notify.py。
 - 巡检 routine「dsh trial 底座」**已恢复**（工作日 10:35 / 14:35 / 18:35 Asia/Shanghai）。观察焦点：质量链路（gate 单派 / reasoning high·high·high / contextClear / 双 Goal 并发）+ token。

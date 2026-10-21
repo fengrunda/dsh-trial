@@ -157,6 +157,19 @@ MAX_DIFF_BYTES = int(os.environ.get("TRIAL_MAX_DIFF_BYTES", "6144"))
 PROD_BROKER = DSH_HOME / "broker-khub-prod"
 PROD_RESTART = DSH_HOME / "bin" / "khub-broker-restart.sh"
 
+# Gate review caliber (slice dsh-gate-ab-20261021-s2): one authoritative 5-line
+# block, injected verbatim both by open-slice.sh (PROMPT_MODE=gate) and by the
+# gate packs written below. Wording is frozen — do not re-litigate it per round.
+GATE_SOFT_MAX_STEPS = 28
+
+GATE_PRINCIPLES_BLOCK = f"""## 审核原则
+- 只核三件事：pack Done-when / 设计对齐 / P0–P1；其余细节不审。
+- 只有 P2 时判 PASS，P2 写进 findings 备注，不得因 P2 HOLD。
+- 工头摘要已有同命令结果则只读复核，不重跑。
+- 全量回归交 CI；定点测试缺证据才补跑一次。
+- 到约 {GATE_SOFT_MAX_STEPS} 步仍未定论：summary 写 status=paused_limit（勿空 HOLD），交监理五选一。"""
+
+
 FOREMAN_STATUS_DONE = "done"
 FOREMAN_STATUS_BLOCKED = "blocked"
 FOREMAN_STATUS_QUESTION = "question"
@@ -757,6 +770,28 @@ def _enforce_pack_bytes(path: Path, cap: int = MAX_PACK_BYTES) -> None:
         raise ValueError(
             f"pack {path.name} is {len(data)} bytes > maxPackBytes={cap}"
         )
+
+
+def _truncate_keep_tail(body: str, cap: int, note: str = "\n\n…[truncated]\n") -> str:
+    """Truncate ``body`` from the middle, never dropping the pack tail.
+
+    The gate builders put ``GATE_PRINCIPLES_BLOCK`` and ``## Done when`` last, so
+    a plain tail-truncation silently drops the review caliber exactly when a pack
+    is near ``maxPackBytes`` (gate finding dsh-gate-ab-20261021-s2 r2 P1). Reserve
+    the tail and cut only the head (diff / prior findings / pack excerpt).
+    """
+    idx = body.rfind(GATE_PRINCIPLES_BLOCK)
+    if idx < 0:  # packs without the caliber block still end in `## Done when`
+        idx = body.rfind("\n## Done when\n")
+    if idx < 0:  # no tail to protect — degrade to the plain cap
+        return _truncate_bytes(body, cap, note=note)[0]
+    tail = body[idx:]
+    keep = cap - len(tail.encode("utf-8")) - len(note.encode("utf-8"))
+    if keep <= 0:
+        # Pathological: the tail alone is over cap — keep it rather than lose it.
+        return _truncate_bytes(tail, cap, note=note)[0]
+    head_cut, _ = _truncate_bytes(body[:idx], keep, note=note)
+    return head_cut + tail
 
 
 def _job_cwd(data: dict, path: Path) -> str:
@@ -1383,6 +1418,12 @@ def _spawn_env(
         env["DSH_STEP_BUDGET"] = str(budget)
     else:
         env.pop("DSH_STEP_BUDGET", None)
+    # Gate: surface the same soft cap under its own name so the prompt/plugin can
+    # say "~N steps -> paused_limit" without re-deriving the role table.
+    if str(role or "").strip() == "gate" and budget > 0:
+        env["DSH_GATE_MAX_STEPS"] = str(budget)
+    else:
+        env.pop("DSH_GATE_MAX_STEPS", None)
     env.pop("NEW_API_KEY", None)
     # hub-mount-b s2: inject HUB_* only from the goal's hub binding. The four
     # keys are cleared unconditionally (inherited dirt included) and re-set
@@ -2365,6 +2406,99 @@ def _park_gate_awaiting_supervisor(
     return {"goal": goal_id, "cwd": cwd, "supervisor_profile": profile}
 
 
+def _resolve_mid_slice_gate_policy(ask: dict, goal: dict | None) -> tuple[str, str]:
+    """Per-slice gate policy for a mid-ticket ``submit_for_review`` (pure).
+
+    Same knobs as the chain Gate段: ``gate_grain`` from goal/limits, pack
+    frontmatter override, risk, paths and the Goal bearer slot. A submission
+    that is not a Goal slice (standalone chain) always opens the LLM gate.
+    """
+    goal = goal or {}
+    grain = GE.resolve_goal_gate_grain(
+        goal=goal or None,
+        job=goal or None,
+        limits=T.resolve_limits(goal=goal or None),
+    )
+    pack_name = str(goal.get("current_pack") or ask.get("pack") or "")
+    from_goal = bool(goal) and bool(pack_name) and (PACKS / Path(pack_name).name).is_file()
+    pack_meta, pack_text = _pack_meta_text(pack_name) if pack_name else ({}, "")
+
+    raw_paths = ask.get("changed_files")
+    paths: list[str] = []
+    if isinstance(raw_paths, list):
+        paths = [str(p).strip() for p in raw_paths if isinstance(p, str) and str(p).strip()]
+    if not paths:
+        paths = _foreman_changed_paths(ask)
+
+    risk = str(ask.get("risk") or pack_meta.get("risk") or "").strip() or None
+
+    slice_id = _resolve_ask_slice_id(ask, goal, fallback="slice")
+    pending = [str(s) for s in (goal.get("pending_slices") or [])]
+    is_goal_bearer = bool(goal.get("goal_gate_bearer")) or (
+        len(pending) == 1 and pending[0] == slice_id
+    )
+    return GE.resolve_slice_gate_policy(
+        grain,
+        pack_meta=pack_meta,
+        pack_text=pack_text,
+        risk=risk,
+        paths=paths,
+        is_goal_bearer=is_goal_bearer,
+        from_goal=from_goal,
+    )
+
+
+def _defer_mid_slice_submit(
+    path: Path,
+    *,
+    ask_id: str,
+    slice_id: str,
+    goal: dict | None,
+    policy: str,
+    reason: str,
+    round_n: int,
+) -> None:
+    """Answer a per_goal-deferred submit with a synthetic PASS.
+
+    No gate session, no ``review_seq`` bump, no ``last_reviewed_sha``: the
+    changes stay unreviewed *by this gate* on purpose — the Goal bearer's
+    aggregated pack is where they get read.
+    """
+    (MAILBOX / "answers").mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(
+        MAILBOX / "answers" / f"{ask_id}.json",
+        {
+            "ask_id": ask_id,
+            "status": "pass",
+            "verdict": VERDICT_PASS,
+            "synthetic": True,
+            "gate_policy": policy,
+            "reason": reason,
+            "findings": [],
+            "round": round_n,
+            "instruction": "片中免审：改动已记入 Goal 末聚合审；按 pack 继续下一步即可",
+        },
+    )
+    if goal is not None:
+        goal.setdefault("gate_deferred", []).append(
+            {"slice": slice_id, "policy": policy, "round": round_n, "reason": reason}
+        )
+        goal["gate_pending"] = True
+        _write_goal(goal)
+    # archive pending, exactly like the reviewed path does after the verdict
+    try:
+        arch = MAILBOX / "archive"
+        arch.mkdir(parents=True, exist_ok=True)
+        if path.is_file():
+            path.rename(arch / f"{ask_id}.pending.json")
+    except OSError:
+        pass
+    print(
+        f"[trial-broker] submit_for_review {ask_id} → synthetic PASS ({policy}:{reason})",
+        flush=True,
+    )
+
+
 def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cwd: str, goal: dict | None) -> None:
     """Open delta gate short-ticket; write PASS/HOLD(+rework_mode) answer for submit_for_review."""
     t0 = time.monotonic()  # 处理耗时 → wait_ms / by_kind.wait_ms_total
@@ -2584,6 +2718,22 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
 
         _atomic_write_json(answer_path, answer)
         _write_goal(goal)
+        return
+
+    # per_goal: mid-Goal slices defer to the Goal's aggregated gate. Answer a
+    # synthetic PASS here — no gate session and no round, because nothing was
+    # reviewed (no review_seq / gate_rounds / last_reviewed_sha bump).
+    mid_policy, mid_reason = _resolve_mid_slice_gate_policy(ask, goal)
+    if mid_policy in (GE.GATE_POLICY_DEFER, GE.GATE_POLICY_SKIP):
+        _defer_mid_slice_submit(
+            path,
+            ask_id=ask_id,
+            slice_id=slice_id,
+            goal=goal,
+            policy=mid_policy,
+            reason=mid_reason,
+            round_n=round_n,
+        )
         return
 
     # Build a gate pack: delta-only when prior findings exist on goal/chain
@@ -3075,10 +3225,13 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
 ## Foreman notes
 {notes_text}
 
+{GATE_PRINCIPLES_BLOCK}
+
 ## Done when
 - Delta-only: verify prior findings fixed; note any new P0/P1.
 - 禁止通读全文件/原 pack/全仓；只核对上述 diff 与 FAIL 清单，必要时 sed -n 小段。
 - Write verdict PASS|HOLD with machine json (findings/unmet_acceptance).
+- 到约 28 步仍未定论：机器块写 status=paused_limit 并带 used_steps / remaining 两键（勿空 HOLD）。
 - No room_*; do not modify business src.
 """
 
@@ -3113,7 +3266,8 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
         body = _assemble(diff_show, foreman_show, findings_json)
     if len(body.encode("utf-8")) > budget:
         # Safety net so _enforce_pack_bytes can never raise on an oversize pack.
-        body, _ = _truncate_bytes(body, budget, note=note)
+        # Keep the caliber block + `## Done when` tail (r2 P1).
+        body = _truncate_keep_tail(body, budget, note=note)
     path.write_text(body, encoding="utf-8")
     _enforce_pack_bytes(path)
     return name
@@ -3430,8 +3584,11 @@ max_bytes_hint: {MAX_PACK_BYTES}
 {diff}
 ```
 
+{GATE_PRINCIPLES_BLOCK}
+
 ## Done when
 - Write verdict to summary_out with machine json block (verdict PASS|HOLD + findings).
+- 到约 28 步仍未定论：机器块写 status=paused_limit 并带 used_steps / remaining 两键（勿空 HOLD）。
 - 禁止通读全文件/原 pack/全仓；只核对上述 diff 与 FAIL 清单，必要时 sed -n 小段。
 - Delta-only review; no room_*; do not modify business src.
 """
@@ -3442,13 +3599,16 @@ max_bytes_hint: {MAX_PACK_BYTES}
             _enforce_pack_bytes(path)
             break
         except ValueError:
-            # re-truncate more aggressively
+            # re-truncate more aggressively, but never cut the tail block/Done when
             cur = path.read_text(encoding="utf-8")
-            # cut from end of diff fence
             if len(cur.encode()) > MAX_PACK_BYTES:
                 keep = MAX_PACK_BYTES - 80
-                cut, _ = _truncate_bytes(cur, keep)
-                path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
+                path.write_text(
+                    _truncate_keep_tail(
+                        cur, keep, note="\n\n…[pack truncated to maxPackBytes]\n"
+                    ),
+                    encoding="utf-8",
+                )
     _enforce_pack_bytes(path)
     return name
 
@@ -3633,8 +3793,12 @@ max_bytes_hint: {MAX_PACK_BYTES}
             cur = path.read_text(encoding="utf-8")
             if len(cur.encode()) > MAX_PACK_BYTES:
                 keep = MAX_PACK_BYTES - 80
-                cut, _ = _truncate_bytes(cur, keep)
-                path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
+                path.write_text(
+                    _truncate_keep_tail(
+                        cur, keep, note="\n\n…[pack truncated to maxPackBytes]\n"
+                    ),
+                    encoding="utf-8",
+                )
     _enforce_pack_bytes(path)
     return name
 
@@ -3884,8 +4048,14 @@ def _write_pack_capped(path: Path, body: str) -> None:
             return
         except ValueError:
             cur = path.read_text(encoding="utf-8")
-            cut, _ = _truncate_bytes(cur, MAX_PACK_BYTES - 80)
-            path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
+            path.write_text(
+                _truncate_keep_tail(
+                    cur,
+                    MAX_PACK_BYTES - 80,
+                    note="\n\n…[pack truncated to maxPackBytes]\n",
+                ),
+                encoding="utf-8",
+            )
     _enforce_pack_bytes(path)
 
 

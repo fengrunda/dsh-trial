@@ -33,7 +33,7 @@ def test_defaults_by_role():
     assert T.role_reasoning_effort("impl", {}) == "high"
     assert T.role_step_budget("impl", {}) == 80
     assert T.role_reasoning_effort("gate", {}) == "high"
-    assert T.role_step_budget("gate", {}) == 60
+    assert T.role_step_budget("gate", {}) == 28
 
 
 def test_unknown_role_gets_nothing():
@@ -48,7 +48,7 @@ def test_defaults_match_module_tables():
         "impl": "high",
         "gate": "high",
     }
-    assert T.DEFAULT_STEP_BUDGET_BY_ROLE == {"supervisor": 30, "impl": 80, "gate": 60}
+    assert T.DEFAULT_STEP_BUDGET_BY_ROLE == {"supervisor": 30, "impl": 80, "gate": 28}
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +76,39 @@ def test_bad_step_budget_values_fall_back_to_zero():
     assert T.role_reasoning_effort("impl", {"reasoning_effort_by_role": 7}) == "high"
 
 
+def test_gate_max_steps_overrides_role_table():
+    assert T.role_step_budget("gate", {"gate_max_steps": 22}) == 22
+    assert (
+        T.role_step_budget(
+            "gate", {"gate_max_steps": 22, "step_budget_by_role": {"gate": 40}}
+        )
+        == 22
+    )
+    # a valid role-table entry still wins when gate_max_steps is absent
+    assert T.role_step_budget("gate", {"step_budget_by_role": {"gate": 40}}) == 40
+
+
+def test_bad_gate_max_steps_falls_to_next_level_never_raises():
+    for bad in ("x", -1, 0, None, "", 0.5, [], {}):
+        limits = {"gate_max_steps": bad}
+        assert T.role_step_budget("gate", limits) == 28, bad
+    # bad gate_max_steps -> role table
+    assert (
+        T.role_step_budget(
+            "gate", {"gate_max_steps": "x", "step_budget_by_role": {"gate": 40}}
+        )
+        == 40
+    )
+    # bad at both levels -> built-in default 28 (gate never loses its soft cap)
+    for bad in ("x", -5, 0, None):
+        assert (
+            T.role_step_budget(
+                "gate", {"gate_max_steps": bad, "step_budget_by_role": {"gate": bad}}
+            )
+            == 28
+        )
+
+
 def test_blank_effort_override_yields_none():
     assert T.role_reasoning_effort("impl", {"reasoning_effort_by_role": {"impl": "  "}}) is None
 
@@ -83,12 +116,29 @@ def test_blank_effort_override_yields_none():
 # ---------------------------------------------------------------------------
 # _spawn_env wiring
 # ---------------------------------------------------------------------------
-def test_spawn_env_gate_sets_high_and_60(monkeypatch):
+def test_spawn_env_gate_sets_high_and_28(monkeypatch):
     monkeypatch.setattr(T, "load_global_limits", lambda: {})
     env = tb._spawn_env("gate")
     assert env["DSH_ROLE"] == "gate"
     assert env["DSH_REASONING_EFFORT"] == "high"
-    assert env["DSH_STEP_BUDGET"] == "60"
+    assert env["DSH_STEP_BUDGET"] == "28"
+    assert env["DSH_GATE_MAX_STEPS"] == "28"
+
+
+def test_spawn_env_gate_honours_gate_max_steps(monkeypatch):
+    monkeypatch.setattr(T, "load_global_limits", lambda: {"gate_max_steps": 22})
+    env = tb._spawn_env("gate")
+    assert env["DSH_STEP_BUDGET"] == "22"
+    assert env["DSH_GATE_MAX_STEPS"] == "22"
+
+
+def test_spawn_env_non_gate_clears_gate_max_steps(monkeypatch):
+    monkeypatch.setattr(T, "load_global_limits", lambda: {})
+    monkeypatch.setenv("DSH_GATE_MAX_STEPS", "99")
+    env = tb._spawn_env("impl", ticket="impl-t6-r1")
+    assert env["DSH_STEP_BUDGET"] == "80"
+    assert "DSH_GATE_MAX_STEPS" not in env
+    assert os.environ["DSH_GATE_MAX_STEPS"] == "99"
 
 
 def test_spawn_env_impl_sets_high_and_80(monkeypatch):
@@ -132,7 +182,7 @@ def test_load_global_limits_never_raises_on_missing_file(monkeypatch, tmp_path):
     # real loader stays total (implicit fallback table in _spawn_env)
     monkeypatch.setattr(T, "LIMITS_PATH", tmp_path / "absent.json")
     assert T.role_reasoning_effort("gate") == "high"
-    assert T.role_step_budget("gate") == 60
+    assert T.role_step_budget("gate") == 28
 
 
 # ---------------------------------------------------------------------------

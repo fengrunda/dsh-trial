@@ -197,6 +197,9 @@ def test_rev_with_prior_findings_uses_delta_pack(tmp_path: Path):
     slice_id = "unit-f1-delta"
     goal = {
         "goal": "unit-f1-delta-goal", "status": "running", "slice": slice_id,
+        # explicit per_slice: this test is about rev2 pack naming, not the
+        # per_goal bearer defer (a non-bearer submit would合成 PASS and skip it).
+        "gate": "per_slice",
         "review_seq": 1, "current_pack": f"{slice_id}.pack.md",
         "current_acceptance": ["do the thing"],
         "last_gate_findings": [{"tier": "P1", "file": "a.py", "issue": "still wrong"}],

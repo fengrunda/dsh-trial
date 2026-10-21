@@ -59,6 +59,11 @@ class FakeClient:
         ("turn failed: 503", "upstream_5xx"),
         ("upstream said Bad Gateway", "upstream_5xx"),
         ("Service Unavailable", "upstream_5xx"),
+        (
+            "ACP session/prompt failed: turn failed: 422: "
+            '{"message":"Upstream request failed: Endpoint is unavailable."}',
+            "endpoint_unavailable",
+        ),
         ("Gateway Timeout", "upstream_5xx"),
         ("TRANSPORT broken pipe", "transport"),
         ("Connection error while writing", "transport"),

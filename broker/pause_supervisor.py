@@ -1,4 +1,4 @@
-"""Pause → supervisor five-way decision (G1 + wall-clock).
+"""Pause → supervisor five-way decision (G1 + wall-clock + upstream env).
 
 Pure helpers for unit tests. trial-broker wires these into chain routing.
 """
@@ -9,7 +9,8 @@ from typing import Any
 
 PAUSE_LIMIT = "paused_limit"
 PAUSE_WALLCLOCK = "paused_wallclock"
-PAUSE_KINDS = frozenset({PAUSE_LIMIT, PAUSE_WALLCLOCK})
+PAUSE_ENV = "paused_env"
+PAUSE_KINDS = frozenset({PAUSE_LIMIT, PAUSE_WALLCLOCK, PAUSE_ENV})
 
 # Five options (工头侧会话); escalate alone wakes Hub/human.
 PAUSE_DECISIONS = frozenset({
@@ -50,7 +51,7 @@ def classify_pause_reason(
     summary_status: str | None = None,
     log_text: str = "",
 ) -> str | None:
-    """Return paused_limit | paused_wallclock | None."""
+    """Return paused_limit | paused_wallclock | paused_env | None."""
     st = str(summary_status or "").strip().lower()
     if st in PAUSE_KINDS:
         return st
@@ -61,6 +62,8 @@ def classify_pause_reason(
         return PAUSE_WALLCLOCK
     if "pause_kind=paused_limit" in section:
         return PAUSE_LIMIT
+    if "pause_kind=paused_env" in section or "env_blocked(" in section:
+        return PAUSE_ENV
     # Prefer explicit plugin / summary markers over wall-clock.
     if _STEP_HARD_RE.search(section):
         return PAUSE_LIMIT
@@ -187,7 +190,22 @@ def build_pause_pack_body(
 ) -> str:
     """Markdown pack body for supervisor-pause decision."""
     kind = pause_kind if pause_kind in PAUSE_KINDS else PAUSE_LIMIT
-    title = "步数硬阈值" if kind == PAUSE_LIMIT else "墙钟到点"
+    if kind == PAUSE_LIMIT:
+        title = "步数硬阈值"
+        suggest = "建议 continue_same 并 +0.5×budget 步 / 或适量延长 hard timeout"
+    elif kind == PAUSE_ENV:
+        title = "上游瞬态故障"
+        suggest = "建议 continue_same 续跑原会话；这不是设计被否"
+    else:
+        title = "墙钟到点"
+        suggest = "建议 continue_same 并延长 idle/hard，或 close/split"
+    env_line = ""
+    if kind == PAUSE_ENV:
+        env_line = (
+            "这是上游瞬态故障，票内已重试用尽。"
+            "工作区可能有未提交改动。不要当成设计被否。\n"
+            "continue_same 仍续跑原会话。\n\n"
+        )
     steps_line = (
         f"- 已用步数: {steps_used} / 预算 {step_budget or '?'} "
         f"(硬阈值约 2×budget)"
@@ -199,11 +217,6 @@ def build_pause_pack_body(
         f"(idle={idle_timeout_sec or '?'}, hard={hard_timeout_sec or '?'})"
         if elapsed_sec is not None
         else f"- 墙钟: idle={idle_timeout_sec or '?'}, hard={hard_timeout_sec or '?'}"
-    )
-    suggest = (
-        "建议 continue_same 并 +0.5×budget 步 / 或适量延长 hard timeout"
-        if kind == PAUSE_LIMIT
-        else "建议 continue_same 并延长 idle/hard，或 close/split"
     )
     return f"""---
 kind: supervisor-pause
@@ -220,7 +233,7 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-sup-pause-r{ro
 
 暂停点，不是失败。禁止机械 closeout / 直接交人。优先原会话继续。
 
-## 已用量
+{env_line}## 已用量
 {steps_line}
 {time_line}
 - 原因: `{kind}`

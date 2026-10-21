@@ -395,3 +395,61 @@ def test_classify_pause_maps_wallclock_and_steps():
     assert tb.PS.classify_pause_reason(log_text=IDLE) == "paused_wallclock"
     assert tb.PS.classify_pause_reason(log_text=STEPS) is None  # needs max_steps map or marker
     assert tb.PS.classify_pause_reason(summary_status="paused_limit") == "paused_limit"
+
+
+ENV_BLOCKED = (
+    "=== run ===\n"
+    "env-retry n=1/2 reason=endpoint_unavailable backoff=20s\n"
+    "env-retry n=2/2 reason=endpoint_unavailable backoff=40s\n"
+    "env_blocked(endpoint_unavailable, retries=2): Endpoint is unavailable\n"
+)
+
+
+def test_env_blocked_classifies_paused_env_not_slice_failed(tmp_path: Path):
+    """In-ticket env retries exhausted → paused_env, not slice failed."""
+    assert tb.PS.classify_pause_reason(log_text=ENV_BLOCKED) == "paused_env"
+    body = tb.PS.build_pause_pack_body(
+        slice_id="s1",
+        round_n=1,
+        pause_kind="paused_env",
+        steps_used=None,
+        step_budget=30,
+        elapsed_sec=None,
+        idle_timeout_sec=900,
+        hard_timeout_sec=3600,
+        goal_id="g1",
+        pending_pack="s1.pack.md",
+        impl_ticket="impl-s1",
+    )
+    assert "上游瞬态故障" in body
+    assert "票内已重试用尽" in body
+    assert "未提交改动" in body
+    assert "不要当成设计被否" in body
+    assert "continue_same 仍续跑原会话" in body
+
+    ctx, dirs = _patched_dirs(tmp_path / "state")
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _dirty(repo)
+    slice_id = "unit-env-blocked"
+    goal_id = "goal-env-blocked"
+    pr_bin = tmp_path / "dsh-trial-pr"
+    _pr_script(pr_bin, tmp_path / "pr.log")
+    with ctx:
+        _write_pack(dirs, slice_id, repo)
+        _seed_goal(dirs, goal_id, repo)
+        with mock.patch.object(
+            tb, "auto_supervisor_pause_decision", return_value=None
+        ) as paused:
+            rc, calls = _run(dirs, repo, slice_id, goal_id, ENV_BLOCKED, pr_bin)
+        goal, chain = _load(dirs, goal_id, slice_id)
+    assert paused.called
+    assert paused.call_args.kwargs["pause_kind"] == "paused_env"
+    assert rc == 0
+    assert chain["state"] == "awaiting_supervisor"
+    assert chain["state"] != "failed"
+    assert chain.get("error") != "foreman exit 1 without summary"
+    assert goal["status"] == "running"
+    assert goal["status"] != "failed"
+    assert chain["rounds"][0]["pause_kind"] == "paused_env"
+    assert calls == [f"impl-trial-{slice_id}-r1"]

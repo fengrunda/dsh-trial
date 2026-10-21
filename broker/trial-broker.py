@@ -63,10 +63,12 @@ with top-level slice/pack/acceptance) or many (``action=emit_chains`` with a
 first failed/escalated slice unless ``on_slice_fail=continue``, and runs the
 supervisor close once after every slice PASSes.
 
-An impl that hits the ACP hard/idle wall-clock or the step hard threshold
-(classifies as ``paused_wallclock`` / ``paused_limit``) routes to the
-supervisor five-way (continue_same / new_ticket / close / split / escalate)
-instead of mechanical closeout. Soft step reminders are unchanged.
+An impl that hits the ACP hard/idle wall-clock, the step hard threshold,
+or an exhausted in-ticket upstream retry (log contains ``env_blocked(``)
+classifies as ``paused_wallclock`` / ``paused_limit`` / ``paused_env`` and
+routes to the supervisor five-way (continue_same / new_ticket / close /
+split / escalate) instead of marking the slice failed. Soft step reminders
+are unchanged. ``continue_same`` still resumes the same impl session.
 ``limit_stop_closeout`` remains as a legacy fallback when classification
 does not match. Only ``escalate`` wakes Hub/human; other decisions park or
 close under supervisor control. Same-Goal supervisor tickets reuse via

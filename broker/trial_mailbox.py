@@ -74,6 +74,20 @@ def decide_and_answer_review(
     verdict = str(gate_block.get("verdict") or "").upper()
     findings = gate_block.get("findings") or []
     unmet = gate_block.get("unmet_acceptance") or []
+    if gate_block.get("machine_block_missing") or verdict == "QUESTION":
+        note = str(gate_block.get("notes") or "machine block missing")
+        return "", {
+            "ask_id": ask.get("ask_id"),
+            "status": "question",
+            "verdict": "question",
+            "ok": False,
+            "gate_ticket": gate_ticket,
+            "findings": [],
+            "unmet_acceptance": [],
+            "summary_path": gate_block.get("summary_path") or "",
+            "notes": note,
+            "instruction": note,
+        }
     if verdict == "PASS":
         return "", {
             "ask_id": ask.get("ask_id"),

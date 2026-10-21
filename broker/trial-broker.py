@@ -3723,8 +3723,15 @@ def build_goal_gate_pack(
     bearer_summary_text: str,
     cwd: Path,
     label: str | None = None,
+    summary_name: str | None = None,
 ) -> str:
-    """One Goal-end gate pack: each slice summary + single base...HEAD diff."""
+    """One Goal-end gate pack: each slice summary + single base...HEAD diff.
+
+    ``summary_name`` is the basename the chain already reads
+    (``<slice>-gate-rN``). The pack file stays ``<slice>-gate-goal-rN.pack.md``;
+    ``summary_out`` must not follow that filename or the gate writes a file
+    the broker does not open.
+    """
     all_ids = list(dict.fromkeys([*deferred_slice_ids, bearer_slice_id]))
     spec_by = {str(s.get("slice")): s for s in (slice_specs or []) if isinstance(s, dict)}
     # Earliest foreman base among deferred + bearer; head = current HEAD.
@@ -3772,6 +3779,11 @@ def build_goal_gate_pack(
     tag = label or f"goal-r{round_n}"
     name = f"{bearer_slice_id}-gate-{tag}.pack.md"
     path = PACKS / name
+    # Broker pickup is <slice>-gate-rN.md. Do not derive summary_out from the
+    # goal-prefixed pack filename (<slice>-gate-goal-rN.md).
+    out_base = str(summary_name or f"{bearer_slice_id}-gate-r{round_n}")
+    if out_base.endswith(".md"):
+        out_base = out_base[:-3]
     body = f"""---
 slice_id: {bearer_slice_id}
 goal: {goal_id}
@@ -3781,7 +3793,7 @@ round: {round_n}
 role: gate
 original_pack: {Path(bearer_pack_name).name}
 deferred_slices: {",".join(deferred_slice_ids)}
-summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_pack(name)}.md
+summary_out: $DSH_HOME/supervisor/thin-state/summaries/{out_base}.md
 max_bytes_hint: {MAX_PACK_BYTES}
 ---
 
@@ -4329,29 +4341,59 @@ def _parse_foreman_summary(summary_path: Path) -> dict:
     return {"block": block, "text": text}
 
 
+def _prose_gate_verdict(text: str) -> str:
+    """PASS or HOLD from prose. Empty when the text does not decide.
+
+    A body that says PASS must not become HOLD just because the prompt
+    template ``PASS|HOLD`` also appears. Both words left after that token is
+    stripped means the text is ambiguous — caller must not invent HOLD.
+    """
+    if not text or not text.strip():
+        return ""
+    m = re.search(r'"verdict"\s*:\s*"(PASS|HOLD)"', text, re.I)
+    if m:
+        return m.group(1).upper()
+    scrubbed = re.sub(r"PASS\s*\|\s*HOLD", " ", text, flags=re.I)
+    has_pass = bool(re.search(r"\bPASS\b", scrubbed))
+    has_hold = bool(re.search(r"\bHOLD\b", scrubbed))
+    if has_pass and not has_hold:
+        return VERDICT_PASS
+    if has_hold and not has_pass:
+        return VERDICT_HOLD
+    return ""
+
+
 def _parse_gate_verdict(summary_path: Path) -> dict:
-    text = summary_path.read_text(encoding="utf-8") if summary_path.is_file() else ""
+    exists = summary_path.is_file()
+    text = ""
+    if exists:
+        try:
+            text = summary_path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+            exists = False
     block = _extract_fenced_json(text) or {}
     verdict = str(block.get("verdict") or "").strip().upper()
-    if verdict not in (VERDICT_PASS, VERDICT_HOLD):
-        low = text.upper()
-        if "PASS" in low and "HOLD" not in low.split("PASS", 1)[0][-20:]:
-            # crude
-            if re.search(r"\bHOLD\b", text, re.I):
-                verdict = VERDICT_HOLD
-            elif re.search(r"\bPASS\b", text, re.I):
-                verdict = VERDICT_PASS
-            else:
-                verdict = VERDICT_HOLD
-        elif re.search(r"\bHOLD\b", text, re.I):
-            verdict = VERDICT_HOLD
-        elif re.search(r"\bPASS\b", text, re.I):
-            verdict = VERDICT_PASS
-        else:
-            verdict = VERDICT_HOLD
+    if verdict in (VERDICT_PASS, VERDICT_HOLD):
         block["verdict"] = verdict
     else:
-        block["verdict"] = verdict
+        prose = _prose_gate_verdict(text)
+        if prose:
+            block["verdict"] = prose
+            block["verdict_from_prose"] = True
+        else:
+            # No machine block and no unambiguous prose verdict. Do not invent
+            # HOLD with empty findings — that opens another impl round and
+            # hides a PASS that landed on a different path.
+            block.pop("verdict", None)
+            block["machine_block_missing"] = True
+            block["summary_exists"] = bool(exists and text.strip())
+            block["summary_path"] = str(summary_path)
+            if not exists or not text.strip():
+                block["notes"] = f"summary path missing: {summary_path}"
+            else:
+                block["notes"] = f"machine block missing: {summary_path}"
+            block["verdict"] = "question"
     if "findings" not in block or not isinstance(block.get("findings"), list):
         block["findings"] = block.get("findings") if isinstance(block.get("findings"), list) else []
     return {"block": block, "text": text}
@@ -4366,6 +4408,14 @@ def enforce_gate_verdict(block: dict) -> dict:
     block = dict(block or {})
     findings = block.get("findings") if isinstance(block.get("findings"), list) else []
     unmet = block.get("unmet_acceptance") if isinstance(block.get("unmet_acceptance"), list) else []
+    # Missing machine block is diagnosable. Do not coerce it to PASS (no
+    # blockers) or HOLD (the old empty-findings fallback).
+    if block.get("machine_block_missing") or str(block.get("verdict") or "").strip().lower() == "question":
+        block["machine_block_missing"] = True
+        block["verdict"] = "question"
+        block["findings"] = findings
+        block["unmet_acceptance"] = unmet if isinstance(unmet, list) else []
+        return block
     # also accept string unmet
     if isinstance(block.get("unmet_acceptance"), str) and block.get("unmet_acceptance").strip():
         unmet = [block["unmet_acceptance"].strip()]
@@ -4667,12 +4717,29 @@ def _adopt_misplaced_summary(expected: Path) -> bool:
     return expected.is_file()
 
 
+def _per_goal_gate_summary_alias(expected: Path) -> Path | None:
+    """Same-round sibling of a per_goal summary name.
+
+    New tickets write ``<slice>-gate-rN.md`` (the path the chain reads).
+    Older gates wrote ``<slice>-gate-goal-rN.md`` because summary_out was
+    derived from the pack filename. Either name resolves to the other.
+    """
+    stem = expected.name[:-3] if expected.name.endswith(".md") else expected.name
+    goal = re.sub(r"-gate-r(\d+(?:-\d+)*)$", r"-gate-goal-r\1", stem)
+    if goal != stem:
+        return expected.with_name(goal + ".md")
+    plain = re.sub(r"-gate-goal-r(\d+(?:-\d+)*)$", r"-gate-r\1", stem)
+    if plain != stem:
+        return expected.with_name(plain + ".md")
+    return None
+
+
 def _align_gate_summary_to_pack(pack_name: str, summary_name: str) -> tuple[str, Path]:
     """Read path follows the pack's ``summary_out``, not a parallel name.
 
-    per_goal packs are named ``<slice>-gate-goal-rN.pack.md`` and tell the
-    gate to write ``-gate-goal-rN.md``. The chain used to keep reading
-    ``-gate-rN.md``, miss the file, and record an empty HOLD.
+    New per_goal packs declare ``<slice>-gate-rN.md`` — the same basename the
+    chain passes to ``run_open_slice``. An older pack may still declare
+    ``-gate-goal-rN.md``; follow that file instead of ignoring it.
     """
     declared = _pack_declared_summary(pack_name)
     name = summary_name
@@ -4688,6 +4755,17 @@ def _resolve_written_gate_summary(expected: Path, slice_id: str) -> Path:
     _adopt_misplaced_summary(expected)
     if expected.is_file() and expected.stat().st_size > 0:
         return expected
+    alias = _per_goal_gate_summary_alias(expected)
+    if alias is not None:
+        try:
+            if alias.is_file() and alias.stat().st_size > 0:
+                print(
+                    f"[trial-broker] gate summary alias {expected.name} → {alias.name}",
+                    flush=True,
+                )
+                return alias
+        except OSError:
+            pass
     best: Path | None = None
     best_mtime = -1.0
     try:
@@ -7823,6 +7901,7 @@ def run_chain_rounds(
                         bearer_summary_text=parsed["text"],
                         cwd=cwd,
                         label=gate_label if gate_label.startswith("goal-") else f"goal-{gate_label}",
+                        summary_name=gate_summary_name,
                     )
                     round_rec["gate_mode"] = GE.GATE_POLICY_PER_GOAL
                 else:
@@ -7952,17 +8031,47 @@ def run_chain_rounds(
             print(f"[trial-broker] chain {slice_id} PASS outbox={out.name}", flush=True)
             return 0
 
+        # Unreadable gate summary (path missing or no machine block). Do not
+        # open a fix round — that replays the same empty HOLD. At max_rounds
+        # the salvage / supervisor park below still runs.
+        if gblock.get("machine_block_missing") and round_n < max_rounds:
+            note = str(gblock.get("notes") or f"summary path missing: {gate_summary}")
+            reason = (
+                "summary_path_missing"
+                if not gate_summary.is_file() or not gparsed["text"].strip()
+                else "machine_block_missing"
+            )
+            round_rec["verdict"] = "question"
+            chain["rounds"][-1] = round_rec
+            chain["state"] = "awaiting_supervisor"
+            chain["awaiting_reason"] = reason
+            chain["last_verdict"] = "question"
+            chain["error"] = note
+            _write_chain(chain)
+            _notify_awaiting_hub(
+                job, chain, reason=reason, block={"notes": note}, goal=goal_obj,
+            )
+            out = _terminal_outbox(job, chain, dest, ok=True)
+            print(
+                f"[trial-broker] chain {slice_id} question r{round_n} "
+                f"({reason}) outbox={out.name}",
+                flush=True,
+            )
+            return 0
+
         # HOLD
         if round_n >= max_rounds:
             # Salvage: the final-round gate timed out or wrote no usable
-            # summary (file absent / empty text → parse defaults to an empty
-            # HOLD with no findings and no unmet_acceptance). If this slice
-            # already has PASS evidence and the impl summary exists, closing
-            # failed here would falsely fail the whole Goal — adopt the prior
-            # PASS instead. A real HOLD (findings / unmet_acceptance) or a
-            # round without PASS evidence still escalates below.
+            # summary (file absent / empty text). That used to parse as an
+            # empty HOLD; it is now ``question`` with machine_block_missing.
+            # If this slice already has PASS evidence and the impl summary
+            # exists, adopt the prior PASS. A real HOLD (findings /
+            # unmet_acceptance) still goes to the supervisor below.
             gate_summary_missing = (
-                verdict == VERDICT_HOLD
+                (
+                    verdict == VERDICT_HOLD
+                    or bool(gblock.get("machine_block_missing"))
+                )
                 and not (gblock.get("findings") or [])
                 and not (gblock.get("unmet_acceptance") or [])
                 and (not gate_summary.is_file() or not gparsed["text"].strip())
@@ -8003,8 +8112,14 @@ def run_chain_rounds(
                     print(f"[trial-broker] chain {slice_id} PASS outbox={out.name}", flush=True)
                     return 0
             # Real HOLD at cap → supervisor decision (not mechanical escalate).
+            # An unreadable summary names the missing path instead of HOLD.
             hold_findings = list(gblock.get("findings") or [])
-            touch_reason = f"HOLD at max_rounds={max_rounds}"
+            if gblock.get("machine_block_missing"):
+                touch_reason = str(
+                    gblock.get("notes") or f"summary path missing: {gate_summary}"
+                )
+            else:
+                touch_reason = f"HOLD at max_rounds={max_rounds}"
             chain["rounds"][-1] = round_rec
             _write_chain(chain)
             outcome = handle_max_rounds_touch(

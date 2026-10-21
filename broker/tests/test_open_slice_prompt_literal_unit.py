@@ -200,6 +200,17 @@ def test_foreman_prompt_interpolates_cwd(sb: Sandbox):
     assert "@@CWD@@" not in prompt
 
 
+def test_gate_prompt_carries_the_review_caliber(sb: Sandbox):
+    # The 5-line caliber is frozen in broker GATE_PRINCIPLES_BLOCK; the shell
+    # path must render the same keywords (heading appears exactly once).
+    proc = sb.run_print_prompt("gate")
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout
+    for kw in ("P0–P1", "P2", "只读复核", "paused_limit", "28 步"):
+        assert kw in out, kw
+    assert out.count("## 审核原则") == 1
+
+
 @pytest.mark.parametrize("mode", MODES)
 def test_special_chars_in_cwd_are_inserted_literally(sb: Sandbox, mode: str):
     value = "/tmp/a&b $(touch x)"

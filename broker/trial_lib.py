@@ -119,6 +119,10 @@ def load_global_limits() -> dict:
                     table = data.get(key)
                     if isinstance(table, dict):
                         out[key] = dict(table)
+                # Gate soft cap: scalar, passed through as-is so role_step_budget
+                # can apply its own fallback chain (a bad value must not raise).
+                if "gate_max_steps" in data:
+                    out["gate_max_steps"] = data["gate_max_steps"]
                 return _migrate_legacy_prompt_wall(data, out)
         except (OSError, json.JSONDecodeError):
             pass
@@ -167,7 +171,18 @@ def max_concurrent_goals(limits: dict | None = None) -> int:
 DEFAULT_REASONING_EFFORT_BY_ROLE = {"supervisor": "high", "impl": "high", "gate": "high"}
 
 # Soft reminder only (>0 enables the plugin hint); never a hard kill.
-DEFAULT_STEP_BUDGET_BY_ROLE = {"supervisor": 30, "impl": 80, "gate": 60}
+# gate 28: at the soft cap the gate writes status=paused_limit (never a bare
+# HOLD) and hands the five-way choice back to the supervisor.
+DEFAULT_STEP_BUDGET_BY_ROLE = {"supervisor": 30, "impl": 80, "gate": 28}
+
+
+def _positive_int(raw) -> int | None:
+    """``raw`` as a positive int, else ``None`` (bad values never raise)."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def role_reasoning_effort(role: str | None, limits: dict | None = None) -> str | None:
@@ -186,20 +201,32 @@ def role_reasoning_effort(role: str | None, limits: dict | None = None) -> str |
 
 
 def role_step_budget(role: str | None, limits: dict | None = None) -> int:
-    """Step budget for ``role``; unknown role or bad value -> ``0`` (do not set)."""
+    """Step budget for ``role``; unknown role or bad value -> ``0`` (do not set).
+
+    Gate resolves in three levels — ``gate_max_steps`` -> ``step_budget_by_role``
+    -> the built-in default — because a gate without a cap cannot know when to
+    write ``paused_limit``. A bad gate value falls to the next level instead of
+    disabling the reminder. Other roles keep the legacy ``0`` (unset) on a bad
+    override.
+    """
     key = str(role or "").strip()
     if key not in DEFAULT_STEP_BUDGET_BY_ROLE:
         return 0
     if limits is None:
         limits = load_global_limits()
-    table = (limits or {}).get("step_budget_by_role")
+    limits = limits or {}
+    default = DEFAULT_STEP_BUDGET_BY_ROLE[key]
+    if key == "gate":
+        value = _positive_int(limits.get("gate_max_steps"))
+        if value is not None:
+            return value
+    table = limits.get("step_budget_by_role")
     if not isinstance(table, dict):
         table = {}
-    try:
-        value = int(table.get(key, DEFAULT_STEP_BUDGET_BY_ROLE[key]))
-    except (TypeError, ValueError):
-        return 0
-    return value if value > 0 else 0
+    value = _positive_int(table.get(key, default))
+    if value is not None:
+        return value
+    return default if key == "gate" else 0
 
 
 # ---------------------------------------------------------------------------

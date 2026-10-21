@@ -157,6 +157,19 @@ MAX_DIFF_BYTES = int(os.environ.get("TRIAL_MAX_DIFF_BYTES", "6144"))
 PROD_BROKER = DSH_HOME / "broker-khub-prod"
 PROD_RESTART = DSH_HOME / "bin" / "khub-broker-restart.sh"
 
+# Gate review caliber (slice dsh-gate-ab-20261021-s2): one authoritative 5-line
+# block, injected verbatim both by open-slice.sh (PROMPT_MODE=gate) and by the
+# gate packs written below. Wording is frozen — do not re-litigate it per round.
+GATE_SOFT_MAX_STEPS = 28
+
+GATE_PRINCIPLES_BLOCK = f"""## 审核原则
+- 只核三件事：pack Done-when / 设计对齐 / P0–P1；其余细节不审。
+- 只有 P2 时判 PASS，P2 写进 findings 备注，不得因 P2 HOLD。
+- 工头摘要已有同命令结果则只读复核，不重跑。
+- 全量回归交 CI；定点测试缺证据才补跑一次。
+- 到约 {GATE_SOFT_MAX_STEPS} 步仍未定论：summary 写 status=paused_limit（勿空 HOLD），交监理五选一。"""
+
+
 FOREMAN_STATUS_DONE = "done"
 FOREMAN_STATUS_BLOCKED = "blocked"
 FOREMAN_STATUS_QUESTION = "question"
@@ -1383,6 +1396,12 @@ def _spawn_env(
         env["DSH_STEP_BUDGET"] = str(budget)
     else:
         env.pop("DSH_STEP_BUDGET", None)
+    # Gate: surface the same soft cap under its own name so the prompt/plugin can
+    # say "~N steps -> paused_limit" without re-deriving the role table.
+    if str(role or "").strip() == "gate" and budget > 0:
+        env["DSH_GATE_MAX_STEPS"] = str(budget)
+    else:
+        env.pop("DSH_GATE_MAX_STEPS", None)
     env.pop("NEW_API_KEY", None)
     # hub-mount-b s2: inject HUB_* only from the goal's hub binding. The four
     # keys are cleared unconditionally (inherited dirt included) and re-set
@@ -3184,6 +3203,8 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
 ## Foreman notes
 {notes_text}
 
+{GATE_PRINCIPLES_BLOCK}
+
 ## Done when
 - Delta-only: verify prior findings fixed; note any new P0/P1.
 - 禁止通读全文件/原 pack/全仓；只核对上述 diff 与 FAIL 清单，必要时 sed -n 小段。
@@ -3538,6 +3559,8 @@ max_bytes_hint: {MAX_PACK_BYTES}
 ```diff
 {diff}
 ```
+
+{GATE_PRINCIPLES_BLOCK}
 
 ## Done when
 - Write verdict to summary_out with machine json block (verdict PASS|HOLD + findings).

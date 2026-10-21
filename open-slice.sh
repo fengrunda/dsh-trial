@@ -396,20 +396,25 @@ fi
 
 # 三层测试口径热注入：foreman/gate 只跑 pack 列出的定点测试，全量交 CI。
 # 逻辑在 broker/pytest_scope.py，每张票重新执行本脚本即热生效；DSH_TEST_POLICY=0 可关闭。
+# --print-prompt 是纯 dry-run（不落盘、不跑子进程），故跳过本段以免 git ls-files 探针。
 if [[ ( "$PROMPT_MODE" == "foreman" || "$PROMPT_MODE" == "gate" ) \
-      && "${DSH_TEST_POLICY:-1}" != "0" ]]; then
+      && "${DSH_TEST_POLICY:-1}" != "0" && "$PRINT_PROMPT" -eq 0 ]]; then
   _test_policy="$(python3 "$(dirname "$0")/broker/pytest_scope.py" --mode "$PROMPT_MODE" "$PACK_ABS" "$CWD" 2>/dev/null || true)"
   if [[ -n "$_test_policy" ]]; then
     PROMPT="$PROMPT"$'\n\n'"$_test_policy"
   fi
 fi
 
-# 审核原则短注入（Runda 18:04）：只补注意力/轮次口径，不重写人格；DSH_GATE_PRINCIPLES=0 可关。
+# 审核口径唯一权威 5 条（dsh-gate-ab-20261021-s2）：与 broker GATE_PRINCIPLES_BLOCK
+# 逐字一致（tests/test_gate_prompt_caliber_unit.py 锁住）。一次定稿，勿逐轮改措辞。
+# 只补注意力/轮次口径，不重写人格；DSH_GATE_PRINCIPLES=0 可关。
 if [[ "$PROMPT_MODE" == "gate" && "${DSH_GATE_PRINCIPLES:-1}" != "0" ]]; then
-  PROMPT="$PROMPT"$'\n\n''## 审核原则（Runda 18:04）
-- 注意力不丢、不偏、符合设计即可；不反复挑细节。
-- 小改动一般一轮审完；仅有 P2 时 PASS，findings 里附备注。
-- 工头已跑的定点测试只读复核，不必重跑。'
+  PROMPT="$PROMPT"$'\n\n''## 审核原则
+- 只核三件事：pack Done-when / 设计对齐 / P0–P1；其余细节不审。
+- 只有 P2 时判 PASS，P2 写进 findings 备注，不得因 P2 HOLD。
+- 工头摘要已有同命令结果则只读复核，不重跑。
+- 全量回归交 CI；定点测试缺证据才补跑一次。
+- 到约 28 步仍未定论：summary 写 status=paused_limit（勿空 HOLD），交监理五选一。'
 fi
 
 if [[ "$PRINT_PROMPT" -eq 1 ]]; then

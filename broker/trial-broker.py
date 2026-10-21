@@ -2699,7 +2699,7 @@ def gate_job_timeout_sec(lim: dict | None = None) -> int:
 
     ``TRIAL_BROKER_JOB_TIMEOUT`` env override wins if set; otherwise it is
     ``ask_supervisor_timeout_sec + prompt_timeout_sec + 120`` (defaults
-    600 + 3600 + 120 = 4320). The plugin must wait **at least** this long
+    600 + 1800 + 120 = 2520). The plugin must wait **at least** this long
     (``gateTimeoutSec``) before declaring a gate answer missing: the broker only
     writes the final ``answers/<ask_id>.json`` after the gate short-ticket
     exits.

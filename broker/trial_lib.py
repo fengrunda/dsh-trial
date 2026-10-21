@@ -33,12 +33,12 @@ DEFAULT_LIMITS = {
     "max_gate_rounds": 2,
     "ask_supervisor_timeout_sec": 600,
     "ask_supervisor_poll_ms": 2000,
-    # Hard wall clock for one session/prompt (1h). Idle resets on ACP stdout;
+    # Hard wall clock for one session/prompt (30m). Idle resets on ACP stdout;
     # this cap still reaps a hung agent so it cannot hold the broker forever.
-    "prompt_timeout_sec": 3600,
-    # Soft wall / idle: no ACP stdout for 30m → paused_wallclock (G1 five-way).
+    "prompt_timeout_sec": 1800,
+    # Soft wall / idle: no ACP stdout for 15m → paused_wallclock (G1 five-way).
     # Above ask_supervisor_timeout_sec so a full supervisor wait is not a hang.
-    "prompt_idle_timeout_sec": 1800,
+    "prompt_idle_timeout_sec": 900,
     "inplace_rework_max_prompt": 20000,
     "inplace_rework_max_findings": 3,
     # Soft reference for impl/foreman prompt discipline (default 30).

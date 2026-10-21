@@ -326,3 +326,27 @@ def test_review_name_helpers_are_symmetric(tmp_path: Path):
         )
         (tb.SUMMARIES / f"{slice_id}-gate-rev2.md").write_text("old\n", encoding="utf-8")
         assert tb._unique_review_names(slice_id, "rev2")[1] == f"{slice_id}-gate-rev2-2"
+
+
+def test_per_goal_summary_alias_is_the_verdict(tmp_path: Path):
+    """Broker reads -gate-rN; per_goal gate writes -gate-goal-rN. Use the written file."""
+    slice_id = "unit-gate-goal-alias"
+    with _patched_dirs(tmp_path / "state"):
+        pack = tb.PACKS / f"{slice_id}-gate-goal-r1.pack.md"
+        pack.write_text(
+            "---\n"
+            f"summary_out: /x/summaries/{slice_id}-gate-goal-r1.md\n"
+            "---\n# goal gate\n",
+            encoding="utf-8",
+        )
+        name, path = tb._align_gate_summary_to_pack(pack.name, f"{slice_id}-gate-r1")
+        assert name == f"{slice_id}-gate-goal-r1"
+        assert path.name == f"{slice_id}-gate-goal-r1.md"
+
+        expected = tb.SUMMARIES / f"{slice_id}-gate-r1.md"
+        written = tb.SUMMARIES / f"{slice_id}-gate-goal-r1.md"
+        _write_summary(written, {"verdict": "PASS", "findings": []})
+        found = tb._resolve_written_gate_summary(expected, slice_id)
+        assert found == written
+        parsed = tb._parse_gate_verdict(found)
+        assert parsed["block"]["verdict"] == "PASS"

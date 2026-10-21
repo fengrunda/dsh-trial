@@ -6,7 +6,8 @@ Covered here:
      pack carries the 禁止通读 ban (and the 上轮 FAIL 清单 heading);
   c. once ``gate_rounds_by_slice[slice]`` reaches the cap,
      ``_handle_submit_for_review`` spawns no gate (``run_open_slice`` not
-     called) and answers HOLD + escalate.
+     called), parks the Goal at ``awaiting_supervisor`` and lets the
+     supervisor decide inplace(+1) | split | escalate.
 """
 from __future__ import annotations
 
@@ -108,44 +109,194 @@ def test_delta_pack_uses_base_sha(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# c. round cap: no gate spawn, HOLD + escalate answer
+# c. round cap: no gate spawn, park at awaiting_supervisor, supervisor decides
 # --------------------------------------------------------------------------
-def test_gate_round_cap_escalates_without_spawning(tmp_path):
+def _cap_ask(tmp_path: Path, name: str = "ask-cap") -> tuple[dict, Path]:
     summary = tmp_path / "impl-summary.md"
     summary.write_text("done\n", encoding="utf-8")
     ask_path = tmp_path / "ask.json"
     ask_path.write_text("{}", encoding="utf-8")
+    ask = {
+        "ask_id": name,
+        "slice": "s1",
+        "summary_path": str(summary),
+        "changed_files": [],
+    }
+    return ask, ask_path
+
+
+def _run_cap(tmp_path, goal, decision=None, *, name="ask-cap", chain=None):
+    ask, ask_path = _cap_ask(tmp_path, name)
+    with _patched_dirs(tmp_path / "state") as dirs:
+        if chain is not None:
+            (dirs["chains"] / f"{chain['slice']}.json").write_text(
+                json.dumps(chain), encoding="utf-8"
+            )
+        with mock.patch.object(
+            tb, "run_open_slice",
+            side_effect=AssertionError("run_open_slice must not be called"),
+        ), mock.patch.object(
+            tb, "auto_supervisor_max_rounds_decision", return_value=decision,
+        ) as auto, mock.patch.object(tb, "_notify_awaiting_hub") as notify:
+            tb._handle_submit_for_review(
+                ask, ask_path, default_profile="default",
+                cwd=str(tmp_path), goal=goal,
+            )
+        ans = json.loads(
+            (tb.MAILBOX / "answers" / f"{name}.json").read_text(encoding="utf-8")
+        )
+    return ans, auto, notify
+
+
+def test_gate_round_cap_parks_awaiting_supervisor(tmp_path):
     goal = {
         "goal": "g1",
         "slice": "s1",
         "gate_rounds_by_slice": {"s1": 2},
         "review_seq": 2,
     }
-    ask = {
-        "ask_id": "ask-cap",
-        "slice": "s1",
-        "summary_path": str(summary),
-        "changed_files": [],
-    }
-    with _patched_dirs(tmp_path / "state"):
-        with mock.patch.object(
-            tb, "run_open_slice",
-            side_effect=AssertionError("run_open_slice must not be called"),
-        ):
-            tb._handle_submit_for_review(
-                ask, ask_path, default_profile="default",
-                cwd=str(tmp_path), goal=goal,
-            )
-        ans = json.loads(
-            (tb.MAILBOX / "answers" / "ask-cap.json").read_text(encoding="utf-8")
-        )
+    ans, auto, notify = _run_cap(tmp_path, goal)
+
     assert ans["status"] == "done"
     assert ans["ok"] is False
     assert ans["verdict"] == "HOLD"
-    assert ans.get("escalate") is True
-    assert ans.get("rework_mode") == "escalate"
+    assert ans["rework_mode"] == "supervisor"
+    assert ans.get("escalate") is False
+    assert ans.get("awaiting_reason") == "max_gate_rounds"
     assert "max_gate_rounds=2" in ans["instruction"]
-    # goal flagged for the supervisor, and PASS must never be set
-    assert goal.get("gate_escalated") is True
-    assert "max_gate_rounds=2 reached slice=s1" == goal.get("escalate_reason")
+
+    # parked, not escalated: no hard-escalate bookkeeping, no round spent
     assert goal.get("status") != "PASS"
+    assert goal["last_chain_state"] == "awaiting_supervisor"
+    assert goal["awaiting_reason"] == "max_gate_rounds"
+    assert "escalate_reason" not in goal
+    assert "gate_escalated" not in goal
+    assert goal["gate_rounds_by_slice"] == {"s1": 2}
+    assert goal["max_gate_rounds_decision_pending"]["ticket_opened"] is False
+
+    # decision was attempted once, for the gate-cap kind; parked => no Hub wake
+    auto.assert_called_once()
+    assert auto.call_args.kwargs["kind"] == "max_gate_rounds"
+    assert auto.call_args.kwargs["max_rounds"] == 2
+    notify.assert_not_called()
+
+
+def test_gate_round_cap_syncs_existing_chain(tmp_path):
+    goal = {
+        "goal": "g1",
+        "slice": "s1",
+        "gate_rounds_by_slice": {"s1": 2},
+        "review_seq": 2,
+    }
+    chain = {"slice": "s1", "goal": "g1", "state": "running", "pack": "s1.pack.md"}
+    _run_cap(tmp_path, goal, chain=chain)
+    saved = json.loads(
+        (tmp_path / "state" / "chains" / "s1.json").read_text(encoding="utf-8")
+    )
+    assert saved["state"] == "awaiting_supervisor"
+    assert saved["awaiting_reason"] == "max_gate_rounds"
+    assert saved["awaiting_answer_for_round"] == 3
+
+
+def test_gate_round_cap_inplace_grants_one_bonus_round(tmp_path):
+    goal = {
+        "goal": "g1",
+        "slice": "s1",
+        "gate_rounds_by_slice": {"s1": 2},
+        "review_seq": 2,
+    }
+    ans, _, notify = _run_cap(tmp_path, goal, "inplace", name="ask-inplace")
+
+    assert goal["max_gate_rounds_by_slice"]["s1"] == 3
+    assert goal["max_gate_rounds_bonus_used"]["s1"] is True
+    assert goal["status"] == "running"
+    assert "awaiting_reason" not in goal
+    assert "max_gate_rounds_decision_pending" not in goal
+    assert ans["rework_mode"] == "inplace"
+    assert ans.get("escalate") is False
+    assert "awaiting_reason" not in ans
+    assert "3" in ans["instruction"]
+    notify.assert_not_called()
+
+
+def test_gate_round_cap_second_inplace_escalates(tmp_path):
+    goal = {
+        "goal": "g1",
+        "slice": "s1",
+        "gate_rounds_by_slice": {"s1": 3},
+        "review_seq": 3,
+        "max_gate_rounds_by_slice": {"s1": 3},
+        "max_gate_rounds_bonus_used": {"s1": True},
+    }
+    ans, _, notify = _run_cap(tmp_path, goal, "inplace", name="ask-inplace2")
+
+    assert goal["status"] == "escalated"
+    assert goal["gate_escalated"] is True
+    assert goal["escalate_reason"] == "max_gate_rounds=3 reached slice=s1 (supervisor)"
+    assert goal["max_gate_rounds_by_slice"]["s1"] == 3
+    assert ans["rework_mode"] == "escalate"
+    assert ans.get("escalate") is True
+    notify.assert_called_once()
+
+
+def test_gate_round_cap_split_stays_resumable(tmp_path):
+    goal = {
+        "goal": "g1",
+        "slice": "s1",
+        "gate_rounds_by_slice": {"s1": 2},
+        "review_seq": 2,
+    }
+    ans, _, notify = _run_cap(tmp_path, goal, "split", name="ask-split")
+
+    assert goal["status"] == "running"
+    assert goal["awaiting_reason"] == "max_gate_rounds_split"
+    assert goal["supervisor_decision"]["decision"] == "split"
+    assert ans["rework_mode"] == "split"
+    assert ans.get("escalate") is False
+    assert ans.get("awaiting_reason") == "max_gate_rounds_split"
+    assert "escalate_reason" not in goal
+    notify.assert_not_called()
+
+
+def test_gate_round_cap_escalate_notifies_once(tmp_path):
+    goal = {
+        "goal": "g1",
+        "slice": "s1",
+        "gate_rounds_by_slice": {"s1": 2},
+        "review_seq": 2,
+    }
+    ans, _, notify = _run_cap(tmp_path, goal, "escalate", name="ask-esc")
+
+    assert goal["status"] == "escalated"
+    assert goal["gate_escalated"] is True
+    assert goal["escalate_reason"] == "max_gate_rounds=2 reached slice=s1 (supervisor)"
+    assert ans["rework_mode"] == "escalate"
+    assert ans.get("escalate") is True
+    notify.assert_called_once()
+    assert notify.call_args.kwargs["reason"] == "max_gate_rounds"
+
+
+def test_gate_cap_reached_honours_slice_override():
+    goal = {
+        "goal": "g1",
+        "gate_rounds_by_slice": {"s1": 2},
+        "max_gate_rounds_by_slice": {"s1": 3},
+    }
+    assert tb._gate_cap_reached(goal, "s1", {"max_gate_rounds": 2}) == (False, 3)
+    assert tb._gate_cap_reached(goal, "s1", {"max_gate_rounds": 1}) == (False, 3)
+    assert tb._gate_cap_reached(None, "s1", {"max_gate_rounds": 2}) == (False, 2)
+
+
+def test_build_supervisor_pack_gate_kind(tmp_path):
+    with _patched_dirs(tmp_path / "state"):
+        name = tb.build_supervisor_max_rounds_pack(
+            slice_id="s1", round_n=2, max_rounds=3, findings=[],
+            reason="cap", goal_id="g1", pending_pack="s1.pack.md",
+            bonus_used=False, kind="max_gate_rounds",
+        )
+        body = (tb.PACKS / name).read_text(encoding="utf-8")
+    assert name == "s1-maxrounds-r2.pack.md"
+    assert "kind: supervisor-max-gate-rounds" in body
+    assert "max_gate_rounds: 3" in body
+    assert "Supervisor max_gate_rounds decision" in body
+    assert "sup-maxgaterounds-r2" in body

@@ -2071,6 +2071,75 @@ def _submit_precheck(ask: dict, goal: dict | None, slice_id: str) -> str | None:
     )
 
 
+def _gate_cap_reached(goal: dict | None, slice_id: str, limits: dict | None) -> tuple[bool, int]:
+    """``(hits_cap, cap)`` for the per-slice gate round cap.
+
+    ``max_gate_rounds_by_slice[slice]`` (a supervisor inplace bonus) wins over
+    the global limit; a missing Goal can never be at the cap.
+    """
+    lim = limits if isinstance(limits, dict) else {}
+    g = goal if isinstance(goal, dict) else {}
+    cap = int(
+        (g.get("max_gate_rounds_by_slice") or {}).get(slice_id)
+        or lim.get("max_gate_rounds")
+        or 2
+    )
+    rounds = int((g.get("gate_rounds_by_slice") or {}).get(slice_id) or 0)
+    return (bool(g) and rounds >= cap), cap
+
+
+def _park_gate_awaiting_supervisor(
+    goal: dict,
+    slice_id: str,
+    *,
+    cap: int,
+    round_n: int,
+    cwd: str,
+    profile: str,
+) -> dict:
+    """Park the Goal at ``awaiting_supervisor`` for a max_gate_rounds decision.
+
+    Returns a minimal synthetic job so the caller can open the supervisor
+    short ticket; no real chain job exists for ``submit_for_review``.
+    """
+    goal_id = str(goal.get("goal") or "")
+    if str(goal.get("status") or "") not in {"done", "failed", "cancelled", "escalated"}:
+        goal["status"] = "running"
+    goal["last_chain_state"] = "awaiting_supervisor"
+    goal["awaiting_reason"] = "max_gate_rounds"
+    for key in (
+        "escalate_reason",
+        "gate_escalated",
+        "error",
+        "pending_rework_mode",
+        "pending_rework_ask_id",
+    ):
+        goal.pop(key, None)
+    goal["max_gate_rounds_decision_pending"] = {
+        "at": _iso(),
+        "slice": slice_id,
+        "cap": cap,
+        "round_n": round_n,
+        "ticket_opened": False,
+    }
+    # Sync the chain only when it already exists and belongs to this Goal —
+    # never create a chain just to express the pending decision.
+    chain = None
+    chain_path = CHAINS / f"{slice_id}.json"
+    try:
+        if chain_path.is_file():
+            chain = json.loads(chain_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        chain = None
+    if isinstance(chain, dict) and str(chain.get("goal") or "") == goal_id:
+        chain["state"] = "awaiting_supervisor"
+        chain["awaiting_reason"] = "max_gate_rounds"
+        chain["awaiting_answer_for_round"] = round_n
+        _write_chain(chain)
+    _write_goal(goal)
+    return {"goal": goal_id, "cwd": cwd, "supervisor_profile": profile}
+
+
 def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cwd: str, goal: dict | None) -> None:
     """Open delta gate short-ticket; write PASS/HOLD(+rework_mode) answer for submit_for_review."""
     t0 = time.monotonic()  # 处理耗时 → wait_ms / by_kind.wait_ms_total
@@ -2122,27 +2191,30 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
         round_n = int(goal.get("review_seq") or 0) + 1
 
     # Gate round cap per slice: beyond max_gate_rounds there is no pack and no
-    # gate spawn — the ticket is escalated to the supervisor instead.
-    max_gate = int(lim.get("max_gate_rounds") or 2)
-    gate_rounds = (goal or {}).get("gate_rounds_by_slice") or {}
-    if goal is not None and int(gate_rounds.get(slice_id) or 0) >= max_gate:
+    # gate spawn — the ticket parks at awaiting_supervisor and a supervisor
+    # short ticket decides inplace(+1) | split | escalate. A mechanical
+    # escalate here is forbidden: 触顶是决策点，不是失败点.
+    hits_cap, max_gate = _gate_cap_reached(goal, slice_id, lim)
+    if hits_cap:
         instruction = (
-            f"gate 轮数已达 max_gate_rounds={max_gate}，停止 rework，"
-            "写 summary(status=blocked) 结束票，交监理"
+            f"gate 轮数已达 max_gate_rounds={max_gate}，已转监理决策"
+            "（inplace/split/escalate）；先写 summary(status=blocked) 结束票，勿再改代码"
         )
         (MAILBOX / "answers").mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(
-            MAILBOX / "answers" / f"{ask_id}.json",
-            {
-                "ask_id": ask_id,
-                "status": "done",
-                "ok": False,
-                "verdict": "HOLD",
-                "rework_mode": "escalate",
-                "escalate": True,
-                "instruction": instruction,
-            },
-        )
+        answer_path = MAILBOX / "answers" / f"{ask_id}.json"
+        answer = {
+            "ask_id": ask_id,
+            "status": "done",
+            "ok": False,
+            "verdict": "HOLD",
+            "rework_mode": "supervisor",
+            "escalate": False,
+            "awaiting_reason": "max_gate_rounds",
+            "instruction": instruction,
+        }
+        # Write the parked answer first; inplace/escalate atomically overwrite
+        # it below so only the final verdict survives on disk.
+        _atomic_write_json(answer_path, answer)
         # archive pending, exactly like the precheck path
         try:
             arch = MAILBOX / "archive"
@@ -2151,14 +2223,142 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                 path.rename(arch / f"{ask_id}.pending.json")
         except OSError:
             pass
-        goal["escalate_reason"] = f"max_gate_rounds={max_gate} reached slice={slice_id}"
-        goal["gate_escalated"] = True
-        _write_goal(goal)
-        print(
-            f"[trial-broker] submit_for_review escalated {ask_id} "
-            f"slice={slice_id} gate_rounds>={max_gate}",
-            flush=True,
+
+        job = _park_gate_awaiting_supervisor(
+            goal, slice_id, cap=max_gate, round_n=round_n, cwd=cwd,
+            profile=default_profile,
         )
+        reason = f"gate 轮数触顶 max_gate_rounds={max_gate} slice={slice_id}"
+        pack_ref = str(goal.get("current_pack") or f"{slice_id}.pack.md")
+        fake_chain = {
+            "slice": slice_id,
+            "goal": str(goal.get("goal") or ""),
+            "cwd": cwd,
+            "pack": pack_ref,
+            "pending_impl_pack": pack_ref,
+            "max_rounds_bonus_used": bool(
+                (goal.get("max_gate_rounds_bonus_used") or {}).get(slice_id)
+            ),
+            "supervisor_events": list(goal.get("supervisor_events") or []),
+        }
+        decision = None
+        try:
+            decision = auto_supervisor_max_rounds_decision(
+                job,
+                fake_chain,
+                round_n=round_n,
+                max_rounds=max_gate,
+                findings=list(goal.get("last_gate_findings") or []),
+                reason=reason,
+                goal=goal,
+                kind="max_gate_rounds",
+            )
+        except Exception as e:  # noqa: BLE001 — parked beats a crash
+            print(f"[trial-broker] gate max_gate_rounds supervisor error: {e}", flush=True)
+            decision = None
+        events = list(fake_chain.get("supervisor_events") or [])
+        if events:
+            goal["supervisor_events"] = events
+        pending = goal.get("max_gate_rounds_decision_pending")
+        if isinstance(pending, dict):
+            pending["ticket_opened"] = bool(events)
+
+        if decision == "inplace" and (goal.get("max_gate_rounds_bonus_used") or {}).get(slice_id):
+            print("[trial-broker] gate inplace refused (bonus already used)", flush=True)
+            decision = "escalate"
+
+        if decision == "inplace":
+            goal.setdefault("max_gate_rounds_by_slice", {})[slice_id] = max_gate + 1
+            goal.setdefault("max_gate_rounds_bonus_used", {})[slice_id] = True
+            goal["status"] = "running"
+            goal["last_chain_state"] = "running"
+            goal.pop("awaiting_reason", None)
+            goal.pop("max_gate_rounds_decision_pending", None)
+            goal["supervisor_decision"] = {
+                "decision": "inplace",
+                "slice": slice_id,
+                "at": _iso(),
+                "new_cap": max_gate + 1,
+                "reason": reason,
+            }
+            answer["rework_mode"] = "inplace"
+            answer["escalate"] = False
+            answer.pop("awaiting_reason", None)
+            answer["instruction"] = (
+                f"监理已批 +1 轮（max_gate_rounds → {max_gate + 1}），"
+                "可重新 submit_for_review"
+            )
+            print(
+                f"[trial-broker] gate cap inplace {slice_id} → {max_gate + 1}",
+                flush=True,
+            )
+        elif decision == "split":
+            goal["status"] = "running"
+            goal["last_chain_state"] = "awaiting_supervisor"
+            goal["awaiting_reason"] = "max_gate_rounds_split"
+            goal.pop("max_gate_rounds_decision_pending", None)
+            goal["supervisor_decision"] = {
+                "decision": "split",
+                "slice": slice_id,
+                "at": _iso(),
+                "reason": reason,
+            }
+            answer["rework_mode"] = "split"
+            answer["escalate"] = False
+            answer["awaiting_reason"] = "max_gate_rounds_split"
+            answer["instruction"] = (
+                f"监理决定 split（max_gate_rounds={max_gate}）：本 slice 拆分收口，"
+                "写 summary 结束票"
+            )
+            print(
+                f"[trial-broker] gate cap split {slice_id} (r{round_n}/{max_gate})",
+                flush=True,
+            )
+        elif decision == "escalate":
+            goal["escalate_reason"] = (
+                f"max_gate_rounds={max_gate} reached slice={slice_id} (supervisor)"
+            )
+            goal["gate_escalated"] = True
+            goal["status"] = "escalated"
+            goal["last_chain_state"] = "escalated"
+            goal.pop("max_gate_rounds_decision_pending", None)
+            goal["supervisor_decision"] = {
+                "decision": "escalate",
+                "slice": slice_id,
+                "at": _iso(),
+                "reason": reason,
+            }
+            answer["rework_mode"] = "escalate"
+            answer["escalate"] = True
+            answer["instruction"] = (
+                f"监理决定 escalate（max_gate_rounds={max_gate}）："
+                "写 summary(status=blocked) 结束票"
+            )
+            try:
+                _notify_awaiting_hub(
+                    job,
+                    {
+                        "slice": slice_id,
+                        "goal": str(goal.get("goal") or ""),
+                        "state": "awaiting_supervisor",
+                    },
+                    reason="max_gate_rounds",
+                    block={
+                        "notes": reason,
+                        "questions": ["max_gate_rounds: inplace|split|escalate"],
+                    },
+                    goal=goal,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[trial-broker] gate max_gate_rounds notify error: {e}", flush=True)
+        else:
+            print(
+                f"[trial-broker] gate cap parked {slice_id} (r{round_n}/{max_gate})",
+                flush=True,
+            )
+
+        _atomic_write_json(answer_path, answer)
+        _write_goal(goal)
         return
 
     # Build a gate pack: delta-only when prior findings exist on goal/chain
@@ -4818,8 +5018,10 @@ def build_supervisor_max_rounds_pack(
     pending_pack: str,
     bonus_used: bool,
     wip_tip: str = "",
+    kind: str = "max_rounds",
 ) -> str:
-    """Pack for the max_rounds supervisor decision short ticket."""
+    """Pack for the max_rounds / max_gate_rounds supervisor decision short ticket."""
+    gate_cap = kind == "max_gate_rounds"
     name = f"{slice_id}-maxrounds-r{round_n}.pack.md"
     path = PACKS / name
     # Prefer P0, keep pack small.
@@ -4828,19 +5030,23 @@ def build_supervisor_max_rounds_pack(
         key=lambda f: (0 if str((f or {}).get("tier") or "").upper() == "P0" else 1),
     )
     excerpt = ranked[:12]
+    kind_line = "supervisor-max-gate-rounds" if gate_cap else "supervisor-max-rounds"
+    cap_line = f"max_gate_rounds: {max_rounds}\n" if gate_cap else ""
+    title = "max_gate_rounds" if gate_cap else "max_rounds"
+    summary_tag = "sup-maxgaterounds" if gate_cap else "sup-maxrounds"
     body = f"""---
-kind: supervisor-max-rounds
+kind: {kind_line}
 slice_id: {slice_id}
 round: {round_n}
 max_rounds: {max_rounds}
-goal: {goal_id or ''}
+{cap_line}goal: {goal_id or ''}
 pending_impl_pack: {pending_pack}
 bonus_used: {str(bool(bonus_used)).lower()}
 wip_tip: {wip_tip}
-summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-sup-maxrounds-r{round_n}.md
+summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-{summary_tag}-r{round_n}.md
 ---
 
-# Supervisor max_rounds decision · {slice_id} · r{round_n}/{max_rounds}
+# Supervisor {title} decision · {slice_id} · r{round_n}/{max_rounds}
 
 触顶是决策点，不是失败点。禁止机械 escalate。返工≠hang。
 
@@ -4901,8 +5107,10 @@ def auto_supervisor_max_rounds_decision(
     findings: list,
     reason: str,
     goal: dict | None = None,
+    kind: str = "max_rounds",
 ) -> str | None:
     """Open supervisor short ticket; return inplace|split|escalate or None."""
+    gate_cap = kind == "max_gate_rounds"
     goal_id = job.get("goal") or chain.get("goal")
     if goal is None and goal_id:
         goal = _read_goal(goal_id)
@@ -4925,9 +5133,12 @@ def auto_supervisor_max_rounds_decision(
         pending_pack=str(chain.get("pending_impl_pack") or chain.get("pack") or ""),
         bonus_used=bonus_used,
         wip_tip=str(chain.get("wip_tip") or (goal or {}).get("wip_tip") or ""),
+        kind=kind,
     )
-    ticket = f"supervisor-maxrounds-{chain['slice']}-r{round_n}"
-    summary_name = f"{chain['slice']}-sup-maxrounds-r{round_n}"
+    ticket_tag = "supervisor-maxgaterounds" if gate_cap else "supervisor-maxrounds"
+    summary_tag = "sup-maxgaterounds" if gate_cap else "sup-maxrounds"
+    ticket = f"{ticket_tag}-{chain['slice']}-r{round_n}"
+    summary_name = f"{chain['slice']}-{summary_tag}-r{round_n}"
     profile = str(
         job.get("supervisor_profile")
         or (goal or {}).get("supervisor_profile")

@@ -1,5 +1,11 @@
 # dsh运维 交接（2026-10-12 14:52 Asia/Shanghai）
 
+## 2026-10-21 max_gate_rounds 触顶与 max_rounds 同轨
+- gate_rounds_by_slice 触顶不再机械 escalate：Goal 停 awaiting_supervisor（awaiting_reason=max_gate_rounds），
+  自动开监理决策短票 inplace(+1 有界) / split / escalate；工头随后写的 summary(status=blocked) 同样留在该决策道（不 notify Hub、不重开票）。
+- 只有真 escalate 才 notify Hub；parked/split 不留 dsh-trial-awaiting-hub 事件。
+- inplace 只抬本 slice 帽（goal.max_gate_rounds_by_slice），全局 DEFAULT_LIMITS.max_gate_rounds 不动。
+
 ## 现状
 - 代码：/workspace/dsh-trial（fengrunda/dsh-trial），main 见本提交；parent 185976c。本提交：newapicy1 adapter 修复笔记 + Hub salvage。
 - 进程：trial-broker pid 1470231（`broker/trial-broker.py --poll 20`），trial-watchdog pid 1470279（`--loop --interval 60`）；pid 文件 ~/.dsh/broker-dsh-trial/trial-broker.pid / trial-watchdog.pid。DSH_HOME=/home/box/.dsh。

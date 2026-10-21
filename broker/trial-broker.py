@@ -2088,6 +2088,231 @@ def _gate_cap_reached(goal: dict | None, slice_id: str, limits: dict | None) -> 
     return (bool(g) and rounds >= cap), cap
 
 
+def _blocked_from_gate_cap(chain: dict | None, goal: dict | None = None) -> bool:
+    """True when the current ``status=blocked`` was produced by the gate cap.
+
+    A capped ``submit_for_review`` answers ``HOLD rework_mode=supervisor`` with
+    ``awaiting_reason=max_gate_rounds`` and leaves a decision-pending marker;
+    the foreman then ends the ticket with ``summary(status=blocked)``. That
+    blocked belongs to the supervisor decision lane — it must not be treated
+    as a generic block (no Hub chain-reply wake) and must not be escalated.
+    """
+    c = chain if isinstance(chain, dict) else {}
+    g = goal if isinstance(goal, dict) else {}
+    if str(c.get("awaiting_reason") or "") == "max_gate_rounds":
+        return True
+    if c.get("max_gate_rounds_decision_pending") is not None:
+        return True
+    return str(g.get("awaiting_reason") or "") == "max_gate_rounds"
+
+
+def _gate_cap_decision_ticket_opened(goal: dict | None) -> bool:
+    pending = (goal or {}).get("max_gate_rounds_decision_pending")
+    return isinstance(pending, dict) and bool(pending.get("ticket_opened"))
+
+
+def _open_gate_cap_decision_once(
+    job: dict,
+    chain: dict | None,
+    goal: dict | None,
+    *,
+    slice_id: str,
+    round_n: int,
+    cap: int,
+    reason: str,
+) -> bool:
+    """Open the max_gate_rounds supervisor short ticket at most once.
+
+    Idempotent via ``max_gate_rounds_decision_pending["ticket_opened"]``: a
+    repeated blocked summary finds the flag set and spawns nothing. Returns
+    True when a ticket was opened by this call.
+    """
+    if goal is None or _gate_cap_decision_ticket_opened(goal):
+        return False
+    real_chain = isinstance(chain, dict) and bool(chain.get("state"))
+    chain_path = CHAINS / f"{slice_id}.json"
+    chain_before = None
+    if not real_chain and chain_path.is_file():
+        try:
+            chain_before = chain_path.read_text(encoding="utf-8")
+        except OSError:
+            chain_before = None
+    view = chain if isinstance(chain, dict) else {}
+    if not view.get("slice"):
+        view = dict(view or {})
+        view["slice"] = slice_id
+    view.setdefault("goal", str(goal.get("goal") or (job or {}).get("goal") or ""))
+    view.setdefault("cwd", str((job or {}).get("cwd") or goal.get("cwd") or ""))
+    view.setdefault("pack", str(goal.get("current_pack") or ""))
+    view.setdefault(
+        "pending_impl_pack",
+        str(chain.get("pending_impl_pack") if isinstance(chain, dict) else ""),
+    )
+    view["max_rounds_bonus_used"] = bool(
+        (goal.get("max_gate_rounds_bonus_used") or {}).get(slice_id)
+    )
+    view.setdefault("supervisor_events", list(goal.get("supervisor_events") or []))
+    decision = None
+    try:
+        decision = auto_supervisor_max_rounds_decision(
+            job or {},
+            view,
+            round_n=round_n,
+            max_rounds=max(int(cap or 0), 1),
+            findings=list(goal.get("last_gate_findings") or []),
+            reason=reason,
+            goal=goal,
+            kind="max_gate_rounds",
+        )
+    except Exception as e:  # noqa: BLE001 — parked beats a crash
+        print(f"[trial-broker] gate-cap blocked reopen error: {e}", flush=True)
+        decision = None
+    if not real_chain:
+        # ``auto_supervisor_max_rounds_decision`` persists the chain view it is
+        # handed; a synthetic view must never replace/create the real chain.
+        if chain_before is not None:
+            chain_path.write_text(chain_before, encoding="utf-8")
+        elif chain_path.is_file():
+            try:
+                chain_path.unlink()
+            except OSError:
+                pass
+    events = list(view.get("supervisor_events") or [])
+    if events:
+        goal["supervisor_events"] = events
+    pending = goal.get("max_gate_rounds_decision_pending")
+    if not isinstance(pending, dict):
+        pending = {}
+        goal["max_gate_rounds_decision_pending"] = pending
+    if not events and decision is None:
+        pending["ticket_opened"] = bool(pending.get("ticket_opened"))
+    else:
+        pending["ticket_opened"] = True
+    _write_goal(goal)
+    return bool(pending.get("ticket_opened")) and bool(events or decision)
+
+
+def _handle_foreman_blocked(
+    job: dict,
+    chain: dict,
+    dest: Path,
+    *,
+    slice_id: str,
+    round_n: int,
+    pack_for_impl: str,
+    goal_obj: dict | None,
+    block: dict | None,
+) -> int:
+    """Settle ``summary(status=blocked)``; gate-cap blocks stay in-lane.
+
+    Gate-cap produced blocks keep ``awaiting_reason=max_gate_rounds`` and the
+    already-open supervisor decision ticket (re-opened only when missing), so
+    no Hub chain-reply event is emitted. Every other block keeps the legacy
+    behaviour: await the Hub and notify once.
+    """
+    if _blocked_from_gate_cap(chain, goal_obj):
+        pending = (goal_obj or {}).get("max_gate_rounds_decision_pending")
+        pending = pending if isinstance(pending, dict) else {}
+        chain["state"] = "awaiting_supervisor"
+        chain["awaiting_answer_for_round"] = round_n
+        chain["awaiting_reason"] = "max_gate_rounds"
+        chain["pending_impl_pack"] = Path(pack_for_impl).name
+        chain["gate_cap_blocked"] = {
+            "at": _iso(),
+            "round_n": round_n,
+            "ask_id": str(
+                (block or {}).get("ask_id")
+                or pending.get("ask_id")
+                or (job or {}).get("ask_id")
+                or ""
+            ),
+        }
+        _write_chain(chain)
+        _open_gate_cap_decision_once(
+            job,
+            chain,
+            goal_obj,
+            slice_id=slice_id,
+            round_n=round_n,
+            cap=int(pending.get("cap") or pending.get("max_rounds") or 0),
+            reason=f"gate-cap blocked (slice={slice_id}, r{round_n})",
+        )
+        print(
+            f"[trial-broker] chain {slice_id} → awaiting_supervisor "
+            f"(gate-cap blocked; supervisor decision, no Hub notify)",
+            flush=True,
+        )
+        return 0
+    chain["state"] = "awaiting_supervisor"
+    chain["awaiting_answer_for_round"] = round_n
+    chain["awaiting_reason"] = FOREMAN_STATUS_BLOCKED
+    chain["pending_impl_pack"] = Path(pack_for_impl).name
+    _write_chain(chain)
+    # Fix 1: Decision D keeps the chain outbox notify=False, but a parked
+    # chain must still wake the Hub so it can push chain-reply.
+    _notify_awaiting_hub(
+        job, chain, reason="blocked", block=block, goal=goal_obj
+    )
+    out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+    print(
+        f"[trial-broker] chain {slice_id} → awaiting_supervisor "
+        f"(blocked; hub notified via {AWAITING_HUB_NOTIFY_KIND}) "
+        f"outbox={out.name}",
+        flush=True,
+    )
+    return 0
+
+
+def _park_ticket_gate_cap_blocked(
+    job: dict,
+    goal_obj: dict | None,
+    *,
+    goal_id: str,
+    slice_id: str,
+    round_n: int,
+    block: dict | None,
+) -> bool:
+    """Ticket-job twin of the gate-cap blocked settlement (no Hub notify)."""
+    if goal_obj is None or not goal_id:
+        return False
+    g = _read_goal(goal_id) or goal_obj
+    pending = g.get("max_gate_rounds_decision_pending")
+    pending = pending if isinstance(pending, dict) else {}
+    cap = int(pending.get("cap") or pending.get("max_rounds") or 0)
+    # Not terminal: _ticket_goal_terminal would escalate/fail, the decision
+    # ticket owns the next move instead.
+    g["status"] = "running"
+    g["last_chain_state"] = "awaiting_supervisor"
+    g["awaiting_reason"] = "max_gate_rounds"
+    g["gate_cap_blocked"] = {
+        "at": _iso(),
+        "round_n": round_n,
+        "slice": slice_id,
+        "ask_id": str(
+            (block or {}).get("ask_id")
+            or pending.get("ask_id")
+            or (job or {}).get("ask_id")
+            or ""
+        ),
+    }
+    _write_goal(g)
+    _open_gate_cap_decision_once(
+        job,
+        None,
+        g,
+        slice_id=slice_id,
+        round_n=round_n,
+        cap=cap,
+        reason=f"gate-cap blocked (ticket {job.get('ticket')}, r{round_n})",
+    )
+    print(
+        f"[trial-broker] ticket {job.get('ticket')} gate-cap blocked → "
+        "awaiting supervisor decision (no Hub notify)",
+        flush=True,
+    )
+    return True
+
+
 def _park_gate_awaiting_supervisor(
     goal: dict,
     slice_id: str,
@@ -5403,8 +5628,13 @@ def handle_max_rounds_touch(
     slice_id: str,
     pack_for_impl: str,
     source: str,
+    notify_hub: bool = True,
 ) -> str:
     """Park at max_rounds and optionally apply supervisor decision.
+
+    ``notify_hub=False`` is for callers whose park is already covered by the
+    Goal/supervisor decision lane (gate-cap): parked/split stay silent and
+    only a real escalate wakes the Hub.
 
     Returns one of:
       - ``\"inplace\"`` — caller should open the next fix round (max_rounds bumped)
@@ -5522,14 +5752,16 @@ def handle_max_rounds_touch(
         _write_chain(chain)
         return "escalate"
 
-    # No decision / auto off → stay parked; wake Hub for chain-reply.
-    _notify_awaiting_hub(
-        job, chain, reason="max_rounds",
-        block={"notes": reason, "questions": [
-            "max_rounds: choose inplace (+1) | split | escalate"
-        ]},
-        goal=goal_obj,
-    )
+    # No decision / auto off → stay parked; wake Hub for chain-reply unless the
+    # caller owns the wake-up (gate-cap decision lane).
+    if notify_hub:
+        _notify_awaiting_hub(
+            job, chain, reason="max_rounds",
+            block={"notes": reason, "questions": [
+                "max_rounds: choose inplace (+1) | split | escalate"
+            ]},
+            goal=goal_obj,
+        )
     return "parked"
 
 
@@ -5545,9 +5777,12 @@ def handle_ticket_max_rounds_touch(
     handoff: dict,
     slice_id: str,
     pack_for_impl: str,
+    notify_hub: bool = True,
 ) -> str:
     """Ticket-job variant: park Goal awaiting_supervisor; optional sync decide.
 
+    ``notify_hub=False`` keeps parked/split silent for callers whose park is
+    already covered by the gate-cap supervisor decision lane.
     Returns inplace|split|escalate|parked (same contract as handle_max_rounds_touch).
     """
     # Synthesize a minimal chain-like dict so we can reuse the supervisor ticket.
@@ -5650,7 +5885,7 @@ def handle_ticket_max_rounds_touch(
         return "escalate"
 
     # Parked: do not call _ticket_goal_terminal (that would escalate/fail).
-    if goal_id:
+    if goal_id and notify_hub:
         _notify_awaiting_hub(
             job,
             {"slice": slice_id, "goal": goal_id, "state": "awaiting_supervisor"},
@@ -7032,22 +7267,16 @@ def run_chain_rounds(
                 impl_ticket=impl_ticket,
             )
         if status == FOREMAN_STATUS_BLOCKED:
-            chain["state"] = "awaiting_supervisor"
-            chain["awaiting_answer_for_round"] = round_n
-            chain["awaiting_reason"] = status
-            chain["pending_impl_pack"] = Path(pack_for_impl).name
-            _write_chain(chain)
-            # Fix 1: Decision D keeps the chain outbox notify=False, but a
-            # parked chain must still wake the Hub so it can push chain-reply.
-            _notify_awaiting_hub(job, chain, reason="blocked", block=block, goal=goal_obj)
-            out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
-            print(
-                f"[trial-broker] chain {slice_id} → awaiting_supervisor "
-                f"(blocked; hub notified via {AWAITING_HUB_NOTIFY_KIND}) "
-                f"outbox={out.name}",
-                flush=True,
+            return _handle_foreman_blocked(
+                job,
+                chain,
+                dest,
+                slice_id=slice_id,
+                round_n=round_n,
+                pack_for_impl=pack_for_impl,
+                goal_obj=goal_obj,
+                block=block,
             )
-            return 0
         if status == FOREMAN_STATUS_QUESTION:
             chain["state"] = "awaiting_supervisor"
             chain["awaiting_answer_for_round"] = round_n
@@ -9084,6 +9313,23 @@ def run_ticket_job(path: Path, job: dict) -> int:
             goal_obj = _read_goal(goal_id) or goal_obj
         parsed = _parse_foreman_summary(round_summary)
         block = parsed.get("block") or {}
+        # Gate-cap blocked: stay in the supervisor decision lane instead of
+        # failing the ticket or waking the Hub (Slice 2, chain twin above).
+        if (
+            str(block.get("status") or "").strip().lower() == FOREMAN_STATUS_BLOCKED
+            and _blocked_from_gate_cap(None, goal_obj)
+        ):
+            _park_ticket_gate_cap_blocked(
+                job,
+                goal_obj,
+                goal_id=goal_id or "",
+                slice_id=slice_id,
+                round_n=round_n,
+                block=block,
+            )
+            status = "awaiting_supervisor"
+            reason = ""
+            break
         # The guard is about impl completion: gate/review tickets keep their
         # historical treatment and are never turned into an impl fix ticket.
         if str(role) == "impl":

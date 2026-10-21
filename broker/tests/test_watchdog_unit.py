@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
@@ -241,3 +242,74 @@ def test_proc_env_has_matches_exact_chunk():
 def test_proc_env_has_unreadable_pid_is_false():
     # A pid that cannot exist: /proc lookup fails, so no match is claimed.
     assert wd._proc_env_has(2**31 - 1, "DSH_TRIAL_GUARD", "1") is False
+
+
+def _kern_procargs2_blob(argv: list[str]) -> bytes:
+    """macOS KERN_PROCARGS2 layout: argc, exec path, NUL pad, then argv."""
+    exec_path = argv[0].encode() if argv else b"/bin/open-slice.sh"
+    body = exec_path + b"\0\0\0\0"
+    for arg in argv:
+        body += arg.encode() + b"\0"
+    return len(argv).to_bytes(4, sys.byteorder) + body
+
+
+def test_parse_kern_procargs2_keeps_goal_id_inside_ticket():
+    goal_id = "engine-k8-merge-ops-20261021"
+    ticket = f"impl-trial-{goal_id}-s2-r1"
+    argv = ["/bin/open-slice.sh", "--ticket", ticket]
+    parsed = wd._parse_kern_procargs2(_kern_procargs2_blob(argv))
+    assert parsed == argv
+    assert any(goal_id in arg for arg in parsed)
+
+
+def test_read_proc_cmdline_sees_live_goal_token():
+    """Darwin sysctl and Linux /proc both surface the goal id inside argv."""
+    goal_id = "engine-k8-merge-ops-20261021"
+    ticket = f"impl-trial-{goal_id}-s2-r1"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", "--ticket", ticket]
+    )
+    try:
+        argv = wd._read_proc_cmdline(proc.pid)
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+    assert any(goal_id in arg for arg in argv)
+    assert wd._read_proc_cmdline(2**31 - 1) == []
+
+
+def test_darwin_argv_goal_token_blocks_orphan_escalation(tmp_path):
+    """A live argv containing the goal id is not an orphan without a processing job.
+
+    The byte source is the macOS KERN_PROCARGS2 blob (what sysctl returns).
+    ``_read_proc_cmdline`` parses it; the sweep must leave the Goal running.
+    """
+    patch, dirs = _patch_state(tmp_path)
+    mailbox = tmp_path / "mailbox"
+    chains = tmp_path / "chains"
+    mailbox.mkdir()
+    chains.mkdir()
+    goal_id = "engine-k8-merge-ops-20261021"
+    ticket = f"impl-trial-{goal_id}-s2-r1"
+    blob = _kern_procargs2_blob(["/bin/open-slice.sh", "--ticket", ticket])
+    goal_path = dirs["goals"] / f"{goal_id}.json"
+    goal_path.write_text(
+        json.dumps(
+            {
+                "goal": goal_id,
+                "status": "running",
+                "updated_at": "2020-01-01T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with patch, mock.patch.multiple(wd, MAILBOX=mailbox, CHAINS=chains), mock.patch.object(
+        wd.sys, "platform", "darwin"
+    ), mock.patch.object(wd, "_darwin_procargs2_bytes", return_value=blob):
+        events = wd.sweep_stale_gate_running_and_orphans(
+            now=1_800_000_000.0, work_pids=[4242], dry_run=False
+        )
+    assert events == []
+    goal = json.loads(goal_path.read_text(encoding="utf-8"))
+    assert goal["status"] == "running"
+    assert "escalate_reason" not in goal

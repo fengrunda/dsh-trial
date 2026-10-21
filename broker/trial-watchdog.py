@@ -379,8 +379,87 @@ def list_work_pids() -> list[int]:
     return out
 
 
+def _parse_kern_procargs2(raw: bytes) -> list[str]:
+    """argv from a macOS ``KERN_PROCARGS2`` blob.
+
+    Layout: native ``argc``, NUL-terminated executable path, NUL padding,
+    then ``argc`` NUL-terminated arguments. The environment block follows
+    and is ignored.
+    """
+    if len(raw) < 4:
+        return []
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    if argc <= 0:
+        return []
+    rest = raw[4:]
+    nul = rest.find(b"\0")
+    if nul < 0:
+        return []
+    rest = rest[nul + 1 :]
+    while rest[:1] == b"\0":
+        rest = rest[1:]
+    argv: list[str] = []
+    while rest and len(argv) < argc:
+        nul = rest.find(b"\0")
+        if nul < 0:
+            break
+        argv.append(rest[:nul].decode("utf-8", "replace"))
+        rest = rest[nul + 1 :]
+    return [part for part in argv if part]
+
+
+def _darwin_procargs2_bytes(pid: int) -> bytes | None:
+    """Raw ``KERN_PROCARGS2`` blob, or None when the pid is unreadable.
+
+    ``ps -o args=`` stops at the terminal width, so a long ``--ticket`` can
+    lose the goal id. This sysctl returns the full vector (up to ``ARG_MAX``).
+    """
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc_name = ctypes.util.find_library("c")
+        if not libc_name:
+            return None
+        libc = ctypes.CDLL(libc_name, use_errno=True)
+        argmax = ctypes.c_int()
+        size = ctypes.c_size_t(ctypes.sizeof(argmax))
+        # CTL_KERN=1, KERN_ARGMAX=8
+        mib_max = (ctypes.c_int * 2)(1, 8)
+        if libc.sysctl(mib_max, 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0:
+            return None
+        if argmax.value <= 0:
+            return None
+        buf = ctypes.create_string_buffer(argmax.value)
+        size = ctypes.c_size_t(argmax.value)
+        # KERN_PROCARGS2=49
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        n = int(size.value)
+        if n <= 0:
+            return None
+        return buf.raw[:n]
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _read_darwin_cmdline(pid: int) -> list[str]:
+    raw = _darwin_procargs2_bytes(pid)
+    if not raw:
+        return []
+    return _parse_kern_procargs2(raw)
+
+
 def _read_proc_cmdline(pid: int) -> list[str]:
-    """NUL-split argv of a live pid (empty list when it vanished)."""
+    """NUL-split argv of a live pid (empty list when it vanished).
+
+    Linux reads ``/proc/<pid>/cmdline``. Darwin has no ``/proc``; argv comes
+    from ``sysctl(KERN_PROCARGS2)`` so a goal id inside ``--ticket`` still
+    matches.
+    """
+    if sys.platform == "darwin":
+        return _read_darwin_cmdline(pid)
     try:
         raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
     except (OSError, ValueError):

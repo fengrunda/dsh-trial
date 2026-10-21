@@ -772,6 +772,28 @@ def _enforce_pack_bytes(path: Path, cap: int = MAX_PACK_BYTES) -> None:
         )
 
 
+def _truncate_keep_tail(body: str, cap: int, note: str = "\n\n…[truncated]\n") -> str:
+    """Truncate ``body`` from the middle, never dropping the pack tail.
+
+    The gate builders put ``GATE_PRINCIPLES_BLOCK`` and ``## Done when`` last, so
+    a plain tail-truncation silently drops the review caliber exactly when a pack
+    is near ``maxPackBytes`` (gate finding dsh-gate-ab-20261021-s2 r2 P1). Reserve
+    the tail and cut only the head (diff / prior findings / pack excerpt).
+    """
+    idx = body.rfind(GATE_PRINCIPLES_BLOCK)
+    if idx < 0:  # packs without the caliber block still end in `## Done when`
+        idx = body.rfind("\n## Done when\n")
+    if idx < 0:  # no tail to protect — degrade to the plain cap
+        return _truncate_bytes(body, cap, note=note)[0]
+    tail = body[idx:]
+    keep = cap - len(tail.encode("utf-8")) - len(note.encode("utf-8"))
+    if keep <= 0:
+        # Pathological: the tail alone is over cap — keep it rather than lose it.
+        return _truncate_bytes(tail, cap, note=note)[0]
+    head_cut, _ = _truncate_bytes(body[:idx], keep, note=note)
+    return head_cut + tail
+
+
 def _job_cwd(data: dict, path: Path) -> str:
     """Return the job's cwd, warning and falling back to the broker's own
     cwd when the job omits it (never silently default to /workspace)."""
@@ -3209,6 +3231,7 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
 - Delta-only: verify prior findings fixed; note any new P0/P1.
 - 禁止通读全文件/原 pack/全仓；只核对上述 diff 与 FAIL 清单，必要时 sed -n 小段。
 - Write verdict PASS|HOLD with machine json (findings/unmet_acceptance).
+- 到约 28 步仍未定论：机器块写 status=paused_limit 并带 used_steps / remaining 两键（勿空 HOLD）。
 - No room_*; do not modify business src.
 """
 
@@ -3243,7 +3266,8 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
         body = _assemble(diff_show, foreman_show, findings_json)
     if len(body.encode("utf-8")) > budget:
         # Safety net so _enforce_pack_bytes can never raise on an oversize pack.
-        body, _ = _truncate_bytes(body, budget, note=note)
+        # Keep the caliber block + `## Done when` tail (r2 P1).
+        body = _truncate_keep_tail(body, budget, note=note)
     path.write_text(body, encoding="utf-8")
     _enforce_pack_bytes(path)
     return name
@@ -3564,6 +3588,7 @@ max_bytes_hint: {MAX_PACK_BYTES}
 
 ## Done when
 - Write verdict to summary_out with machine json block (verdict PASS|HOLD + findings).
+- 到约 28 步仍未定论：机器块写 status=paused_limit 并带 used_steps / remaining 两键（勿空 HOLD）。
 - 禁止通读全文件/原 pack/全仓；只核对上述 diff 与 FAIL 清单，必要时 sed -n 小段。
 - Delta-only review; no room_*; do not modify business src.
 """
@@ -3574,13 +3599,16 @@ max_bytes_hint: {MAX_PACK_BYTES}
             _enforce_pack_bytes(path)
             break
         except ValueError:
-            # re-truncate more aggressively
+            # re-truncate more aggressively, but never cut the tail block/Done when
             cur = path.read_text(encoding="utf-8")
-            # cut from end of diff fence
             if len(cur.encode()) > MAX_PACK_BYTES:
                 keep = MAX_PACK_BYTES - 80
-                cut, _ = _truncate_bytes(cur, keep)
-                path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
+                path.write_text(
+                    _truncate_keep_tail(
+                        cur, keep, note="\n\n…[pack truncated to maxPackBytes]\n"
+                    ),
+                    encoding="utf-8",
+                )
     _enforce_pack_bytes(path)
     return name
 
@@ -3765,8 +3793,12 @@ max_bytes_hint: {MAX_PACK_BYTES}
             cur = path.read_text(encoding="utf-8")
             if len(cur.encode()) > MAX_PACK_BYTES:
                 keep = MAX_PACK_BYTES - 80
-                cut, _ = _truncate_bytes(cur, keep)
-                path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
+                path.write_text(
+                    _truncate_keep_tail(
+                        cur, keep, note="\n\n…[pack truncated to maxPackBytes]\n"
+                    ),
+                    encoding="utf-8",
+                )
     _enforce_pack_bytes(path)
     return name
 
@@ -4016,8 +4048,14 @@ def _write_pack_capped(path: Path, body: str) -> None:
             return
         except ValueError:
             cur = path.read_text(encoding="utf-8")
-            cut, _ = _truncate_bytes(cur, MAX_PACK_BYTES - 80)
-            path.write_text(cut + "\n\n…[pack truncated to maxPackBytes]\n", encoding="utf-8")
+            path.write_text(
+                _truncate_keep_tail(
+                    cur,
+                    MAX_PACK_BYTES - 80,
+                    note="\n\n…[pack truncated to maxPackBytes]\n",
+                ),
+                encoding="utf-8",
+            )
     _enforce_pack_bytes(path)
 
 

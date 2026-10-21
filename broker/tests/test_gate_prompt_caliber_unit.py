@@ -108,6 +108,8 @@ def test_build_gate_pack_carries_caliber(tmp_path):
     assert "## 审核原则" in body
     assert body.index("## 审核原则") < body.index("## Done when")
     assert "28" in body
+    # paused_limit summaries must carry used_steps/remaining (r2 P1)
+    assert "used_steps" in body and "remaining" in body
 
 
 def test_build_delta_gate_pack_carries_caliber(tmp_path):
@@ -116,6 +118,7 @@ def test_build_delta_gate_pack_carries_caliber(tmp_path):
         assert kw in body, kw
     assert "## 审核原则" in body
     assert body.index("## 审核原则") < body.index("## Done when")
+    assert "used_steps" in body and "remaining" in body
 
 
 def test_gate_pack_pairs_soft_cap_with_paused_limit(tmp_path):
@@ -124,6 +127,56 @@ def test_gate_pack_pairs_soft_cap_with_paused_limit(tmp_path):
     assert "28" in line
     # the caliber never becomes a hard kill
     assert "硬" not in line
+
+
+# ---------------------------------------------------------------------------
+# b2. near-maxPackBytes packs keep the tail (caliber + Done when) — r2 P1
+# ---------------------------------------------------------------------------
+def _assert_tail_survived(body: str) -> None:
+    assert len(body.encode("utf-8")) <= tb.MAX_PACK_BYTES
+    assert tb.GATE_PRINCIPLES_BLOCK in body
+    assert "## Done when" in body
+    assert body.index("## 审核原则") < body.index("## Done when")
+
+
+def test_oversize_gate_pack_keeps_caliber_and_done_when(tmp_path):
+    (tmp_path / "s1.pack.md").write_text("# pack\n" + "+pad\n" * 2000, encoding="utf-8")
+    with mock.patch.object(tb, "PACKS", tmp_path), \
+            mock.patch.object(tb, "_git_rev", return_value="deadbeef"), \
+            mock.patch.object(tb, "_git_diff", return_value="+x\n" * 4000):
+        name = tb.build_gate_pack(
+            slice_id="s1",
+            round_n=1,
+            original_pack_name="s1.pack.md",
+            acceptance=["do the thing"],
+            foreman_block={"base": "deadbeef", "commit": "cafebabe"},
+            foreman_summary_text="did it",
+            cwd=tmp_path,
+        )
+        _assert_tail_survived((tmp_path / name).read_text(encoding="utf-8"))
+
+
+def test_oversize_delta_pack_keeps_caliber_and_done_when(tmp_path):
+    findings = [
+        {"tier": "P1", "file": "a.py", "issue": "x" * 4000, "fix_hint": "y" * 4000}
+        for _ in range(4)
+    ]
+    (tmp_path / "s1.pack.md").write_text("# pack\n", encoding="utf-8")
+    with mock.patch.object(tb, "PACKS", tmp_path), \
+            mock.patch.object(tb, "_git_rev", return_value="deadbeef"), \
+            mock.patch.object(tb, "_git_diff", return_value="+x\n" * 4000):
+        name = tb.build_delta_gate_pack(
+            slice_id="s1",
+            round_n=2,
+            original_pack_name="s1.pack.md",
+            acceptance=[],
+            prior_findings=findings,
+            foreman_block={"base": "deadbeef", "commit": "cafebabe"},
+            foreman_summary_text="did it",
+            cwd=tmp_path,
+            label="rev2",
+        )
+        _assert_tail_survived((tmp_path / name).read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------

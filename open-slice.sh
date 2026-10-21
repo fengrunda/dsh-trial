@@ -252,6 +252,9 @@ build_prompt_gate() {
   ]
 }
 ```
+   若到约 28 步仍未定论（见「审核原则」末条），机器块改用
+   `{"status": "paused_limit", "used_steps": <已用步数>, "remaining": "<剩余待判一句话>", "findings": [...]}`：
+   **status=paused_limit 时 `used_steps` 与 `remaining` 两键必填**，勿写空 HOLD、勿留空 verdict。
 5. 写完 verdict 文件后停止；不要 Approve/gh；不要改 src。
 
 硬禁：room_*；改业务仓；push / gh / dsh-trial-pr；打印 API key。

@@ -209,6 +209,9 @@ def test_gate_prompt_carries_the_review_caliber(sb: Sandbox):
     for kw in ("P0–P1", "P2", "只读复核", "paused_limit", "28 步"):
         assert kw in out, kw
     assert out.count("## 审核原则") == 1
+    # paused_limit summaries must carry the two step keys (r2 P1)
+    assert '"used_steps"' in out, out
+    assert '"remaining"' in out, out
 
 
 @pytest.mark.parametrize("mode", MODES)

@@ -1748,6 +1748,7 @@ def _handle_ask_supervisor(ask: dict, path: Path, *, default_profile: str, cwd: 
         if timed_out:
             m["ask_timeout"] = int(m.get("ask_timeout") or 0) + 1
         T.record_ticket_metric(goal, {
+            **_usage_fields_from_art(art),
             "role": "supervisor",
             "ticket": ticket,
             "slice": slice_id,
@@ -1763,6 +1764,23 @@ def _handle_ask_supervisor(ask: dict, path: Path, *, default_profile: str, cwd: 
         })
         _write_goal(goal)
     print(f"[trial-broker] answered ask {ask_id} via {ticket}", flush=True)
+
+
+
+def _usage_fields_from_art(art: dict | None) -> dict:
+    """Pi-aligned input/cacheRead/output from ticket session (via artifacts)."""
+    u = T.usage_from_artifact(art)
+    out = {
+        "input": u.get("input") or 0,
+        "cacheRead": u.get("cacheRead") or 0,
+        "output": u.get("output") or 0,
+        "cache_hit_rate": u.get("cache_hit_rate"),
+        "cache_hit_low": bool(u.get("cache_hit_low")),
+        "cache_hit_note": u.get("cache_hit_note") or "",
+    }
+    if u.get("source"):
+        out["session"] = u["source"]
+    return out
 
 
 def _tool_res_from_art(art: dict | None) -> str | None:
@@ -2335,6 +2353,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
             goal.setdefault("last_reviewed_sha", {})[slice_id] = str(reviewed_sha)
         peak, steps = _peak_prompt(gate_art.get("composition"))
         T.record_ticket_metric(goal, {
+            **_usage_fields_from_art(gate_art),
             "role": "gate",
             "ticket": gate_ticket,
             "slice": slice_id,
@@ -6414,6 +6433,7 @@ def run_chain_rounds(
             if goal_obj is not None:
                 # chain 路径记账（prompt_token_total 默认 peak×steps）→ dsh-trial report 非 0
                 T.record_ticket_metric(goal_obj, {
+                    **_usage_fields_from_art(impl_art),
                     "role": "impl",
                     "ticket": impl_ticket,
                     "slice": slice_id,
@@ -7040,6 +7060,7 @@ def run_chain_rounds(
             gparsed["block"] = gblock
             if goal_obj is not None:
                 T.record_ticket_metric(goal_obj, {
+                    **_usage_fields_from_art(gate_art),
                     "role": "gate",
                     "ticket": gate_ticket,
                     "slice": slice_id,

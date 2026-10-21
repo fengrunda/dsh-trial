@@ -447,6 +447,206 @@ def apply_goal_update(goal: dict, update: dict) -> dict:
     return goal
 
 
+
+# Pi-aligned cache hit: cacheRead / (input + cacheRead); exclude output.
+# < CACHE_HIT_RATE_WARN must be flagged in Goal/report notes.
+CACHE_HIT_RATE_WARN = 0.90
+
+
+def cache_hit_rate(input_tokens: int | float | None, cache_read: int | float | None) -> float | None:
+    """cache_hit_rate = cacheRead / (input + cacheRead); None when denom is 0."""
+    inp = int(input_tokens or 0)
+    cr = int(cache_read or 0)
+    denom = inp + cr
+    if denom <= 0:
+        return None
+    return cr / denom
+
+
+def cache_hit_low(rate: float | None, threshold: float = CACHE_HIT_RATE_WARN) -> bool:
+    return rate is not None and rate < threshold
+
+
+def cache_hit_note(rate: float | None, threshold: float = CACHE_HIT_RATE_WARN) -> str:
+    if rate is None:
+        return ""
+    if rate < threshold:
+        return f"CACHE_HIT_LOW<{threshold:.0%} rate={rate:.1%} — 必须重点排查"
+    return ""
+
+
+def _load_session_events(path: Path) -> list[dict]:
+    """Load session.v3.jsonl or .zstd as a list of event dicts."""
+    import subprocess
+
+    s = str(path)
+    if s.endswith(".zstd") or path.suffix == ".zstd":
+        try:
+            text = subprocess.check_output(["zstd", "-dc", s], text=True, errors="replace")
+        except (OSError, subprocess.CalledProcessError):
+            return []
+    else:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+    out: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(o, dict):
+            out.append(o)
+    return out
+
+
+def summarize_session_usage(session_path: Path | str | None) -> dict:
+    """Sum input / cacheRead / output from a dsh session (Pi-aligned field names).
+
+    Source of truth: assistant/message ``data.usage`` with inputTokens /
+    cacheReadTokens / outputTokens. Falls back to empty zeros when missing.
+    """
+    empty = {
+        "input": 0,
+        "cacheRead": 0,
+        "output": 0,
+        "llm_calls": 0,
+        "cache_hit_rate": None,
+        "cache_hit_low": False,
+        "cache_hit_note": "",
+        "source": None,
+    }
+    if not session_path:
+        return empty
+    path = Path(session_path)
+    if not path.is_file():
+        return empty
+    inp = cr = out = n = 0
+    for o in _load_session_events(path):
+        if o.get("type") != "assistant/message":
+            continue
+        u = (o.get("data") or {}).get("usage") or {}
+        if not isinstance(u, dict) or not u:
+            continue
+        inp += int(u.get("inputTokens") or 0)
+        cr += int(u.get("cacheReadTokens") or 0)
+        out += int(u.get("outputTokens") or 0)
+        n += 1
+    rate = cache_hit_rate(inp, cr)
+    return {
+        "input": inp,
+        "cacheRead": cr,
+        "output": out,
+        "llm_calls": n,
+        "cache_hit_rate": None if rate is None else round(rate, 4),
+        "cache_hit_low": cache_hit_low(rate),
+        "cache_hit_note": cache_hit_note(rate),
+        "source": str(path),
+    }
+
+
+def default_artifact_root() -> Path:
+    return Path(os.environ.get("TRIAL_ARTIFACT_ROOT") or "/workspace/tmp/trial-broker")
+
+
+def usage_from_artifact(art: dict | None, artifact_root: Path | None = None) -> dict:
+    """Resolve session path from an artifacts dict or ticket broker-result.json."""
+    empty = summarize_session_usage(None)
+    if not art and artifact_root is None:
+        return empty
+    art = art or {}
+    sess = art.get("session")
+    ticket = art.get("ticket")
+    if not sess and ticket:
+        root = artifact_root or default_artifact_root()
+        br = root / str(ticket) / "broker-result.json"
+        if br.is_file():
+            try:
+                sess = (json.loads(br.read_text(encoding="utf-8")) or {}).get("session")
+            except (OSError, json.JSONDecodeError):
+                sess = None
+    return summarize_session_usage(sess)
+
+
+def finish_cache_metrics(m: dict) -> dict:
+    """Recompute goal-level cache_hit_rate / flag / note from input+cacheRead totals."""
+    rate = cache_hit_rate(m.get("input"), m.get("cacheRead"))
+    m["cache_hit_rate"] = None if rate is None else round(rate, 4)
+    m["cache_hit_low"] = cache_hit_low(rate)
+    m["cache_hit_note"] = cache_hit_note(rate)
+    return m
+
+
+def enrich_goal_cache_metrics(
+    goal: dict,
+    *,
+    artifact_root: Path | None = None,
+    force: bool = False,
+) -> dict:
+    """Fill input/cacheRead/output on goal metrics from ticket sessions/artifacts.
+
+    Used by report so historical Goals (pre-broker persist) still show hit rate.
+    Does not write the goal file; caller decides persistence.
+    """
+    m = goal.setdefault("metrics", empty_metrics())
+    root = artifact_root or default_artifact_root()
+    tickets = m.get("tickets") or []
+    have_totals = (int(m.get("input") or 0) + int(m.get("cacheRead") or 0)) > 0
+    if have_totals and not force:
+        finish_cache_metrics(m)
+        return goal
+
+    total_in = total_cr = total_out = 0
+    for row in tickets:
+        if not isinstance(row, dict):
+            continue
+        row_in = int(row.get("input") or 0)
+        row_cr = int(row.get("cacheRead") or 0)
+        row_out = int(row.get("output") or 0)
+        if (row_in or row_cr or row_out) and not force:
+            total_in += row_in
+            total_cr += row_cr
+            total_out += row_out
+            rate = cache_hit_rate(row_in, row_cr)
+            row["cache_hit_rate"] = None if rate is None else round(rate, 4)
+            row["cache_hit_low"] = cache_hit_low(rate)
+            row["cache_hit_note"] = cache_hit_note(rate)
+            continue
+        sess = row.get("session")
+        if not sess:
+            ticket = row.get("ticket")
+            if ticket:
+                br = root / str(ticket) / "broker-result.json"
+                if br.is_file():
+                    try:
+                        sess = (json.loads(br.read_text(encoding="utf-8")) or {}).get("session")
+                    except (OSError, json.JSONDecodeError):
+                        sess = None
+        u = summarize_session_usage(sess)
+        row["input"] = u["input"]
+        row["cacheRead"] = u["cacheRead"]
+        row["output"] = u["output"]
+        row["cache_hit_rate"] = u["cache_hit_rate"]
+        row["cache_hit_low"] = u["cache_hit_low"]
+        row["cache_hit_note"] = u["cache_hit_note"]
+        if u.get("source") and not row.get("session"):
+            row["session"] = u["source"]
+        total_in += u["input"]
+        total_cr += u["cacheRead"]
+        total_out += u["output"]
+
+    if tickets:
+        m["input"] = total_in
+        m["cacheRead"] = total_cr
+        m["output"] = total_out
+    finish_cache_metrics(m)
+    return goal
+
+
 def empty_metrics() -> dict:
     return {
         "slices_planned": 0,
@@ -470,6 +670,13 @@ def empty_metrics() -> dict:
         "limit_hits": [],
         "phase_timings": {},
         "prompt_token_total": 0,
+        # Pi-aligned token split (session usage sums). prompt_token_total stays peak×steps.
+        "input": 0,
+        "cacheRead": 0,
+        "output": 0,
+        "cache_hit_rate": None,
+        "cache_hit_low": False,
+        "cache_hit_note": "",
         "notify_events": [],
     }
 
@@ -494,7 +701,12 @@ def decide_rework_mode(
 
 
 def record_ticket_metric(goal: dict, row: dict) -> dict:
-    """row: role, ticket, slice, exit, peak_prompt, steps, tool_res, assert_clean, prompt_token_total, duration_ms"""
+    """row: role, ticket, slice, exit, peak_prompt, steps, tool_res, assert_clean, prompt_token_total, duration_ms
+
+    Optional Pi-aligned usage: input / cacheRead / output (and optional session path).
+    When usage is omitted but ``session`` is set, summarize from the session file.
+    ``prompt_token_total`` remains the peak×steps proxy (unchanged).
+    """
     m = goal.setdefault("metrics", empty_metrics())
     peak = int(row.get("peak_prompt") or 0)
     steps = int(row.get("steps") or 0)
@@ -504,6 +716,28 @@ def record_ticket_metric(goal: dict, row: dict) -> dict:
     row = dict(row)
     row["prompt_token_total"] = ptt
     row["at"] = now_iso()
+
+    inp = int(row.get("input") or 0)
+    cr = int(row.get("cacheRead") or 0)
+    out = int(row.get("output") or 0)
+    if not (inp or cr or out) and row.get("session"):
+        u = summarize_session_usage(row.get("session"))
+        inp, cr, out = u["input"], u["cacheRead"], u["output"]
+        row["input"] = inp
+        row["cacheRead"] = cr
+        row["output"] = out
+        row["cache_hit_rate"] = u["cache_hit_rate"]
+        row["cache_hit_low"] = u["cache_hit_low"]
+        row["cache_hit_note"] = u["cache_hit_note"]
+    else:
+        rate = cache_hit_rate(inp, cr)
+        row["input"] = inp
+        row["cacheRead"] = cr
+        row["output"] = out
+        row["cache_hit_rate"] = None if rate is None else round(rate, 4)
+        row["cache_hit_low"] = cache_hit_low(rate)
+        row["cache_hit_note"] = cache_hit_note(rate)
+
     m["tickets"].append(row)
     role = str(row.get("role") or "impl")
     br = m["by_role"].setdefault(role, {"count": 0, "peak_sum": 0, "steps_sum": 0, "prompt_token_total": 0})
@@ -512,6 +746,10 @@ def record_ticket_metric(goal: dict, row: dict) -> dict:
     br["steps_sum"] += steps
     br["prompt_token_total"] += ptt
     m["prompt_token_total"] = int(m.get("prompt_token_total") or 0) + ptt
+    m["input"] = int(m.get("input") or 0) + inp
+    m["cacheRead"] = int(m.get("cacheRead") or 0) + cr
+    m["output"] = int(m.get("output") or 0) + out
+    finish_cache_metrics(m)
 
     # per-kind rollup: count / wait_ms / timeouts / wake prompt tokens
     kind = str(row.get("kind") or role)
@@ -624,6 +862,9 @@ def aggregate_report(goals_dir: Path | None = None, since: str | None = None) ->
                     continue
             goals.append(g)
 
+    for g in goals:
+        enrich_goal_cache_metrics(g)
+
     n = len(goals)
     hold = sum(int((g.get("metrics") or {}).get("hold_count") or 0) for g in goals)
     rework = sum(int((g.get("metrics") or {}).get("rework_rounds") or 0) for g in goals)
@@ -680,6 +921,30 @@ def aggregate_report(goals_dir: Path | None = None, since: str | None = None) ->
             "ask_count": m.get("ask_count") or 0,
             "supervisor_tickets": g.get("supervisor_ticket_count") or 0,
             "prompt_token_total": m.get("prompt_token_total") or 0,
+            "input": int(m.get("input") or 0),
+            "cacheRead": int(m.get("cacheRead") or 0),
+            "output": int(m.get("output") or 0),
+            "cache_hit_rate": m.get("cache_hit_rate"),
+            "cache_hit_low": bool(m.get("cache_hit_low")),
+            "cache_hit_note": m.get("cache_hit_note") or "",
+            "tickets": [
+                {
+                    "role": t.get("role"),
+                    "ticket": t.get("ticket"),
+                    "kind": t.get("kind"),
+                    "slice": t.get("slice"),
+                    "input": int(t.get("input") or 0),
+                    "cacheRead": int(t.get("cacheRead") or 0),
+                    "output": int(t.get("output") or 0),
+                    "cache_hit_rate": t.get("cache_hit_rate"),
+                    "cache_hit_low": bool(t.get("cache_hit_low")),
+                    "cache_hit_note": t.get("cache_hit_note") or "",
+                    "session": t.get("session"),
+                    "prompt_token_total": t.get("prompt_token_total"),
+                }
+                for t in (m.get("tickets") or [])
+                if isinstance(t, dict)
+            ],
             "limit_hit": g.get("limit_hit"),
         })
 
@@ -711,6 +976,21 @@ def aggregate_report(goals_dir: Path | None = None, since: str | None = None) ->
         ],
     }
 
+    total_input = sum(int(g.get("input") or 0) for g in per_goal)
+    total_cache_read = sum(int(g.get("cacheRead") or 0) for g in per_goal)
+    total_output = sum(int(g.get("output") or 0) for g in per_goal)
+    overall_rate = cache_hit_rate(total_input, total_cache_read)
+    low_goals = [g for g in per_goal if g.get("cache_hit_low")]
+    tickets_cache_hit_low = []
+    for g in per_goal:
+        for t in g.get("tickets") or []:
+            if t.get("cache_hit_low"):
+                tickets_cache_hit_low.append({
+                    "goal": g.get("goal"),
+                    "status": g.get("status"),
+                    **t,
+                })
+
     return {
         "goals": n,
         "done": done,
@@ -721,6 +1001,16 @@ def aggregate_report(goals_dir: Path | None = None, since: str | None = None) ->
         "supervisor_ticket_share": (sup_tickets / total_tickets) if total_tickets else 0.0,
         "supervisor_token_share": (sup_tokens / total_tokens) if total_tokens else 0.0,
         "prompt_token_total": total_tokens,
+        "input": total_input,
+        "cacheRead": total_cache_read,
+        "output": total_output,
+        "cache_hit_rate": None if overall_rate is None else round(overall_rate, 4),
+        "cache_hit_low": cache_hit_low(overall_rate),
+        "cache_hit_note": cache_hit_note(overall_rate),
+        "cache_hit_low_goals": [g.get("goal") for g in low_goals],
+        "tickets_cache_hit_low": tickets_cache_hit_low,
+        "cache_hit_formula": "cacheRead / (input + cacheRead)",
+        "cache_hit_warn_threshold": CACHE_HIT_RATE_WARN,
         "limit_hit_count": len(limit_hits),
         "limit_hits": limit_hits,
         "rework_inplace": rework_agg("inplace"),
@@ -731,6 +1021,41 @@ def aggregate_report(goals_dir: Path | None = None, since: str | None = None) ->
         "heartbeat": hb_summary,
         "generated_at": now_iso(),
     }
+
+
+
+def filter_report_cache_hit_low(rep: dict) -> dict:
+    """Keep only Goals/tickets with cache_hit_low; for `dsh-trial report --cache-hit-low`."""
+    per = [g for g in (rep.get("per_goal") or []) if g.get("cache_hit_low")]
+    # Also include goals that have any low ticket even if goal rollup is ok
+    goal_ids = {g.get("goal") for g in per}
+    for t in rep.get("tickets_cache_hit_low") or []:
+        gid = t.get("goal")
+        if gid in goal_ids:
+            continue
+        src = next((g for g in (rep.get("per_goal") or []) if g.get("goal") == gid), None)
+        if src:
+            per.append(src)
+            goal_ids.add(gid)
+    out = dict(rep)
+    out["per_goal"] = per
+    out["goals"] = len(per)
+    out["cache_hit_low_goals"] = [g.get("goal") for g in per]
+    out["tickets_cache_hit_low"] = list(rep.get("tickets_cache_hit_low") or [])
+    out["filter"] = "cache_hit_low"
+    # recompute rollup from filtered goals
+    total_input = sum(int(g.get("input") or 0) for g in per)
+    total_cache_read = sum(int(g.get("cacheRead") or 0) for g in per)
+    total_output = sum(int(g.get("output") or 0) for g in per)
+    overall_rate = cache_hit_rate(total_input, total_cache_read)
+    out["input"] = total_input
+    out["cacheRead"] = total_cache_read
+    out["output"] = total_output
+    out["cache_hit_rate"] = None if overall_rate is None else round(overall_rate, 4)
+    out["cache_hit_low"] = cache_hit_low(overall_rate) if per else True
+    out["cache_hit_note"] = cache_hit_note(overall_rate) if per else "CACHE_HIT_LOW filter (no rows)"
+    out["prompt_token_total"] = sum(int(g.get("prompt_token_total") or 0) for g in per)
+    return out
 
 
 def format_report_zh(rep: dict) -> str:
@@ -744,6 +1069,17 @@ def format_report_zh(rep: dict) -> str:
         f"- 监理票占比：{rep['supervisor_ticket_share']:.1%}",
         f"- 监理 token 占比（prompt×步数累计）：{rep['supervisor_token_share']:.1%}",
         f"- 全部 Goal 总 prompt token：{rep['prompt_token_total']}",
+        (
+            "- 缓存命中（Pi 口径 cacheRead/(input+cacheRead)）："
+            f"input={rep.get('input', 0)} cacheRead={rep.get('cacheRead', 0)} "
+            f"output={rep.get('output', 0)} hit_rate="
+            + (
+                "n/a"
+                if rep.get("cache_hit_rate") is None
+                else f"{rep.get('cache_hit_rate'):.1%}"
+            )
+            + (" ⚠ CACHE_HIT_LOW<90%" if rep.get("cache_hit_low") else "")
+        ),
         f"- 撞上限次数：{rep['limit_hit_count']}",
         f"- 返工 inplace：次数={rep.get('rework_inplace',{}).get('count',0)} "
         f"平均步数={rep.get('rework_inplace',{}).get('avg_steps',0):.1f} "
@@ -774,18 +1110,67 @@ def format_report_zh(rep: dict) -> str:
             )
         for q in beat.get("queued") or []:
             lines.append(f"- queued name={q.get('name')} reason={q.get('reason')}")
+    low = rep.get("cache_hit_low_goals") or []
+    if low:
+        lines += [
+            "",
+            "### ⚠ 缓存命中率 < 90%（必须重点排查）",
+        ]
+        for name in low:
+            g = next((x for x in (rep.get("per_goal") or []) if x.get("goal") == name), None)
+            rate = None if not g else g.get("cache_hit_rate")
+            rate_s = "n/a" if rate is None else f"{rate:.1%}"
+            if g and g.get("cache_hit_low"):
+                note = g.get("cache_hit_note") or "CACHE_HIT_LOW<90% — 必须重点排查"
+            else:
+                note = "Goal 均值≥90%，但含单票 CACHE_HIT_LOW（见下）"
+            lines.append(f"- `{name}`: hit_rate={rate_s} — {note}")
+            for t in (g or {}).get("tickets") or []:
+                if not t.get("cache_hit_low"):
+                    continue
+                tr = t.get("cache_hit_rate")
+                tr_s = "n/a" if tr is None else f"{tr:.1%}"
+                sess = t.get("session") or "(no session path)"
+                lines.append(
+                    f"  - ticket=`{t.get('ticket')}` role={t.get('role')} kind={t.get('kind')} "
+                    f"input={t.get('input', 0)} cacheRead={t.get('cacheRead', 0)} "
+                    f"output={t.get('output', 0)} hit={tr_s} session=`{sess}`"
+                )
+        # Flat list also covers tickets whose Goal average is ok but ticket itself is low
+        flat = [
+            t for t in (rep.get("tickets_cache_hit_low") or [])
+            if t.get("goal") not in low
+        ]
+        if flat:
+            lines.append("- （Goal 均值≥90% 但单票 <90%）")
+            for t in flat:
+                tr = t.get("cache_hit_rate")
+                tr_s = "n/a" if tr is None else f"{tr:.1%}"
+                lines.append(
+                    f"  - goal=`{t.get('goal')}` ticket=`{t.get('ticket')}` "
+                    f"role={t.get('role')} hit={tr_s} session=`{t.get('session') or '-'}`"
+                )
+
     lines += [
         "",
-        "| Goal | 状态 | 切片 | HOLD | 返工 | 提问 | 监理票 | 总 token | 撞上限 |",
-        "|------|------|-----:|-----:|-----:|-----:|-------:|---------:|--------|",
+        "| Goal | 状态 | 切片 | HOLD | 返工 | 提问 | 监理票 | 总 token | input | cacheRead | output | 命中率 | 撞上限 |",
+        "|------|------|-----:|-----:|-----:|-----:|-------:|---------:|------:|----------:|-------:|-------:|--------|",
     ]
     for g in rep.get("per_goal") or []:
         hit = g.get("limit_hit")
         hit_s = hit.get("limit") if isinstance(hit, dict) else (hit or "")
+        rate = g.get("cache_hit_rate")
+        if rate is None:
+            rate_s = "n/a"
+        else:
+            rate_s = f"{rate:.1%}"
+            if g.get("cache_hit_low"):
+                rate_s += " ⚠"
         lines.append(
             f"| {g.get('goal')} | {g.get('status')} | {g.get('slices')} | {g.get('hold_count')} | "
             f"{g.get('rework_rounds')} | {g.get('ask_count')} | {g.get('supervisor_tickets')} | "
-            f"{g.get('prompt_token_total')} | {hit_s} |"
+            f"{g.get('prompt_token_total')} | {g.get('input', 0)} | {g.get('cacheRead', 0)} | "
+            f"{g.get('output', 0)} | {rate_s} | {hit_s} |"
         )
     if rep.get("by_kind"):
         lines += ["", "### by_kind（按消息 kind）"]

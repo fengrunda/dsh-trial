@@ -52,6 +52,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     _ensure_trial_lib()
     from trial_lib import (  # noqa: E402
         GOALS,
+        enrich_goal_cache_metrics,
         heartbeat_summary,
         max_concurrent_goals,
         read_broker_heartbeat,
@@ -73,14 +74,28 @@ def cmd_status(args: argparse.Namespace) -> int:
         if data.get("limit_hit"):
             print(f"limit_hit={json.dumps(data.get('limit_hit'), ensure_ascii=False)}")
         m = data.get("metrics") or {}
+        enrich_goal_cache_metrics(data)
+        m = data.get("metrics") or {}
+        rate = m.get("cache_hit_rate")
+        rate_s = "n/a" if rate is None else f"{rate:.1%}"
+        flag = " ⚠ CACHE_HIT_LOW<90%" if m.get("cache_hit_low") else ""
         print(
             f"metrics: holds={m.get('hold_count')} rework={m.get('rework_rounds')} "
-            f"asks={m.get('ask_count')} prompt_token_total={m.get('prompt_token_total')}"
+            f"asks={m.get('ask_count')} prompt_token_total={m.get('prompt_token_total')} "
+            f"input={m.get('input', 0)} cacheRead={m.get('cacheRead', 0)} "
+            f"output={m.get('output', 0)} cache_hit_rate={rate_s}{flag}"
         )
+        if m.get("cache_hit_note"):
+            print(f"cache_hit_note: {m.get('cache_hit_note')}")
         for t in m.get("tickets") or []:
+            tr = t.get("cache_hit_rate")
+            tr_s = "n/a" if tr is None else f"{tr:.1%}"
+            tflag = " ⚠" if t.get("cache_hit_low") else ""
             print(
                 f"  - {t.get('role')} {t.get('ticket')} peak={t.get('peak_prompt')} "
                 f"steps={t.get('steps')} total={t.get('prompt_token_total')} "
+                f"input={t.get('input', 0)} cacheRead={t.get('cacheRead', 0)} "
+                f"output={t.get('output', 0)} hit={tr_s}{tflag} "
                 f"tool_res={t.get('tool_res')} clean={t.get('assert_clean')}"
             )
         return 0
@@ -148,9 +163,15 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_report(args: argparse.Namespace) -> int:
     _ensure_trial_lib()
-    from trial_lib import aggregate_report, format_report_zh  # noqa: E402
+    from trial_lib import (  # noqa: E402
+        aggregate_report,
+        filter_report_cache_hit_low,
+        format_report_zh,
+    )
 
     rep = aggregate_report(since=args.since)
+    if getattr(args, "cache_hit_low", False):
+        rep = filter_report_cache_hit_low(rep)
     if args.json:
         print(json.dumps(rep, ensure_ascii=False, indent=2))
     else:
@@ -257,9 +278,17 @@ def main() -> int:
     )
     _add_goal_status_parser(sub, "goals", "alias for status (list/show goals)")
 
-    rp = sub.add_parser("report", help="cross-goal aggregate report (+ 并发 from heartbeat)")
+    rp = sub.add_parser(
+        "report",
+        help="cross-goal aggregate report (+ 并发 / cache hit; --cache-hit-low filters <90%%)",
+    )
     rp.add_argument("--since", help="ISO timestamp lower bound on goal created_at")
     rp.add_argument("--json", action="store_true")
+    rp.add_argument(
+        "--cache-hit-low",
+        action="store_true",
+        help="only Goals/tickets with cache_hit_rate < 90%% (Pi: cacheRead/(input+cacheRead))",
+    )
     rp.set_defaults(func=cmd_report)
 
     lim = sub.add_parser("limits", help="show/set global trial limits")

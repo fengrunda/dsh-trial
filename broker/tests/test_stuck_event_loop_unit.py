@@ -185,7 +185,7 @@ def test_collect_resume_items_escalates_instead_of_leaving_alone(tmp_path: Path)
 # d) watchdog sweep: dry-run warns, real pass clears and writes ERROR
 # --------------------------------------------------------------------------
 def _patch_watchdog_dirs(tmp_path: Path):
-    dirs = {n: tmp_path / n for n in ("mailbox", "goals", "inbox", "processing")}
+    dirs = {n: tmp_path / n for n in ("mailbox", "goals", "inbox", "processing", "chains")}
     for p in dirs.values():
         p.mkdir(parents=True, exist_ok=True)
     return mock.patch.multiple(
@@ -194,6 +194,7 @@ def _patch_watchdog_dirs(tmp_path: Path):
         GOALS=dirs["goals"],
         INBOX=dirs["inbox"],
         PROCESSING=dirs["processing"],
+        CHAINS=dirs["chains"],
     ), dirs
 
 
@@ -275,6 +276,35 @@ def test_watchdog_orphan_goal_event_and_escalation(tmp_path: Path):
         goal = json.loads(goal_path.read_text())
         assert goal["status"] == "escalated"
         assert goal["escalate_reason"] == wd.ORPHAN_ESCALATE_REASON
+
+
+def test_watchdog_skips_parked_chain(tmp_path: Path):
+    patch, d = _patch_watchdog_dirs(tmp_path)
+    goal_id = "watchdog-parked"
+    sid = f"{goal_id}-s1"
+    with patch:
+        goal_path = d["goals"] / f"{goal_id}.json"
+        goal_path.write_text(
+            json.dumps(
+                {
+                    "goal": goal_id,
+                    "status": "running",
+                    "slices": [sid],
+                    "current_slice": sid,
+                    "updated_at": "2020-01-01T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (d["chains"] / f"{sid}.json").write_text(
+            json.dumps({"slice": sid, "state": "awaiting_supervisor", "goal": goal_id}),
+            encoding="utf-8",
+        )
+        events = wd.sweep_stale_gate_running_and_orphans(
+            now=1_800_000_000.0, work_pids=[], dry_run=False
+        )
+        assert events == []
+        assert json.loads(goal_path.read_text())["status"] == "running"
 
 
 def test_reconcile_orphan_skips_awaiting_supervisor(tmp_path: Path):

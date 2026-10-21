@@ -825,11 +825,17 @@ def load_job(path: Path) -> dict:
         answer = data.get("answer")
         if not slice_id or answer is None or str(answer).strip() == "":
             raise ValueError(f"chain-reply missing slice/answer: {path}")
-        return {
+        reply = {
             **base,
             "slice": _safe_slice_id(slice_id),
             "answer": str(answer),
         }
+        # Hub replies decision=split|continue_same|… on a parked chain.
+        # Keep the field; dropping it forced Hub to remap awaiting_reason first.
+        raw_decision = data.get("decision")
+        if raw_decision is not None and str(raw_decision).strip():
+            reply["decision"] = str(raw_decision).strip()
+        return reply
 
     if jtype == "goal-update":
         goal_id = data.get("goal") or data.get("id")
@@ -8183,6 +8189,258 @@ def run_chain_job(path: Path, job: dict) -> int:
     return run_chain_rounds(job, chain, dest, start_round=1, start_pack=pack_name)
 
 
+def _pause_reply_family(reason: str) -> str:
+    """``pause_split`` / ``pause_continue`` / ``pause_new_ticket``, or empty.
+
+    Matches the bare token and ``pause_*:{pause_kind}`` (e.g.
+    ``pause_split:paused_limit``). Does not match a longer unrelated prefix.
+    """
+    raw = str(reason or "").strip()
+    for name in ("pause_split", "pause_continue", "pause_new_ticket"):
+        if raw == name or raw.startswith(name + ":"):
+            return name
+    return ""
+
+
+def _chain_reply_pause_decision(job: dict) -> str | None:
+    """Pause five-way from a chain-reply (inplace → continue_same)."""
+    answer = str((job or {}).get("answer") or "")
+    return PS.parse_pause_decision(
+        {"decision": (job or {}).get("decision"), "answer": answer},
+        answer,
+    )
+
+
+def _reject_chain_reply(dest: Path, job: dict, err: str) -> int:
+    print(f"[trial-broker] FAIL {err}", flush=True)
+    (FAILED / f"{dest.stem}.error.json").write_text(
+        json.dumps({"error": err, "job": job, "at": _iso()}, ensure_ascii=False, indent=2)
+    )
+    shutil.move(str(dest), str(FAILED / dest.name))
+    return 1
+
+
+def _escalate_pause_chain_reply(
+    job: dict,
+    chain: dict,
+    dest: Path,
+    slice_id: str,
+    *,
+    reason: str,
+) -> int:
+    """Same terminal shape as a max_rounds chain-reply escalate."""
+    parent_goal_id = _resolve_parent_goal_id(job, chain)
+    goal_obj = _read_goal(parent_goal_id) if parent_goal_id else None
+    chain["state"] = "escalated"
+    chain["escalate_reason"] = reason
+    chain["supervisor_decision"] = {
+        "decision": "escalate",
+        "at": _iso(),
+        "via": "chain-reply",
+        "reason": reason,
+    }
+    _write_chain(chain)
+    if goal_obj is not None:
+        goal_obj["status"] = "escalated"
+        goal_obj["last_chain_state"] = "escalated"
+        goal_obj["escalate_reason"] = reason
+        goal_obj["error"] = reason
+        goal_obj["supervisor_decision"] = dict(chain["supervisor_decision"])
+        _write_goal(goal_obj)
+    out = _terminal_outbox(job, chain, dest, ok=False)
+    if parent_goal_id:
+        _notify_goal_terminal(str(parent_goal_id))
+    print(
+        f"[trial-broker] chain-reply pause escalate "
+        f"slice={slice_id} outbox={out.name}",
+        flush=True,
+    )
+    return 1
+
+
+def _park_pause_split_chain_reply(
+    job: dict,
+    chain: dict,
+    dest: Path,
+    slice_id: str,
+    *,
+    awaiting_reason: str,
+) -> int:
+    """Record split and stay parked. Do not open impl rN+1.
+
+    ``awaiting_reason`` stays ``pause_split`` / ``pause_split:{kind}``.
+    Hub must not remap it to ``max_rounds`` before replying.
+    """
+    parent_goal_id = _resolve_parent_goal_id(job, chain)
+    goal_obj = _read_goal(parent_goal_id) if parent_goal_id else None
+    chain["supervisor_decision"] = {
+        "decision": "split",
+        "at": _iso(),
+        "via": "chain-reply",
+        "reason": awaiting_reason,
+        "note": "pause split: remaining work → new slice / Hub Goal; chain stays parked",
+    }
+    chain["state"] = "awaiting_supervisor"
+    chain["awaiting_reason"] = awaiting_reason
+    _write_chain(chain)
+    if goal_obj is not None:
+        goal_obj["supervisor_decision"] = dict(chain["supervisor_decision"])
+        goal_obj["awaiting_reason"] = awaiting_reason
+        goal_obj["status"] = "running"
+        goal_obj["last_chain_state"] = "awaiting_supervisor"
+        goal_obj.pop("error", None)
+        goal_obj.pop("escalate_reason", None)
+        _write_goal(goal_obj)
+    out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+    print(
+        f"[trial-broker] chain-reply pause split recorded "
+        f"slice={slice_id} reason={awaiting_reason} outbox={out.name}",
+        flush=True,
+    )
+    return 0
+
+
+def _load_chain_reply_goal(job: dict, chain: dict) -> dict | None:
+    parent_goal_id = _resolve_parent_goal_id(job, chain)
+    return _read_goal(parent_goal_id) if parent_goal_id else None
+
+
+def _arm_pause_chain_resume(
+    job: dict,
+    chain: dict,
+    *,
+    decision: str,
+    awaiting_reason: str,
+    resume_mode: str,
+    bounded: bool,
+) -> tuple[str, object]:
+    """Clear the pause park and let the generic reply open the next impl round.
+
+    ``bounded=True`` matches max_rounds inplace: one +1, then escalate.
+    ``new_ticket`` is unbounded here; the generic reply still opens one fresh
+    impl ticket (rN+1) and bumps ``max_rounds`` only when that round needs it.
+    """
+    slice_id = str(chain.get("slice") or job.get("slice") or "")
+    goal_obj = _load_chain_reply_goal(job, chain)
+    if bounded and chain.get("max_rounds_bonus_used"):
+        # dest is threaded by the caller via escalate; this arm returns a
+        # marker so the caller can escalate with the processing path.
+        return ("escalate", "pause continue refused: max_rounds bonus already used")
+    pending = chain.get("max_rounds_decision_pending") or {}
+    round_n = int(
+        pending.get("round_n")
+        or chain.get("awaiting_answer_for_round")
+        or len(chain.get("rounds") or [])
+        or 1
+    )
+    max_rounds = int(chain.get("max_rounds") or pending.get("max_rounds") or 2)
+    new_max = max_rounds
+    if bounded:
+        chain["max_rounds_bonus_used"] = True
+        new_max = max(max_rounds, round_n) + 1
+        chain["max_rounds"] = new_max
+    chain["state"] = "running"
+    chain["awaiting_reason"] = None
+    chain["pause_resume_mode"] = resume_mode
+    chain["supervisor_decision"] = {
+        "decision": decision,
+        "at": _iso(),
+        "via": "chain-reply",
+        "reason": awaiting_reason,
+        "prior_max_rounds": max_rounds,
+        "new_max_rounds": new_max,
+    }
+    if resume_mode == "new_ticket":
+        chain.pop("pause_impl_ticket", None)
+    chain.pop("max_rounds_decision_pending", None)
+    _write_chain(chain)
+    if goal_obj is not None:
+        goal_obj["last_chain_state"] = "running"
+        goal_obj["status"] = "running"
+        goal_obj.pop("awaiting_reason", None)
+        goal_obj["supervisor_decision"] = dict(chain["supervisor_decision"])
+        _write_goal(goal_obj)
+    job = dict(job)
+    if not str(job.get("answer") or "").strip():
+        job["answer"] = (
+            "Supervisor decision=new_ticket: open a fresh impl ticket."
+            if resume_mode == "new_ticket"
+            else "Supervisor decision=continue_same: bounded continue (+1 round)."
+        )
+    print(
+        f"[trial-broker] chain-reply {awaiting_reason} {decision} "
+        f"→ resume mode={resume_mode} slice={slice_id} max_rounds={new_max}",
+        flush=True,
+    )
+    return ("resume", job)
+
+
+def _apply_pause_chain_reply(
+    job: dict,
+    chain: dict,
+    dest: Path,
+    slice_id: str,
+    awaiting_reason: str,
+) -> tuple[str, object]:
+    """Handle pause_* chain-replies before the generic impl resume.
+
+    Returns ``(\"return\", rc)``, ``(\"resume\", job)``, or ``(\"ignore\", job)``.
+    ``pause_split`` never falls through to the generic path.
+    """
+    family = _pause_reply_family(awaiting_reason)
+    if not family:
+        return ("ignore", job)
+    decision = _chain_reply_pause_decision(job)
+    if decision == "split":
+        return (
+            "return",
+            _park_pause_split_chain_reply(
+                job, chain, dest, slice_id, awaiting_reason=awaiting_reason
+            ),
+        )
+    if decision == "escalate":
+        return (
+            "return",
+            _escalate_pause_chain_reply(
+                job, chain, dest, slice_id, reason=awaiting_reason
+            ),
+        )
+    if family == "pause_split":
+        err = (
+            "pause_split chain-reply needs decision=split|escalate "
+            f"(got decision={job.get('decision')!r} "
+            f"answer={str(job.get('answer') or '')[:80]!r})"
+        )
+        return ("return", _reject_chain_reply(dest, job, err))
+    if family == "pause_continue" and decision in ("continue_same", "inplace"):
+        kind, payload = _arm_pause_chain_resume(
+            job,
+            chain,
+            decision="continue_same",
+            awaiting_reason=awaiting_reason,
+            resume_mode="continue_same",
+            bounded=True,
+        )
+        if kind == "escalate":
+            return (
+                "return",
+                _escalate_pause_chain_reply(
+                    job, chain, dest, slice_id, reason=str(payload)
+                ),
+            )
+        return (kind, payload)
+    if family == "pause_new_ticket" and decision == "new_ticket":
+        return _arm_pause_chain_resume(
+            job,
+            chain,
+            decision="new_ticket",
+            awaiting_reason=awaiting_reason,
+            resume_mode="new_ticket",
+            bounded=False,
+        )
+    return ("ignore", job)
+
+
 def run_chain_reply_job(path: Path, job: dict) -> int:
     dest = PROCESSING / f"{_stamp()}-{path.name}"
     shutil.move(str(path), str(dest))
@@ -8207,9 +8465,22 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         shutil.move(str(dest), str(FAILED / dest.name))
         return 1
 
+    # Pause parks (pause_split / pause_continue / pause_new_ticket) accept the
+    # supervisor decision directly. pause_split + split stays parked — Hub does
+    # not remap awaiting_reason to max_rounds first. max_rounds handling below
+    # is unchanged.
+    awaiting_reason = str(chain.get("awaiting_reason") or "")
+    if _pause_reply_family(awaiting_reason):
+        pause_kind, pause_payload = _apply_pause_chain_reply(
+            job, chain, dest, slice_id, awaiting_reason
+        )
+        if pause_kind == "return":
+            return int(pause_payload)
+        if pause_kind == "resume":
+            job = pause_payload  # type: ignore[assignment]
+
     # max_rounds parked: answer may be a decision (inplace|split|escalate) rather
     # than a free-text foreman reply. Apply it before the generic reply path.
-    awaiting_reason = str(chain.get("awaiting_reason") or "")
     if awaiting_reason in ("max_rounds", "max_rounds_split"):
         decision = parse_max_rounds_decision(
             {"decision": job.get("decision"), "answer": job.get("answer")},

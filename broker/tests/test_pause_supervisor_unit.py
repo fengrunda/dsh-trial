@@ -50,6 +50,42 @@ def test_parse_pause_decision_five_ways():
     )
 
 
+def test_parse_pause_decision_continue_same_canonical():
+    assert (
+        ps.parse_pause_decision(
+            {"action": "pause_decision", "decision": "continue_same", "notes": "keep going"}
+        )
+        == "continue_same"
+    )
+
+
+def test_parse_pause_decision_max_rounds_inplace_is_continue_same():
+    block = {
+        "action": "max_rounds_decision",
+        "slice": "hub-k7d-l2-20261021-s1",
+        "decision": "inplace",
+        "notes": "same slice",
+    }
+    assert ps.parse_pause_decision(block) == "continue_same"
+    assert ps.parse_pause_decision({"decision": "INPLACE"}) == "continue_same"
+    assert ps.parse_pause_decision({"action": "max_rounds_decision", "decision": "split"}) == "split"
+    assert (
+        ps.parse_pause_decision({"action": "max_rounds_decision", "decision": "escalate"})
+        == "escalate"
+    )
+    assert (
+        ps.parse_pause_decision(None, text='{"decision": "inplace"}') == "continue_same"
+    )
+    assert ps.parse_pause_decision({"answer": "inplace now"}) == "continue_same"
+
+
+def test_parse_pause_decision_unknown_is_none():
+    assert ps.parse_pause_decision({"decision": "keep"}) is None
+    assert ps.parse_pause_decision({"action": "max_rounds_decision", "decision": "keep"}) is None
+    assert ps.parse_pause_decision(None, text="no machine block here") is None
+    assert ps.parse_pause_decision({}) is None
+
+
 def test_build_pause_pack_mentions_five_options():
     body = ps.build_pause_pack_body(
         slice_id="s1",
@@ -68,6 +104,11 @@ def test_build_pause_pack_mentions_five_options():
     assert "continue_same" in body and "escalate" in body
     assert "paused_limit" in body
     assert "60" in body
+    assert '"action": "pause_decision"' in body
+    assert "禁止 `action=max_rounds_decision`" in body
+    assert "禁止 `decision=inplace`" in body
+    assert "原会话继续请用 continue_same" in body
+    assert "max_rounds_decision|inplace" not in body
 
 
 def test_supervisor_reuse_same_goal():

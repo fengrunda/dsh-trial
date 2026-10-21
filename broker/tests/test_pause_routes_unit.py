@@ -144,7 +144,62 @@ def test_auto_supervisor_pause_writes_pack_and_parses(tmp_path):
         assert decision == "close"
         pack = dirs["packs"] / "s1-pause-r1.pack.md"
         assert pack.is_file()
-        assert "continue_same" in pack.read_text(encoding="utf-8")
+        text = pack.read_text(encoding="utf-8")
+        assert "continue_same" in text
+        assert "禁止 `action=max_rounds_decision`" in text
+
+
+def test_auto_supervisor_pause_accepts_max_rounds_inplace_alias(tmp_path):
+    patcher, dirs = _patched_dirs(tmp_path)
+    with patcher:
+        goal = {"goal": "g1", "supervisor_ticket_count": 0, "max_supervisor_tickets": 8}
+        job = {"goal": "g1", "cwd": str(tmp_path), "profile": "acp-lite"}
+        chain = {"slice": "s1", "goal": "g1", "pack": "s1.pack.md", "supervisor_events": []}
+
+        def fake_run_supervisor_ticket(**kwargs):
+            summary = dirs["summaries"] / "s1-sup-pause-r1.md"
+            summary.write_text(
+                "\n".join(
+                    [
+                        "```json",
+                        json.dumps(
+                            {
+                                "action": "max_rounds_decision",
+                                "slice": "s1",
+                                "decision": "inplace",
+                                "notes": "reuse session answered with touch schema",
+                            }
+                        ),
+                        "```",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            return 0, {"assert_clean": True}, summary
+
+        with mock.patch.object(tb, "run_supervisor_ticket", side_effect=fake_run_supervisor_ticket), mock.patch.object(
+            tb, "_read_goal", return_value=goal
+        ), mock.patch.object(tb, "_write_goal"), mock.patch.object(tb, "_write_chain"), mock.patch.object(
+            tb, "_bump_supervisor_tickets"
+        ), mock.patch.object(tb, "T") as T:
+            T.resolve_limits.return_value = {
+                "impl_max_steps": 30,
+                "prompt_idle_timeout_sec": 900,
+                "prompt_timeout_sec": 3600,
+            }
+            T.load_global_limits.return_value = T.resolve_limits.return_value
+            T.DEFAULT_LIMITS = {"impl_max_steps": 30}
+            decision = tb.auto_supervisor_pause_decision(
+                job,
+                chain,
+                round_n=1,
+                pause_kind="paused_limit",
+                goal=goal,
+                steps_used=60,
+                impl_ticket="impl-s1",
+            )
+        assert decision == "continue_same"
 
 
 if __name__ == "__main__":

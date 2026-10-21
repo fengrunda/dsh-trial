@@ -3304,6 +3304,9 @@ def run_open_slice(
     slot: int | None = None,
     keep_open: bool = False,
     resume: bool = False,
+    prompt_timeout_sec: int | None = None,
+    step_budget: int | None = None,
+    prompt_file: str | None = None,
 ) -> int:
     profile = T.map_profile(profile)
     if draining():
@@ -3336,11 +3339,18 @@ def run_open_slice(
         cmd.append("--final")
     if resume:
         cmd.append("--resume")
+    if prompt_file:
+        cmd.extend(["--prompt-file", str(prompt_file)])
+    if step_budget is not None and int(step_budget) > 0:
+        cmd.extend(["--step-budget", str(int(step_budget))])
     lim = T.resolve_limits(goal=goal) if goal else T.load_global_limits()
+    hard_cap = int(lim.get("prompt_timeout_sec") or T.DEFAULT_LIMITS["prompt_timeout_sec"])
+    if prompt_timeout_sec is not None and int(prompt_timeout_sec) > 0:
+        hard_cap = int(prompt_timeout_sec)
     env = _spawn_env(
         role,
         ticket=ticket,
-        prompt_timeout_sec=int(lim.get("prompt_timeout_sec") or T.DEFAULT_LIMITS["prompt_timeout_sec"]),
+        prompt_timeout_sec=hard_cap,
         prompt_idle_timeout_sec=int(
             lim.get("prompt_idle_timeout_sec") or T.DEFAULT_LIMITS["prompt_idle_timeout_sec"]
         ),
@@ -3350,10 +3360,14 @@ def run_open_slice(
         hub_profile=(goal if isinstance(goal, dict) else {}).get("hub_profile"),
         hub_bank=(goal if isinstance(goal, dict) else {}).get("hub_bank"),
     )
+    if step_budget is not None and int(step_budget) > 0:
+        env["DSH_STEP_BUDGET"] = str(int(step_budget))
     # Job timeout must exceed the prompt hard cap. A fixed 2400s backstop
     # used to cut the slice before a still-working agent finished.
     # Shared with the gate ack so the plugin's wait matches this budget.
     job_timeout = gate_job_timeout_sec(lim)
+    ask_to = int(lim.get("ask_supervisor_timeout_sec") or 600)
+    job_timeout = max(job_timeout, ask_to + hard_cap + 120)
     print(
         f"[trial-broker] spawn open-slice ticket={ticket} pack={pack_name} "
         f"profile={profile} role={role} mode={prompt_mode} "
@@ -5645,7 +5659,7 @@ def auto_supervisor_pause_decision(
         profile=profile,
         cwd=str(job.get("cwd") or chain.get("cwd") or "/workspace"),
         summary_name=summary_name,
-        prompt_mode="supervisor-max-rounds",  # same decision-style prompt template
+        prompt_mode="supervisor-pause",
         goal=goal,
         keep_open=True,
         resume=bool(reuse_kw["resume"]),
@@ -5669,16 +5683,111 @@ def auto_supervisor_pause_decision(
         "artifacts": art,
     })
     _write_chain(chain)
-    parsed = _parse_supervisor_summary(summary_path)
-    decision = PS.parse_pause_decision(parsed.get("block"), parsed.get("text") or "")
-    if not decision:
+    parsed_summary = _parse_supervisor_summary(summary_path)
+    parsed = PS.parse_pause_decision(
+        parsed_summary.get("block"), parsed_summary.get("text") or ""
+    )
+    decision = PS.pause_decision_name(parsed)
+    if not decision or not isinstance(parsed, dict):
         print("[trial-broker] pause supervisor decision empty", flush=True)
         return None
+    chain["pause_continue"] = {
+        "decision": decision,
+        "add_steps": int(parsed.get("add_steps") or 0),
+        "add_timeout_sec": int(parsed.get("add_timeout_sec") or 0),
+    }
     print(
         f"[trial-broker] pause supervisor decision={decision} kind={pause_kind} via {ticket}",
         flush=True,
     )
     return decision
+
+
+# route_pause_decision returns this instead of parking. run_chain_rounds must
+# stay inside the Goal thread and resume the same impl ticket.
+CONTINUE_SAME_INLINE = 3
+
+
+def _steps_used_for_ticket(chain: dict, ticket: str) -> int | None:
+    for rec in reversed(chain.get("rounds") or []):
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("impl_ticket") or "") != ticket:
+            continue
+        steps = rec.get("impl_steps")
+        if isinstance(steps, int):
+            return steps
+    return None
+
+
+def _resume_paused_impl_continue_same(
+    job: dict,
+    chain: dict,
+    goal: dict | None,
+    spec: dict,
+    *,
+    log_path: Path,
+    summary_name: str,
+    pack_name: str,
+) -> int:
+    """Resume the original impl ACP session. Does not bump max_rounds.
+
+    Shared by the inline pause path and a continue_same chain-reply.
+    ``--resume`` keeps the session; ``--new`` would replace it.
+    """
+    lim = T.resolve_limits(goal=goal) if goal else T.load_global_limits()
+    base_steps = int(lim.get("impl_max_steps") or T.DEFAULT_LIMITS.get("impl_max_steps") or 30)
+    ticket = str(spec.get("impl_ticket") or chain.get("pause_impl_ticket") or "")
+    used = spec.get("steps_used")
+    if not isinstance(used, int):
+        used = _steps_used_for_ticket(chain, ticket)
+    add_steps = int(spec.get("add_steps") or 0)
+    step_budget = PS.continue_same_step_budget(
+        base_steps, used if isinstance(used, int) else None, add_steps
+    )
+    base_timeout = int(lim.get("prompt_timeout_sec") or T.DEFAULT_LIMITS["prompt_timeout_sec"])
+    add_timeout = max(0, int(spec.get("add_timeout_sec") or 0))
+    timeout = base_timeout + add_timeout
+    prompt_path = ARTIFACT_ROOT / f"{ticket or 'impl'}.continue-same-prompt.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(
+        "按监理 continue_same 续跑原会话。勿重做已完成工作。"
+        "从停下的地方继续，做完按原 pack 交摘要。\n",
+        encoding="utf-8",
+    )
+    chain["last_continue_same"] = {
+        "ticket": ticket,
+        "resume": True,
+        "step_budget": step_budget,
+        "prompt_timeout_sec": timeout,
+        "add_steps": add_steps,
+        "add_timeout_sec": add_timeout,
+        "steps_used": used if isinstance(used, int) else None,
+        "max_rounds": chain.get("max_rounds"),
+    }
+    _write_chain(chain)
+    print(
+        f"[trial-broker] continue_same resume ticket={ticket} "
+        f"steps={step_budget} timeout={timeout}s (max_rounds unchanged)",
+        flush=True,
+    )
+    return run_open_slice(
+        ticket=ticket,
+        pack_name=pack_name,
+        profile=str(job.get("profile") or chain.get("profile") or "acp-lite"),
+        cwd=str(job.get("cwd") or chain.get("cwd") or "/workspace"),
+        role="impl",
+        summary_name=summary_name,
+        prompt_mode="foreman",
+        log_path=log_path,
+        goal=goal,
+        watch_mailbox=True,
+        slot=resolve_slot(job=job),
+        resume=True,
+        prompt_timeout_sec=timeout,
+        step_budget=step_budget,
+        prompt_file=str(prompt_path),
+    )
 
 
 def route_pause_decision(
@@ -5732,16 +5841,29 @@ def route_pause_decision(
         _notify_awaiting_hub(job, chain, reason="pause_new_ticket", block={}, goal=goal_obj)
         _terminal_outbox(job, chain, dest, ok=True, notify=False)
         return 0
-    # continue_same: mark for resume of same impl ticket
-    chain["state"] = "awaiting_supervisor"
-    chain["awaiting_reason"] = f"pause_continue:{pause_kind}"
+    # continue_same: same impl ticket, --resume. Do not park, do not move the
+    # processing job, do not spend a max_rounds bonus. Caller (run_chain_rounds)
+    # must keep the Goal thread and re-enter this round.
+    extra = chain.get("pause_continue") if isinstance(chain.get("pause_continue"), dict) else {}
+    chain["pause_continue"] = {
+        "decision": "continue_same",
+        "add_steps": int(extra.get("add_steps") or 0),
+        "add_timeout_sec": int(extra.get("add_timeout_sec") or 0),
+    }
+    chain["state"] = "running"
+    chain["awaiting_reason"] = None
     chain["pending_impl_pack"] = Path(pack_for_impl).name
     chain["pause_resume_mode"] = "continue_same"
     chain["pause_impl_ticket"] = impl_ticket
+    chain["inline_continue_same"] = {
+        "round_n": round_n,
+        "impl_ticket": impl_ticket,
+        "add_steps": int(chain["pause_continue"]["add_steps"]),
+        "add_timeout_sec": int(chain["pause_continue"]["add_timeout_sec"]),
+        "pack": Path(pack_for_impl).name,
+    }
     _write_chain(chain)
-    # Auto-continue inline when possible: bump max and re-enter with resume.
-    # Keep awaiting marker for observability; runner below clears it.
-    return 0
+    return CONTINUE_SAME_INLINE
 
 
 def _park_chain_awaiting_max_rounds(
@@ -6944,6 +7066,14 @@ def run_chain_rounds(
         impl_summary_name = f"{slice_id}-impl-r{round_n}"
         impl_summary = SUMMARIES / f"{impl_summary_name}.md"
         impl_log = ARTIFACT_ROOT / f"{impl_ticket}.log"
+        inline = chain.get("inline_continue_same")
+        if isinstance(inline, dict) and int(inline.get("round_n") or round_n) == round_n:
+            chain.pop("inline_continue_same", None)
+            if inline.get("impl_ticket"):
+                impl_ticket = str(inline["impl_ticket"])
+                impl_log = ARTIFACT_ROOT / f"{impl_ticket}.log"
+        else:
+            inline = None
 
         # Capture base sha before foreman (best-effort)
         base_before = _git_rev(cwd)
@@ -6964,8 +7094,8 @@ def run_chain_rounds(
         # T2 resume: an existing impl summary (or an already-recorded round) is
         # a finished ticket. Adopt it — never open a second ACP session for it
         # and never record its metric twice.
-        resumed_rec = _chain_round_record(chain, round_n) if resume else None
-        reuse_impl = bool(resume) and (
+        resumed_rec = _chain_round_record(chain, round_n) if resume and not inline else None
+        reuse_impl = bool(resume) and not inline and (
             resumed_rec is not None or impl_summary.is_file()
         )
         # T3: a bare summary file is not proof the impl ticket finished — the
@@ -7031,19 +7161,30 @@ def run_chain_rounds(
                 flush=True,
             )
         else:
-            ec = run_open_slice(
-                ticket=impl_ticket,
-                pack_name=Path(pack_for_impl).name,
-                profile=job["profile"],
-                cwd=str(cwd),
-                role="impl",
-                summary_name=impl_summary_name,
-                prompt_mode="foreman",
-                log_path=impl_log,
-                goal=goal_obj,
-                watch_mailbox=True,
-                slot=resolve_slot(job=job),
-            )
+            if inline:
+                ec = _resume_paused_impl_continue_same(
+                    job,
+                    chain,
+                    goal_obj,
+                    inline,
+                    log_path=impl_log,
+                    summary_name=impl_summary_name,
+                    pack_name=Path(pack_for_impl).name,
+                )
+            else:
+                ec = run_open_slice(
+                    ticket=impl_ticket,
+                    pack_name=Path(pack_for_impl).name,
+                    profile=job["profile"],
+                    cwd=str(cwd),
+                    role="impl",
+                    summary_name=impl_summary_name,
+                    prompt_mode="foreman",
+                    log_path=impl_log,
+                    goal=goal_obj,
+                    watch_mailbox=True,
+                    slot=resolve_slot(job=job),
+                )
             # Agents sometimes write the summary under ~/.dsh-supervisor/...
             # (glued path). Adopt into canonical SUMMARIES before missing-check.
             _adopt_misplaced_summary(impl_summary)
@@ -7214,7 +7355,7 @@ def run_chain_rounds(
                         flush=True,
                     )
                     return 0
-                return route_pause_decision(
+                rc = route_pause_decision(
                     job,
                     chain,
                     dest,
@@ -7225,6 +7366,9 @@ def run_chain_rounds(
                     goal_obj=goal_obj,
                     impl_ticket=impl_ticket,
                 )
+                if rc == CONTINUE_SAME_INLINE:
+                    continue
+                return rc
             closed = None
             if ec != 0 and closed is None and pause_kind is None:
                 closed = limit_stop_closeout(
@@ -7425,7 +7569,7 @@ def run_chain_rounds(
                     flush=True,
                 )
                 return 0
-            return route_pause_decision(
+            rc = route_pause_decision(
                 job,
                 chain,
                 dest,
@@ -7436,6 +7580,9 @@ def run_chain_rounds(
                 goal_obj=goal_obj,
                 impl_ticket=impl_ticket,
             )
+            if rc == CONTINUE_SAME_INLINE:
+                continue
+            return rc
         if status == FOREMAN_STATUS_BLOCKED:
             return _handle_foreman_blocked(
                 job,
@@ -8812,11 +8959,16 @@ def _pause_reply_family(reason: str) -> str:
     return ""
 
 
-def _chain_reply_pause_decision(job: dict) -> str | None:
+def _chain_reply_pause_decision(job: dict) -> dict | None:
     """Pause five-way from a chain-reply (inplace → continue_same)."""
     answer = str((job or {}).get("answer") or "")
     return PS.parse_pause_decision(
-        {"decision": (job or {}).get("decision"), "answer": answer},
+        {
+            "decision": (job or {}).get("decision"),
+            "answer": answer,
+            "add_steps": (job or {}).get("add_steps"),
+            "add_timeout_sec": (job or {}).get("add_timeout_sec"),
+        },
         answer,
     )
 
@@ -8985,6 +9137,107 @@ def _arm_pause_chain_resume(
     return ("resume", job)
 
 
+def _paused_impl_ticket(chain: dict, slice_id: str, round_n: int) -> str:
+    ticket = str(chain.get("pause_impl_ticket") or "").strip()
+    if ticket:
+        return ticket
+    rounds = [r for r in (chain.get("rounds") or []) if isinstance(r, dict)]
+    if rounds and str(rounds[-1].get("impl_ticket") or "").strip():
+        return str(rounds[-1]["impl_ticket"])
+    return f"impl-trial-{slice_id}-r{round_n}"
+
+
+def _arm_continue_same_reply(
+    job: dict,
+    chain: dict,
+    slice_id: str,
+    awaiting_reason: str,
+) -> dict:
+    """Mark the original impl ticket for --resume. Do not open r+1 or bump max_rounds."""
+    round_n = int(
+        chain.get("awaiting_answer_for_round") or len(chain.get("rounds") or []) or 1
+    )
+    ticket = _paused_impl_ticket(chain, slice_id, round_n)
+    extra = chain.get("pause_continue") if isinstance(chain.get("pause_continue"), dict) else {}
+    pack = str(chain.get("pending_impl_pack") or chain.get("pack") or "")
+    chain["inline_continue_same"] = {
+        "round_n": round_n,
+        "impl_ticket": ticket,
+        "add_steps": int(extra.get("add_steps") or 0),
+        "add_timeout_sec": int(extra.get("add_timeout_sec") or 0),
+        "pack": Path(pack).name if pack else "",
+    }
+    chain["pause_impl_ticket"] = ticket
+    chain["pause_resume_mode"] = "continue_same"
+    chain["state"] = "running"
+    chain["awaiting_reason"] = None
+    chain["supervisor_decision"] = {
+        "decision": "continue_same",
+        "at": _iso(),
+        "via": "chain-reply",
+        "reason": awaiting_reason,
+        "note": "resume original impl session; max_rounds unchanged",
+    }
+    _write_chain(chain)
+    goal_obj = _load_chain_reply_goal(job, chain)
+    if goal_obj is not None:
+        goal_obj["last_chain_state"] = "running"
+        goal_obj["status"] = "running"
+        goal_obj.pop("awaiting_reason", None)
+        goal_obj["supervisor_decision"] = dict(chain["supervisor_decision"])
+        _write_goal(goal_obj)
+    print(
+        f"[trial-broker] chain-reply continue_same slice={slice_id} "
+        f"ticket={ticket} round={round_n} max_rounds={chain.get('max_rounds')}",
+        flush=True,
+    )
+    return job
+
+
+def _dispatch_continue_same_rounds(
+    job: dict,
+    chain: dict,
+    dest: Path,
+    slice_id: str,
+) -> int:
+    """Re-enter the paused round with --resume. Same helper as the inline path."""
+    spec = chain.get("inline_continue_same") if isinstance(chain.get("inline_continue_same"), dict) else {}
+    start_round = int(spec.get("round_n") or 1)
+    start_pack = str(spec.get("pack") or chain.get("pending_impl_pack") or chain.get("pack") or "")
+    parent_goal_id = _resolve_parent_goal_id(job, chain)
+    parent_goal = _read_goal(parent_goal_id) if parent_goal_id else None
+    max_rounds = int(chain.get("max_rounds") or 2)
+    resume_job = {
+        "id": job.get("id") or f"chain-reply-{slice_id}",
+        "type": "chain",
+        "slice": slice_id,
+        "pack": chain.get("pack"),
+        "acceptance": chain.get("acceptance"),
+        "profile": chain.get("profile") or "acp-lite",
+        "gate_profile": chain.get("gate_profile") or chain.get("profile") or "acp-lite",
+        "cwd": chain.get("cwd") or "/workspace",
+        "max_rounds": max_rounds,
+        "notify": chain.get("notify") or job.get("notify"),
+        "notify_dry_run": chain.get("notify_dry_run") if chain.get("notify_dry_run") is not None else job.get("notify_dry_run"),
+        "notify_prefix": chain.get("notify_prefix") or job.get("notify_prefix"),
+        "goal": parent_goal_id,
+        "gate_policy": chain.get("gate_policy") or GE.GATE_POLICY_PER_SLICE,
+        "gate_grain": chain.get("gate_grain"),
+        "gate_deferred_slices": list(chain.get("gate_deferred_slices") or []),
+    }
+    if parent_goal_id:
+        resume_job["from_goal"] = True
+        resume_job["defer_supervisor_close"] = True
+        if parent_goal and parent_goal.get("supervisor_profile") is not None:
+            resume_job["supervisor_profile"] = parent_goal.get("supervisor_profile")
+    rc = run_chain_rounds(
+        resume_job, chain, dest, start_round=start_round, start_pack=start_pack or f"{slice_id}.pack.md"
+    )
+    if parent_goal_id:
+        return _settle_parent_goal_after_resume(parent_goal_id, resume_job, slice_id, dest, rc)
+    return rc
+
+
 def _apply_pause_chain_reply(
     job: dict,
     chain: dict,
@@ -9000,7 +9253,14 @@ def _apply_pause_chain_reply(
     family = _pause_reply_family(awaiting_reason)
     if not family:
         return ("ignore", job)
-    decision = _chain_reply_pause_decision(job)
+    parsed = _chain_reply_pause_decision(job)
+    decision = PS.pause_decision_name(parsed)
+    if isinstance(parsed, dict):
+        chain["pause_continue"] = {
+            "decision": parsed["decision"],
+            "add_steps": int(parsed.get("add_steps") or 0),
+            "add_timeout_sec": int(parsed.get("add_timeout_sec") or 0),
+        }
     if decision == "split":
         return (
             "return",
@@ -9023,22 +9283,10 @@ def _apply_pause_chain_reply(
         )
         return ("return", _reject_chain_reply(dest, job, err))
     if family == "pause_continue" and decision in ("continue_same", "inplace"):
-        kind, payload = _arm_pause_chain_resume(
-            job,
-            chain,
-            decision="continue_same",
-            awaiting_reason=awaiting_reason,
-            resume_mode="continue_same",
-            bounded=True,
+        return (
+            "continue_same",
+            _arm_continue_same_reply(job, chain, slice_id, awaiting_reason),
         )
-        if kind == "escalate":
-            return (
-                "return",
-                _escalate_pause_chain_reply(
-                    job, chain, dest, slice_id, reason=str(payload)
-                ),
-            )
-        return (kind, payload)
     if family == "pause_new_ticket" and decision == "new_ticket":
         return _arm_pause_chain_resume(
             job,
@@ -9086,6 +9334,8 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         )
         if pause_kind == "return":
             return int(pause_payload)
+        if pause_kind == "continue_same":
+            return _dispatch_continue_same_rounds(pause_payload, chain, dest, slice_id)
         if pause_kind == "resume":
             job = pause_payload  # type: ignore[assignment]
 
@@ -10152,6 +10402,23 @@ def _resume_goal_chain(goal: dict) -> int:
         or chain.get("pending_impl_pack")
         or Path(chain.get("pack") or f"{slice_id}.pack.md").name
     )
+    has_round = any(
+        isinstance(r, dict) and int(r.get("round") or 0) == start_round for r in rounds
+    )
+    prior_ticket = str(chain.get("pause_impl_ticket") or "").strip()
+    if has_round or prior_ticket:
+        # Same ticket name already has a session. --new would replace it.
+        if not prior_ticket:
+            prior_ticket = f"impl-trial-{slice_id}-r{start_round}"
+        chain["inline_continue_same"] = {
+            "round_n": start_round,
+            "impl_ticket": prior_ticket,
+            "add_steps": 0,
+            "add_timeout_sec": 0,
+            "pack": Path(str(start_pack)).name,
+        }
+        chain["pause_impl_ticket"] = prior_ticket
+        chain["pause_resume_mode"] = "continue_same"
     resume_job = {
         "id": f"resume-{slice_id}",
         "type": "chain",

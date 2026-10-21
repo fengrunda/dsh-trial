@@ -78,8 +78,45 @@ def _canonical_pause_decision(raw: object) -> str | None:
     return None
 
 
-def parse_pause_decision(block: dict | None, text: str = "") -> str | None:
-    """Five-way pause decision, plus max_rounds schema aliases.
+def _nonneg_int(value: object, default: int = 0) -> int:
+    try:
+        n = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else 0
+
+
+def pause_decision_name(parsed: object) -> str | None:
+    """Decision token from ``parse_pause_decision`` (dict) or a legacy string."""
+    if isinstance(parsed, str):
+        token = parsed.strip()
+        return token or None
+    if isinstance(parsed, dict):
+        token = str(parsed.get("decision") or "").strip()
+        return token or None
+    return None
+
+
+def continue_same_step_budget(base: int, used: int | None, add_steps: int) -> int:
+    """Steps left for a continue_same resume of the same impl session.
+
+    ponytail: when ``used`` is unknown, return ``base + add_steps``. That can
+    overshoot the 2× hard cap. Upgrade path: pass ``impl_steps`` from the
+    round record or the ticket log.
+    """
+    extra = _nonneg_int(add_steps)
+    base_n = max(0, _nonneg_int(base))
+    if used is None:
+        return max(1, base_n + extra)
+    remaining = max(0, base_n - int(used))
+    return max(1, remaining + extra)
+
+
+def parse_pause_decision(block: dict | None, text: str = "") -> dict | None:
+    """Five-way pause decision plus the continue_same budget deltas.
+
+    Returns ``{"decision", "add_steps", "add_timeout_sec"}`` or None.
+    ``add_*`` are 0 when the block omits them.
 
     Reused supervisor sessions often answer a pause pack with
     ``action=max_rounds_decision`` and ``decision=inplace|split|escalate``.
@@ -87,36 +124,50 @@ def parse_pause_decision(block: dict | None, text: str = "") -> str | None:
     stay awaiting_supervisor. Canonical pause_decision + five-way unchanged.
     """
     block = block if isinstance(block, dict) else {}
+    decision: str | None = None
     action = str(block.get("action") or "").strip().lower()
     if action == "max_rounds_decision":
         nested = str(block.get("decision") or "").strip().lower()
         mapped = _MAX_ROUNDS_PAUSE_ALIASES.get(nested)
         if mapped:
-            return mapped
-        if nested in PAUSE_DECISIONS:
-            return nested
+            decision = mapped
+        elif nested in PAUSE_DECISIONS:
+            decision = nested
 
-    for key in ("decision", "verdict", "choice", "action"):
-        raw = str(block.get(key) or "").strip().lower()
-        mapped = _canonical_pause_decision(raw)
-        if mapped:
-            return mapped
-        # allow action=pause_decision with nested decision
-        if raw == "pause_decision":
-            nested = _canonical_pause_decision(block.get("decision"))
-            if nested:
-                return nested
+    if decision is None:
+        for key in ("decision", "verdict", "choice", "action"):
+            raw = str(block.get(key) or "").strip().lower()
+            mapped = _canonical_pause_decision(raw)
+            if mapped:
+                decision = mapped
+                break
+            # allow action=pause_decision with nested decision
+            if raw == "pause_decision":
+                nested_dec = _canonical_pause_decision(block.get("decision"))
+                if nested_dec:
+                    decision = nested_dec
+                    break
 
-    # Prose tokens, same shape as parse_max_rounds_decision.
-    answer = str(block.get("answer") or "").strip().lower()
-    for opt in _PROSE_DECISION_OPTS:
-        if answer == opt or answer.startswith(opt + " ") or f"decision={opt}" in answer:
-            return _canonical_pause_decision(opt)
-    blob = (text or "").lower()
-    for opt in _PROSE_DECISION_OPTS:
-        if f'"decision": "{opt}"' in blob or f'"decision":"{opt}"' in blob:
-            return _canonical_pause_decision(opt)
-    return None
+    if decision is None:
+        # Prose tokens, same shape as parse_max_rounds_decision.
+        answer = str(block.get("answer") or "").strip().lower()
+        for opt in _PROSE_DECISION_OPTS:
+            if answer == opt or answer.startswith(opt + " ") or f"decision={opt}" in answer:
+                decision = _canonical_pause_decision(opt)
+                break
+    if decision is None:
+        blob = (text or "").lower()
+        for opt in _PROSE_DECISION_OPTS:
+            if f'"decision": "{opt}"' in blob or f'"decision":"{opt}"' in blob:
+                decision = _canonical_pause_decision(opt)
+                break
+    if not decision:
+        return None
+    return {
+        "decision": decision,
+        "add_steps": _nonneg_int(block.get("add_steps")),
+        "add_timeout_sec": _nonneg_int(block.get("add_timeout_sec")),
+    }
 
 
 def build_pause_pack_body(

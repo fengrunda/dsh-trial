@@ -41,22 +41,39 @@ def test_classify_none_when_clean():
     assert ps.classify_pause_reason(summary_status="done", log_text="=== run ===\nok\n") is None
 
 
+def _name(parsed):
+    assert isinstance(parsed, dict), parsed
+    return parsed["decision"]
+
+
 def test_parse_pause_decision_five_ways():
     for d in ("continue_same", "new_ticket", "close", "split", "escalate"):
-        assert ps.parse_pause_decision({"decision": d}) == d
-    assert ps.parse_pause_decision({"action": "pause_decision", "decision": "close"}) == "close"
-    assert (
-        ps.parse_pause_decision(None, text='{"decision": "continue_same"}') == "continue_same"
+        assert _name(ps.parse_pause_decision({"decision": d})) == d
+    assert _name(ps.parse_pause_decision({"action": "pause_decision", "decision": "close"})) == "close"
+    assert _name(ps.parse_pause_decision(None, text='{"decision": "continue_same"}')) == "continue_same"
+
+
+def test_parse_pause_decision_keeps_continue_budget():
+    parsed = ps.parse_pause_decision(
+        {
+            "action": "pause_decision",
+            "decision": "continue_same",
+            "add_steps": 0,
+            "add_timeout_sec": 1800,
+        }
     )
+    assert parsed == {"decision": "continue_same", "add_steps": 0, "add_timeout_sec": 1800}
+    assert ps.continue_same_step_budget(30, 22, 0) == 8
+    # used unknown: base + add, not a silent zero
+    assert ps.continue_same_step_budget(30, None, 10) == 40
 
 
 def test_parse_pause_decision_continue_same_canonical():
-    assert (
+    assert _name(
         ps.parse_pause_decision(
             {"action": "pause_decision", "decision": "continue_same", "notes": "keep going"}
         )
-        == "continue_same"
-    )
+    ) == "continue_same"
 
 
 def test_parse_pause_decision_max_rounds_inplace_is_continue_same():
@@ -66,17 +83,15 @@ def test_parse_pause_decision_max_rounds_inplace_is_continue_same():
         "decision": "inplace",
         "notes": "same slice",
     }
-    assert ps.parse_pause_decision(block) == "continue_same"
-    assert ps.parse_pause_decision({"decision": "INPLACE"}) == "continue_same"
-    assert ps.parse_pause_decision({"action": "max_rounds_decision", "decision": "split"}) == "split"
+    assert _name(ps.parse_pause_decision(block)) == "continue_same"
+    assert _name(ps.parse_pause_decision({"decision": "INPLACE"})) == "continue_same"
+    assert _name(ps.parse_pause_decision({"action": "max_rounds_decision", "decision": "split"})) == "split"
     assert (
-        ps.parse_pause_decision({"action": "max_rounds_decision", "decision": "escalate"})
+        _name(ps.parse_pause_decision({"action": "max_rounds_decision", "decision": "escalate"}))
         == "escalate"
     )
-    assert (
-        ps.parse_pause_decision(None, text='{"decision": "inplace"}') == "continue_same"
-    )
-    assert ps.parse_pause_decision({"answer": "inplace now"}) == "continue_same"
+    assert _name(ps.parse_pause_decision(None, text='{"decision": "inplace"}')) == "continue_same"
+    assert _name(ps.parse_pause_decision({"answer": "inplace now"})) == "continue_same"
 
 
 def test_parse_pause_decision_unknown_is_none():

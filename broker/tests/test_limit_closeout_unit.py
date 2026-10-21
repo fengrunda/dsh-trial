@@ -124,6 +124,8 @@ def _run(
 
     def fake_open_slice(**kwargs):
         calls.append(kwargs.get("ticket") or "")
+        if kwargs.get("resume"):
+            calls.append("resumed")
         kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
         kwargs["log_path"].write_text(log_body, encoding="utf-8")
         return 1
@@ -155,11 +157,22 @@ def _run(
         mock.patch.dict(os.environ, {"DSH_TRIAL_PR": str(pr_bin)}),
     ]
     if pause_decision is not None:
-        patches.append(
-            mock.patch.object(
-                tb, "auto_supervisor_pause_decision", return_value=pause_decision
+        if pause_decision == "continue_same":
+            box = {"n": 0}
+
+            def _once(*_a, **_k):
+                box["n"] += 1
+                return pause_decision if box["n"] == 1 else None
+
+            patches.append(
+                mock.patch.object(tb, "auto_supervisor_pause_decision", side_effect=_once)
             )
-        )
+        else:
+            patches.append(
+                mock.patch.object(
+                    tb, "auto_supervisor_pause_decision", return_value=pause_decision
+                )
+            )
     with patches[0], patches[1], patches[2]:
         if pause_decision is not None:
             with patches[3]:
@@ -315,9 +328,10 @@ def test_idle_timeout_routes_to_supervisor_pause(tmp_path: Path):
         goal, chain = _load(dirs, goal_id, slice_id)
     assert chain["state"] == "awaiting_supervisor"
     assert chain.get("pause_resume_mode") == "continue_same"
+    assert calls[0] == f"impl-trial-{slice_id}-r1"
+    assert "resumed" in calls
     assert (chain.get("last_pause") or {}).get("kind") == "paused_wallclock"
     assert goal["status"] == "running"
-    assert calls == [f"impl-trial-{slice_id}-r1"]
     dirty = subprocess.run(
         ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True, check=True
     ).stdout

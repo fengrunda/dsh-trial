@@ -13,7 +13,7 @@ Usage:
   open-slice.sh --ticket NAME --pack REL_OR_ABS [--profile acp|acp-lite]
                 [--cwd ABS] [--role gate|impl|supervisor] [--final] [--keep-open] [--resume]
                 [--log PATH] [--summary-name NAME]
-                [--prompt-mode baseline|foreman|gate|supervisor-plan|supervisor-answer|supervisor-close|supervisor-max-rounds] [--prompt-file PATH]
+                [--prompt-mode baseline|foreman|gate|supervisor-plan|supervisor-answer|supervisor-close|supervisor-max-rounds|supervisor-pause] [--prompt-file PATH]
                 [--reasoning-effort off|low|high|max] [--step-budget N]
                 [--print-prompt]
 
@@ -381,6 +381,41 @@ PROMPT
     '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
 }
 
+build_prompt_supervisor_pause() {
+  local _tpl
+  _tpl="$(cat <<'PROMPT'
+你是 dsh 试用**监理**短票（supervisor-pause）。**禁止 join 任何 team-room**，禁止 room_*。不要改业务 src。
+
+读 design_pack_read path=「@@PACK_BASENAME@@」。这是墙钟或步数暂停，不是 max_rounds 触顶。
+在 continue_same / new_ticket / close / split / escalate 中**五选一**。
+- continue_same：原 impl 会话续跑（优先）。写 add_steps 与 add_timeout_sec（秒，可加在现有墙钟上）
+- new_ticket：同分支新开 impl 票
+- close：按当前 WIP 收口
+- split：剩余工作拆走，本链保持暂停
+- escalate：升级
+
+禁止写成 max_rounds 的三选一（不要 action=max_rounds_decision，不要 decision=inplace）。
+
+写入摘要：「@@SUMMARY_OUT@@」，文末：
+```json
+{
+  "action": "pause_decision",
+  "slice": "<slice_id>",
+  "decision": "continue_same|new_ticket|close|split|escalate",
+  "add_steps": 0,
+  "add_timeout_sec": 0,
+  "notes": "一两句"
+}
+```
+硬禁：room_*；push / gh / dsh-trial-pr；空泛回复；打印 API key。
+Done when: summary 含 pause_decision，decision 为五选一之一。
+PROMPT
+)"
+  _render_prompt "$_tpl" \
+    '@@PACK_BASENAME@@' "$PACK_BASENAME" \
+    '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
+}
+
 if [[ -n "$PROMPT_FILE" ]]; then
   [[ -f "$PROMPT_FILE" ]] || { echo "prompt-file missing: $PROMPT_FILE" >&2; exit 2; }
   PROMPT="$(cat "$PROMPT_FILE")"
@@ -393,6 +428,7 @@ else
     supervisor-answer) PROMPT="$(build_prompt_supervisor_answer)" ;;
     supervisor-close)  PROMPT="$(build_prompt_supervisor_close)" ;;
     supervisor-max-rounds) PROMPT="$(build_prompt_supervisor_max_rounds)" ;;
+    supervisor-pause) PROMPT="$(build_prompt_supervisor_pause)" ;;
     *) echo "unknown --prompt-mode: $PROMPT_MODE" >&2; exit 2 ;;
   esac
 fi

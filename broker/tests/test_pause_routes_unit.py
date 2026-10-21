@@ -46,7 +46,7 @@ def test_route_pause_continue_same_parks_awaiting(tmp_path):
         dest = dirs["outbox"]
         with mock.patch.object(tb, "_notify_awaiting_hub"), mock.patch.object(
             tb, "_terminal_outbox", return_value=Path("x.json")
-        ), mock.patch.object(tb, "_write_chain"):
+        ) as term, mock.patch.object(tb, "_write_chain"):
             rc = tb.route_pause_decision(
                 job,
                 chain,
@@ -58,10 +58,14 @@ def test_route_pause_continue_same_parks_awaiting(tmp_path):
                 goal_obj={"goal": "g1"},
                 impl_ticket="impl-s1",
             )
-        assert rc == 0
-        assert chain["state"] == "awaiting_supervisor"
+        assert rc == tb.CONTINUE_SAME_INLINE
+        assert chain["state"] == "running"
         assert chain["pause_resume_mode"] == "continue_same"
-        assert "paused_limit" in chain["awaiting_reason"]
+        assert chain["pause_impl_ticket"] == "impl-s1"
+        assert chain["inline_continue_same"]["round_n"] == 1
+        assert chain.get("awaiting_reason") in (None, "")
+        assert "max_rounds_bonus_used" not in chain
+        term.assert_not_called()
 
 
 def test_route_pause_escalate_notifies(tmp_path):

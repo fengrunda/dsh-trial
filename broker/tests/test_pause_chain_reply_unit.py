@@ -215,6 +215,7 @@ def test_pause_continue_inplace_resumes_bounded(tmp_path: Path):
 
         def _rounds(job, chain, dest, **kwargs):
             seen["start_round"] = kwargs.get("start_round")
+            seen["start_pack"] = kwargs.get("start_pack")
             seen["answer"] = job.get("answer")
             chain["state"] = "running"
             tb._write_chain(chain)
@@ -224,13 +225,16 @@ def test_pause_continue_inplace_resumes_bounded(tmp_path: Path):
                 mock.patch.object(tb, "run_open_slice", side_effect=AssertionError("direct open")):
             rc = tb.run_job(inbox)
         assert rc == 0
-        assert seen["start_round"] == 3
+        assert seen["start_round"] == 2
         chain = _read(dirs, "chains", slice_id)
         goal = _read(dirs, "goals", goal_id)
         assert chain["supervisor_decision"]["decision"] == "continue_same"
         assert chain["pause_resume_mode"] == "continue_same"
-        assert chain["max_rounds_bonus_used"] is True
-        assert int(chain["max_rounds"]) == 3
+        assert chain.get("max_rounds_bonus_used") is not True
+        assert int(chain["max_rounds"]) == 2
+        assert chain["inline_continue_same"]["impl_ticket"] == "impl-r2"
+        assert chain["inline_continue_same"]["round_n"] == 2
+        assert seen["start_pack"] == f"{slice_id}.pack.md"
         assert chain.get("awaiting_reason") in (None, "")
         assert goal["status"] == "running"
         assert "awaiting_reason" not in goal

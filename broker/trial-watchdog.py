@@ -85,6 +85,13 @@ TRIAL_SUP = DSH_HOME / "supervisor" / "trial"
 INBOX = TRIAL_SUP / "inbox"
 PROCESSING = TRIAL_SUP / "processing"
 GOALS = DSH_HOME / "supervisor" / "thin-state" / "goals"
+CHAINS = DSH_HOME / "supervisor" / "thin-state" / "chains"
+_PARKED_CHAIN_STATES = frozenset({
+    "awaiting_supervisor",
+    "paused_limit",
+    "paused_wallclock",
+    "paused",
+})
 MAILBOX = T.MAILBOX
 NOTIFY = DSH_HOME / "bin" / "khub-dsh-complete-notify.py"
 PIDFILE = STATE_DIR / "trial-broker.pid"
@@ -921,6 +928,46 @@ def _write_goal_doc(path: Path, goal: dict) -> None:
     os.replace(tmp, path)
 
 
+def _goal_slice_ids(goal: dict) -> list[str]:
+    ids: list[str] = []
+    for raw in goal.get("slices") or []:
+        if isinstance(raw, str) and raw.strip():
+            ids.append(raw.strip())
+        elif isinstance(raw, dict):
+            sid = str(raw.get("slice") or raw.get("id") or "").strip()
+            if sid:
+                ids.append(sid)
+    cur = str(goal.get("current_slice") or "").strip()
+    if cur and cur not in ids:
+        ids.append(cur)
+    return ids
+
+
+def _chain_state(slice_id: str) -> str:
+    path = CHAINS / f"{slice_id}.json"
+    if not path.is_file():
+        return ""
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("state") or "").strip()
+
+
+def _goal_parked_slice(goal: dict) -> str:
+    """Slice id when this Goal is waiting on a supervisor pause, else ''."""
+    for sid in _goal_slice_ids(goal):
+        if _chain_state(sid) in _PARKED_CHAIN_STATES:
+            return sid
+    cur = str(goal.get("current_slice") or "").strip()
+    last = str(goal.get("last_chain_state") or "").strip()
+    if cur and last in _PARKED_CHAIN_STATES:
+        return cur
+    return ""
+
+
 def _goal_has_job(goal: dict, goal_id: str) -> bool:
     """True when the Goal still owns a processing/inbox job (or declared path)."""
     raw = str(goal.get("processing_job") or "").strip()
@@ -1066,6 +1113,9 @@ def sweep_stale_gate_running_and_orphans(
                 continue
             age = _goal_age_sec(goal, now)
             if age is not None and age <= threshold:
+                continue
+            parked = _goal_parked_slice(goal)
+            if parked:
                 continue
             reason = (
                 f"orphan running goal status={status}: no processing job / live "

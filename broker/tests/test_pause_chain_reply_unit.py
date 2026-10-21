@@ -269,3 +269,44 @@ def test_pause_new_ticket_opens_fresh_round(tmp_path: Path):
         assert chain["pause_resume_mode"] == "new_ticket"
         assert "pause_impl_ticket" not in chain
         assert chain.get("max_rounds_bonus_used") is not True
+
+
+def test_load_job_chain_reply_keeps_continue_same_budget_deltas(tmp_path):
+    """PR #21 follow-up: chain-reply must not drop add_steps / add_timeout_sec."""
+    job_path = tmp_path / "chain-reply.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "type": "chain-reply",
+                "slice": "s1",
+                "decision": "continue_same",
+                "add_steps": 0,
+                "add_timeout_sec": 1800,
+                "answer": "continue",
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = tb.load_job(job_path)
+    assert job["type"] == "chain-reply"
+    assert job["decision"] == "continue_same"
+    assert job["add_steps"] == 0
+    assert job["add_timeout_sec"] == 1800
+
+
+def test_load_job_goal_update_keeps_impl_max_steps(tmp_path):
+    job_path = tmp_path / "goal-update.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "type": "goal-update",
+                "goal": "g1",
+                "impl_max_steps": 80,
+                "prompt_idle_timeout_sec": 900,
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = tb.load_job(job_path)
+    assert job["impl_max_steps"] == 80
+    assert job["prompt_idle_timeout_sec"] == 900

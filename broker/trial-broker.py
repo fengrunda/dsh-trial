@@ -870,6 +870,12 @@ def load_job(path: Path) -> dict:
         raw_decision = data.get("decision")
         if raw_decision is not None and str(raw_decision).strip():
             reply["decision"] = str(raw_decision).strip()
+        # continue_same budget deltas (PR #21). Must not drop — parse_pause_decision
+        # reads these off the job; answer prose alone does not carry add_*.
+        if data.get("add_steps") is not None:
+            reply["add_steps"] = data.get("add_steps")
+        if data.get("add_timeout_sec") is not None:
+            reply["add_timeout_sec"] = data.get("add_timeout_sec")
         return reply
 
     if jtype == "goal-update":
@@ -887,6 +893,10 @@ def load_job(path: Path) -> dict:
             "ask_supervisor_timeout_sec": data.get("ask_supervisor_timeout_sec"),
             "ask_supervisor_poll_ms": data.get("ask_supervisor_poll_ms"),
             "prompt_timeout_sec": data.get("prompt_timeout_sec"),
+            "prompt_idle_timeout_sec": data.get("prompt_idle_timeout_sec"),
+            "impl_max_steps": data.get("impl_max_steps"),
+            "inplace_rework_max_prompt": data.get("inplace_rework_max_prompt"),
+            "inplace_rework_max_findings": data.get("inplace_rework_max_findings"),
             "action": data.get("action"),
             "resume": bool(data.get("resume")),
         }
@@ -5736,7 +5746,14 @@ def _resume_paused_impl_continue_same(
     ``--resume`` keeps the session; ``--new`` would replace it.
     """
     lim = T.resolve_limits(goal=goal) if goal else T.load_global_limits()
-    base_steps = int(lim.get("impl_max_steps") or T.DEFAULT_LIMITS.get("impl_max_steps") or 30)
+    # Prefer role_step_budget (impl default 80) over soft impl_max_steps (30) so
+    # continue_same remaining matches the budget the paused ticket actually ran.
+    base_steps = int(
+        T.role_step_budget("impl", lim)
+        or lim.get("impl_max_steps")
+        or T.DEFAULT_LIMITS.get("impl_max_steps")
+        or 30
+    )
     ticket = str(spec.get("impl_ticket") or chain.get("pause_impl_ticket") or "")
     used = spec.get("steps_used")
     if not isinstance(used, int):

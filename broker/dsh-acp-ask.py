@@ -322,10 +322,14 @@ def classify_transient(err: str) -> str | None:
 
     Timeouts, early process exits and ordinary 4xx parameter errors are
     deliberately not transient: retrying them only burns the ticket budget.
+    A 422 whose body says the upstream endpoint is unavailable is a channel
+    outage, not a bad request, so it retries like a 5xx.
     """
     low = err.lower()
     if re.search(r"role\s*.?developer.? is not supported", low):
         return "developer_role_400"
+    if re.search(r"endpoint is unavailable", low):
+        return "endpoint_unavailable"
     if re.search(r"turn failed: 429|rate.?limit", low):
         return "rate_limit"
     if re.search(

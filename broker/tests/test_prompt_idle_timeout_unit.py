@@ -46,10 +46,10 @@ class _FakeClient:
 
 def test_prompt_timeout_defaults_are_idle_plus_hard_cap():
     idle, hard = ask.prompt_timeouts_from_env({})
-    assert idle == 1800
-    assert hard == 3600
-    assert T.DEFAULT_LIMITS["prompt_idle_timeout_sec"] == 1800
-    assert T.DEFAULT_LIMITS["prompt_timeout_sec"] == 3600
+    assert idle == 900
+    assert hard == 1800
+    assert T.DEFAULT_LIMITS["prompt_idle_timeout_sec"] == 900
+    assert T.DEFAULT_LIMITS["prompt_timeout_sec"] == 1800
     assert T.DEFAULT_LIMITS["prompt_idle_timeout_sec"] > T.DEFAULT_LIMITS["ask_supervisor_timeout_sec"]
 
 
@@ -72,8 +72,9 @@ def test_legacy_1800_wall_without_idle_key_becomes_hard_cap():
             loaded = T.load_global_limits()
         finally:
             T.LIMITS_PATH = old
-    assert loaded["prompt_timeout_sec"] == 3600
-    assert loaded["prompt_idle_timeout_sec"] == 1800
+    # Legacy lone 1800 wall migrates hard → DEFAULT (now 1800) and fills idle DEFAULT (900).
+    assert loaded["prompt_timeout_sec"] == 1800
+    assert loaded["prompt_idle_timeout_sec"] == 900
     assert loaded["max_slices"] == 3
 
 

@@ -90,7 +90,7 @@ def _verdict_block(verdict: str, findings: list | None = None) -> dict:
 # --------------------------------------------------------------------------
 def test_gate_job_timeout_sec_defaults_and_env(monkeypatch):
     monkeypatch.delenv("TRIAL_BROKER_JOB_TIMEOUT", raising=False)
-    assert tb.gate_job_timeout_sec({}) == 4320  # 600 + 3600 + 120
+    assert tb.gate_job_timeout_sec({}) == 2520  # 600 + 1800 + 120
     assert tb.gate_job_timeout_sec(
         {"ask_supervisor_timeout_sec": 600, "prompt_timeout_sec": 3600}
     ) == 4320

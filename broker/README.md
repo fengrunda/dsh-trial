@@ -166,7 +166,7 @@ trial-broker 在**每 job 结束**与**空闲轮询（≥1h）**时调用 GC（`
 
 - broker 与插件共用同一全局 mailbox：`DSH_TRIAL_MAILBOX` 可覆盖默认 `~/.dsh/supervisor/thin-state/mailbox`（`trial_lib.MAILBOX` 绝对规范化，`trial-broker.py` 直接取 `T.MAILBOX`）。
 - 插件侧同步等待（`ask_supervisor` / `submit_for_review`）超时须 ≥ 工具 `timeoutSec`，且 `timeoutSec ≤ ask_supervisor_timeout_sec`（默认 600s）。
-- ACP `session/prompt` 是空闲超时加硬上限，不是整段墙钟。`prompt_idle_timeout_sec` / `DSH_ACP_PROMPT_IDLE_TIMEOUT`（默认 900）在 ACP stdout 有进展时重置，且须大于 `ask_supervisor_timeout_sec`（600），避免监理等待被当成挂起。`prompt_timeout_sec` / `DSH_ACP_PROMPT_TIMEOUT`（默认 3600）是硬上限，真卡死不会永远占着 broker。仓库里的 `broker/dsh-acp-ask.py` 实现该语义；broker 用 `DSH_ACP_ASK` 指向它。旧的 limits.json 若只写了 `prompt_timeout_sec=1800` 且没有 idle 键，读取时视为过时墙钟，改用 3600 硬上限。
+- ACP `session/prompt` 是空闲超时加硬上限，不是整段墙钟。`prompt_idle_timeout_sec` / `DSH_ACP_PROMPT_IDLE_TIMEOUT`（默认 900 / 15m）在 ACP stdout 有进展时重置，且须大于 `ask_supervisor_timeout_sec`（600），避免监理等待被当成挂起。`prompt_timeout_sec` / `DSH_ACP_PROMPT_TIMEOUT`（默认 1800 / 30m）是硬上限，真卡死不会永远占着 broker。仓库里的 `broker/dsh-acp-ask.py` 实现该语义；broker 用 `DSH_ACP_ASK` 指向它。旧的 limits.json 若只写了 `prompt_timeout_sec=1800` 且没有 idle 键，读取时视为过时墙钟，改用当前 DEFAULT 硬上限（现为 1800）并填入 DEFAULT idle（900）。
 - impl 票期间 broker 有 watcher 扫同一 `MAILBOX/pending` 并即时回写 `answers/`。
 
 ## Gate 硬规则

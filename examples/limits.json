@@ -8,12 +8,12 @@
   "inplace_rework_max_prompt": 20000,
   "inplace_rework_max_findings": 3,
   "impl_max_steps": 30,
-  "notes": "Template for $DSH_HOME/supervisor/trial/limits.json. prompt_idle_timeout_sec=1800 (30m soft wall → paused_wallclock); prompt_timeout_sec=3600 (1h hard cap). Copy and tune; no tenant secrets. | gate_grain=per_goal (Runda 2026-10-20): one Goal-end gate; pack gate:per_slice / risk:high still per-slice. reasoning_effort_by_role defaults high/low/low (supervisor high; gate/impl low; gate risk=high still upgrades via broker/gate_effort.py).",
+  "notes": "Template for $DSH_HOME/supervisor/trial/limits.json. prompt_idle_timeout_sec=1800 (30m soft wall → paused_wallclock); prompt_timeout_sec=3600 (1h hard cap). Copy and tune; no tenant secrets. | gate_grain=per_goal (Runda 2026-10-20): one Goal-end gate; pack gate:per_slice / risk:high still per-slice. reasoning_effort_by_role defaults high/high/high (supervisor/impl/gate all high, Runda 2026-10-21; gate risk=high still upgrades via broker/gate_effort.py).",
   "prompt_idle_timeout_sec": 1800,
   "gate_grain": "per_goal",
   "reasoning_effort_by_role": {
     "supervisor": "high",
-    "impl": "low",
-    "gate": "low"
+    "impl": "high",
+    "gate": "high"
   }
 }

@@ -169,7 +169,7 @@ python3 broker/trial-broker.py --events-since <cursor.json> --peek
 `DSH_TRIAL_WORKTREE_PREFIXES`（缺省 `/workspace/dsh-wt/`）下的 `<前缀>/<第一段>`
 若出现在 brief 里，或 job 写了 `worktree` / `extra_cwds`，也占冲突键。
 worktree 不要放进仓库目录里面。同一条分支不能检出两份。
-新 Goal 的 cwd 和在飞的票冲突时，调度在前缀下 `git worktree add -b` 一条新分支，并把这份 Goal 的 cwd 改过去。同一 Goal 的后续、chain-reply、goal-update 仍排队。git 失败就保持排队，不丢 Goal。
+新 Goal 的 cwd 和在飞的票冲突时，调度会在前缀下开新分支的 worktree 并把 cwd 改过去；同一 Goal 仍串行。
 
 ### Chain-reply
 

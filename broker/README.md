@@ -88,7 +88,7 @@ python3 ./broker/trial-watchdog.py --once --dry-run   # 只打印 payload，不�
    宽限期内 broker 续心跳即恢复正常，宽限过后仍不续才报 stalled。`no_broker_process`
    与 session-idle（纯单调钟）不受宽限影响。
 
-孤儿扫描（`running` / `planning` / `closeout`，没有 processing/inbox 里这份 Goal 的 job，年龄超过 `TRIAL_WATCHDOG_STALE_GATE_SEC`，默认 180s）只感知，不再把 Goal `status` 写成 `escalated`。下面三条有一条就留下：心跳文件还新鲜且 `slots` 里有这个 goal（`ticket` 为空也算活，拆片或换票的空隙 Goal 线程仍占着槽）；进程表能看到带这个 goal id 的 `open-slice.sh` / `dsh-acp-ask.py`（macOS 用 `ps` 列子进程，用已有的 `KERN_PROCARGS2` 读 argv 和环境，不读 `/proc`）；processing/inbox 里还有这份 job。三条都没有，才往现有 outbox 写过渡事件 `orphan_supervisor_handoff`（不发终态通知），交给已有的 Goal 级监理会话 `supervisor-goal-<id>`（keep_open，五选一）。只有监理能决定 escalate。已经 parked 等监理的 Goal 继续跳过。
+孤儿扫描（`running` / `planning` / `closeout`，没有 processing/inbox 里这份 Goal 的 job，年龄超过 `TRIAL_WATCHDOG_STALE_GATE_SEC`，默认 180s）只感知，不再把 Goal `status` 写成 `escalated`。下面三条有一条就留下：心跳文件还新鲜且 `slots` 里有这个 goal（`ticket` 为空也算活，拆片或换票的空隙 Goal 线程仍占着槽）；进程表能看到带这个 goal id 的 `open-slice.sh` / `dsh-acp-ask.py`（macOS 用 `ps` 列子进程，用已有的 `KERN_PROCARGS2` 读 argv 和环境，不读 `/proc`）；processing/inbox 里还有这份 job。三条都没有，才往现有 outbox 写过渡事件 `orphan_supervisor_handoff`（不发终态通知），交给已有的 Goal 级监理会话 `supervisor-goal-<id>`（keep_open，五选一）。只有监理能决定 escalate。已经 parked 等监理的 Goal 继续跳过。broker 启动时的 `reconcile_orphan_running_goals` 和 `collect_resume_items` 走同一条，不看年龄门槛：三条有一条就不交接；三条都没有就写同一个 `perceive_handoff`，由已有调度器去开那张监理票，启动本身不把 status 写成 `escalated`。
 
 事件 payload 统一带 `goal` / `status` / `reason` / `suggested_action`；同一 `reason_key`
 在 `TRIAL_WATCHDOG_COOLDOWN_SEC`（默认 900s）内不重复发。
@@ -122,7 +122,10 @@ python3 ./broker/trial-watchdog.py --once --dry-run   # 只打印 payload，不�
 
 1. 开 `impl-trial-<slice>-r<N>`（role=impl，prompt-mode=foreman）→ 结构化 summary。  
 2. 工头 `done` → broker 写 `packs/<slice>-gate-r<N>.pack.md`（原 pack + acceptance + 工头块 + diff）→ 开 `gate-trial-<slice>-r<N>`。  
-3. Gate 写 `summaries/<slice>-gate-r<N>.md`（verdict PASS|HOLD + findings）。  
+3. Gate 写 `summaries/<slice>-gate-r<N>.md`（verdict PASS|HOLD + findings）。
+   摘要在但没有可解析机器块，且 round 还没到 `max_rounds`：不新开实现轮，也不当成 PASS。
+   交给已有的 `supervisor-goal-<id>`（keep_open）三选一 `rerun_gate` / `question` / `escalate`。
+   过渡事件 kind=`machine_block_handoff`。只有 `escalate` 才是终态。  
 4. HOLD 且 round < max → 写 fix pack：**Gate findings 是主任务**（正文最前），
    Done when 要求逐条 `finding_resolutions`，**原 pack 缩略作附录** → 下一轮工头；满轮 HOLD → `escalated`。  
 5. 工头票中 `submit_for_review` 返回 HOLD：

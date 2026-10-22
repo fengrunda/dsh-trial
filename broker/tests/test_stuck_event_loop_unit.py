@@ -15,8 +15,8 @@ Rules under test:
      ERROR, archives pending, and re-raises;
   b) ``_fail_ask_after_error`` overwrites an existing gate_running ack instead
      of skipping it;
-  c) ``reconcile_orphan_running_goals`` escalates a running Goal with no
-     processing job;
+  c) ``reconcile_orphan_running_goals`` hands a jobless running Goal to the
+     supervisor instead of writing ``escalated``;
   d) the watchdog sweep warns on (dry-run) and clears (real) a stale
      gate_running ack with no live process.
 """
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from contextlib import ExitStack
 from pathlib import Path
@@ -149,27 +150,54 @@ def test_fail_ask_after_error_overwrites_gate_running(tmp_path: Path):
         assert (d["mailbox"] / "archive" / f"{ask_id}.pending.json").is_file()
 
 
+def _handoff_events(outbox: Path) -> list[dict]:
+    events = []
+    for path in sorted(outbox.glob("*.json")):
+        body = json.loads(path.read_text(encoding="utf-8"))
+        if body.get("kind") == "orphan_supervisor_handoff":
+            events.append(body)
+    return events
+
+
+def _quiet_alive(stack, root: Path):
+    """No live broker heartbeat and no real process table in these tests."""
+    stack.enter_context(mock.patch.object(tb, "_work_pid_holds_goal", return_value=False))
+    stack.enter_context(mock.patch.object(tb, "HEARTBEAT", root / "no-heartbeat.json"))
+
+
 # --------------------------------------------------------------------------
-# c) reconcile_orphan_running_goals escalates a jobless running Goal
+# c) jobless running Goal is handed to the supervisor, not escalated
 # --------------------------------------------------------------------------
-def test_reconcile_orphan_running_goal_escalates(tmp_path: Path):
+def test_reconcile_orphan_running_goal_hands_off(tmp_path: Path):
     ctx, d = _patched_dirs(tmp_path / "state")
     goal_id = "orphan-1"
+    _quiet_alive(ctx, tmp_path)
     with ctx:
         (d["goals"] / f"{goal_id}.json").write_text(
-            json.dumps({"goal": goal_id, "status": "running"}), encoding="utf-8"
+            json.dumps({"goal": goal_id, "status": "running", "current_slice": "s1"}),
+            encoding="utf-8",
         )
         escalated = tb.reconcile_orphan_running_goals()
-        assert escalated == [goal_id]
+        assert escalated == []
         goal = json.loads((d["goals"] / f"{goal_id}.json").read_text())
-        assert goal["status"] == "escalated"
-        assert goal["escalate_reason"] == "orphan_running_no_processing"
-        assert "processing job missing" in goal["error"]
+        assert goal["status"] == "running"
+        assert "escalate_reason" not in goal
+        hand = goal["perceive_handoff"]
+        assert hand["handed"] is True
+        assert hand["opened"] is False
+        assert hand["reason"] == "orphan_running_no_processing"
+        assert hand["ticket"] == f"supervisor-goal-{goal_id}"
+        events = _handoff_events(d["outbox"])
+        assert len(events) == 1
+        assert events[0]["status"] == "handoff"
+        assert events[0]["kind"] == "orphan_supervisor_handoff"
+        assert events[0]["status"] not in ("escalated", "dsh-trial-complete", "PASS")
 
 
-def test_collect_resume_items_escalates_instead_of_leaving_alone(tmp_path: Path):
+def test_collect_resume_items_hands_off_instead_of_leaving_alone(tmp_path: Path):
     ctx, d = _patched_dirs(tmp_path / "state")
     goal_id = "orphan-2"
+    _quiet_alive(ctx, tmp_path)
     with ctx:
         (d["goals"] / f"{goal_id}.json").write_text(
             json.dumps({"goal": goal_id, "status": "planning"}), encoding="utf-8"
@@ -177,8 +205,65 @@ def test_collect_resume_items_escalates_instead_of_leaving_alone(tmp_path: Path)
         items = tb.collect_resume_items()
         assert items == []
         goal = json.loads((d["goals"] / f"{goal_id}.json").read_text())
-        assert goal["status"] == "escalated"
-        assert goal["escalate_reason"] == "orphan_running_no_processing"
+        assert goal["status"] == "planning"
+        assert "escalate_reason" not in goal
+        assert goal["perceive_handoff"]["handed"] is True
+        assert goal["perceive_handoff"]["ticket"] == f"supervisor-goal-{goal_id}"
+
+
+def test_reconcile_keeps_goal_when_heartbeat_slot_is_fresh(tmp_path: Path):
+    ctx, d = _patched_dirs(tmp_path / "state")
+    goal_id = "orphan-hb"
+    hb = tmp_path / "heartbeat.json"
+    hb.write_text(
+        json.dumps({"slots": [{"goal": goal_id, "ticket": ""}]}),
+        encoding="utf-8",
+    )
+    ctx.enter_context(mock.patch.object(tb, "HEARTBEAT", hb))
+    ctx.enter_context(mock.patch.object(tb, "_work_pid_holds_goal", return_value=False))
+    with ctx:
+        (d["goals"] / f"{goal_id}.json").write_text(
+            json.dumps({"goal": goal_id, "status": "running"}), encoding="utf-8"
+        )
+        assert tb.reconcile_orphan_running_goals() == []
+        goal = json.loads((d["goals"] / f"{goal_id}.json").read_text())
+        assert "perceive_handoff" not in goal
+        assert goal["status"] == "running"
+        ago = hb.stat().st_mtime - 1000
+        os.utime(hb, (ago, ago))
+        assert tb.reconcile_orphan_running_goals() == []
+        goal = json.loads((d["goals"] / f"{goal_id}.json").read_text())
+        assert goal["status"] == "running"
+        assert goal["perceive_handoff"]["handed"] is True
+
+
+def test_reconcile_keeps_goal_when_work_pid_or_inbox_holds_it(tmp_path: Path):
+    ctx, d = _patched_dirs(tmp_path / "state")
+    pid_goal = "orphan-pid"
+    inbox_goal = "orphan-inbox"
+    ctx.enter_context(mock.patch.object(tb, "HEARTBEAT", tmp_path / "no-heartbeat.json"))
+    ctx.enter_context(mock.patch.object(
+        tb, "_work_pid_holds_goal", side_effect=lambda goal_id: goal_id == pid_goal,
+    ))
+    with ctx:
+        (d["goals"] / f"{pid_goal}.json").write_text(
+            json.dumps({"goal": pid_goal, "status": "closeout"}), encoding="utf-8"
+        )
+        (d["goals"] / f"{inbox_goal}.json").write_text(
+            json.dumps({"goal": inbox_goal, "status": "running"}), encoding="utf-8"
+        )
+        (d["inbox"] / "job.json").write_text(
+            json.dumps({"goal": inbox_goal, "type": "ticket"}), encoding="utf-8"
+        )
+        assert tb.reconcile_orphan_running_goals() == []
+        pid_body = json.loads((d["goals"] / f"{pid_goal}.json").read_text())
+        inbox_body = json.loads((d["goals"] / f"{inbox_goal}.json").read_text())
+        assert pid_body["status"] == "closeout"
+        assert inbox_body["status"] == "running"
+        assert "perceive_handoff" not in pid_body
+        assert "perceive_handoff" not in inbox_body
+        assert "escalate_reason" not in pid_body
+        assert "escalate_reason" not in inbox_body
 
 
 # --------------------------------------------------------------------------
@@ -347,3 +432,4 @@ def test_reconcile_orphan_skips_awaiting_supervisor(tmp_path: Path):
         after = json.loads((d["goals"] / f"{goal_id}.json").read_text(encoding="utf-8"))
         assert after["status"] == "running"
         assert after.get("escalate_reason") is None
+        assert "perceive_handoff" not in after

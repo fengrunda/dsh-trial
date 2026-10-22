@@ -13,7 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -150,7 +150,20 @@ def test_missing_machine_block_is_question_not_hold(tmp_path: Path):
     assert "summary path missing" in answer["instruction"]
 
 
-def _drive(dirs: dict, root: Path, slice_id: str, fake_open_slice, *, max_rounds: int = 2):
+class _NoSupervisor:
+    pass
+
+
+def _drive(
+    dirs: dict,
+    root: Path,
+    slice_id: str,
+    fake_open_slice,
+    *,
+    max_rounds: int = 2,
+    goal_id: str = "",
+    supervisor=_NoSupervisor,
+):
     pack = dirs["packs"] / f"{slice_id}.pack.md"
     pack.write_text(f"---\nslice_id: {slice_id}\n---\n# pack\n", encoding="utf-8")
     job = {
@@ -165,7 +178,20 @@ def _drive(dirs: dict, root: Path, slice_id: str, fake_open_slice, *, max_rounds
         "max_rounds": max_rounds,
         "gate_policy": "per_goal",
     }
+    if goal_id:
+        job["goal"] = goal_id
+        (dirs["goals"] / f"{goal_id}.json").write_text(
+            json.dumps({
+                "goal": goal_id,
+                "status": "running",
+                "slices": [slice_id],
+                "current_slice": slice_id,
+            }),
+            encoding="utf-8",
+        )
     chain = tb._new_chain_state(job)
+    if goal_id:
+        chain["goal"] = goal_id
     dest = dirs["processing"] / f"{slice_id}.json"
     calls: list = []
 
@@ -173,13 +199,41 @@ def _drive(dirs: dict, root: Path, slice_id: str, fake_open_slice, *, max_rounds
         calls.append(kwargs)
         return fake_open_slice(**kwargs)
 
+    supervisor_patch = (
+        nullcontext()
+        if supervisor is _NoSupervisor
+        else mock.patch.object(
+            tb, "auto_supervisor_machine_block_decision", return_value=supervisor,
+        )
+    )
     with mock.patch.object(tb, "run_open_slice", side_effect=_wrap), \
             mock.patch.object(tb, "write_artifacts", side_effect=_fake_artifacts), \
-            mock.patch.object(tb, "maybe_notify_hub", return_value={"sent": True}):
+            mock.patch.object(tb, "maybe_notify_hub", return_value={"sent": True}), \
+            supervisor_patch as sup:
         rc = tb.run_chain_rounds(
             job, chain, dest, start_round=1, start_pack=pack.name,
         )
-    return rc, chain, calls
+    return rc, chain, calls, sup
+
+
+def _impl_summary(block_status: str = "done"):
+    return {
+        "status": block_status,
+        "changed_files": ["docs/x.md"],
+        "base": "b",
+        "commit": "c",
+        "questions": [],
+        "notes": "ok",
+    }
+
+
+def _event_bodies(dirs: dict) -> list[dict]:
+    bodies = []
+    for path in sorted(dirs["outbox"].glob("*.json")):
+        body = json.loads(path.read_text(encoding="utf-8"))
+        if body.get("kind"):
+            bodies.append(body)
+    return bodies
 
 
 def test_chain_reads_legacy_goal_summary_as_pass(tmp_path: Path):
@@ -206,7 +260,7 @@ def test_chain_reads_legacy_goal_summary_as_pass(tmp_path: Path):
         return 0
 
     with _patched_dirs(tmp_path / "state") as dirs:
-        rc, chain, calls = _drive(dirs, root, slice_id, fake_open_slice)
+        rc, chain, calls, _sup = _drive(dirs, root, slice_id, fake_open_slice)
         gate = [c for c in calls if c.get("role") == "gate"]
         assert len(gate) == 1, calls
         assert gate[0]["summary_name"] == f"{slice_id}-gate-r1"
@@ -230,21 +284,159 @@ def test_missing_gate_summary_does_not_open_another_impl(tmp_path: Path):
             return 0
         _write_summary(
             tb.SUMMARIES / f"{kwargs['summary_name']}.md",
-            {"status": "done", "changed_files": ["docs/x.md"], "base": "b",
-             "commit": "c", "questions": [], "notes": "ok"},
+            _impl_summary(),
         )
         return 0
 
     with _patched_dirs(tmp_path / "state") as dirs:
-        rc, chain, calls = _drive(dirs, root, slice_id, fake_open_slice, max_rounds=2)
+        rc, chain, calls, sup = _drive(
+            dirs, root, slice_id, fake_open_slice, max_rounds=2, supervisor="question",
+        )
         assert rc == 0, chain
         assert chain["state"] == "awaiting_supervisor", chain
         assert chain["last_verdict"] == "question", chain
         assert chain["awaiting_reason"] == "summary_path_missing", chain
         assert "summary path missing" in str(chain.get("error") or "")
         assert chain["last_verdict"] != "HOLD"
+        assert chain["last_verdict"] != "PASS"
         impls = [c for c in calls if c.get("role") != "gate"]
         assert len(impls) == 1, calls
+        assert sup.call_count == 1
         last = chain["rounds"][-1]
         assert last["verdict"] == "question"
         assert not (last.get("gate_block") or {}).get("findings")
+        kinds = [b["kind"] for b in _event_bodies(dirs)]
+        assert "machine_block_handoff" in kinds
+        assert "dsh-trial-complete" not in kinds
+        assert "goal_terminal" not in kinds
+
+
+def test_parse_machine_block_decision_rejects_impl_choices():
+    assert tb.parse_machine_block_decision({"decision": "rerun_gate"}) == "rerun_gate"
+    assert tb.parse_machine_block_decision({"decision": "question"}) == "question"
+    assert tb.parse_machine_block_decision({"decision": "escalate"}) == "escalate"
+    assert tb.parse_machine_block_decision({"decision": "continue_same"}) is None
+    assert tb.parse_machine_block_decision({"decision": "new_ticket"}) is None
+    assert tb.parse_machine_block_decision(None, "") is None
+
+
+def _unreadable_gate(slice_id: str):
+    gates = {"n": 0}
+
+    def fake_open_slice(**kwargs):
+        kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["log_path"].write_text("unit\n", encoding="utf-8")
+        if kwargs.get("role") == "gate":
+            gates["n"] += 1
+            path = tb.SUMMARIES / f"{kwargs['summary_name']}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if gates["n"] == 1:
+                path.write_text("看过 diff，没有机器块。\n", encoding="utf-8")
+            else:
+                _write_summary(
+                    path,
+                    {"verdict": "PASS", "findings": [], "unmet_acceptance": []},
+                    prose="PASS。0 P0 / 0 P1。",
+                )
+            return 0
+        _write_summary(tb.SUMMARIES / f"{kwargs['summary_name']}.md", _impl_summary())
+        return 0
+
+    return fake_open_slice
+
+
+def test_unreadable_gate_summary_asks_supervisor_not_pass(tmp_path: Path):
+    slice_id = "unit-path-noblock"
+    root = tmp_path / "repo"
+    root.mkdir()
+    with _patched_dirs(tmp_path / "state") as dirs:
+        rc, chain, calls, sup = _drive(
+            dirs, root, slice_id, _unreadable_gate(slice_id),
+            max_rounds=2, supervisor="question",
+        )
+        assert rc == 0, chain
+        assert chain["state"] == "awaiting_supervisor", chain
+        assert chain["awaiting_reason"] == "machine_block_missing", chain
+        assert chain["last_verdict"] == "question"
+        assert chain["last_verdict"] != "PASS"
+        assert len([c for c in calls if c.get("role") == "impl"]) == 1
+        assert len([c for c in calls if c.get("role") == "gate"]) == 1
+        assert sup.call_count == 1
+        assert sup.call_args.kwargs["reason"] == "machine_block_missing"
+        handoff = [
+            b for b in _event_bodies(dirs) if b["kind"] == "machine_block_handoff"
+        ]
+        assert len(handoff) == 1
+        assert handoff[0]["decision"] == "question"
+        assert handoff[0]["kind"] not in ("PASS", "escalated", "dsh-trial-complete")
+
+
+def test_unreadable_gate_summary_rerun_gate_does_not_open_impl(tmp_path: Path):
+    slice_id = "unit-path-rerun"
+    root = tmp_path / "repo"
+    root.mkdir()
+    with _patched_dirs(tmp_path / "state") as dirs:
+        rc, chain, calls, sup = _drive(
+            dirs, root, slice_id, _unreadable_gate(slice_id),
+            max_rounds=2, supervisor="rerun_gate",
+        )
+        assert rc == 0, chain
+        assert chain["state"] == "PASS", chain
+        assert chain["last_verdict"] == "PASS"
+        assert len([c for c in calls if c.get("role") == "impl"]) == 1, calls
+        assert len([c for c in calls if c.get("role") == "gate"]) == 2, calls
+        assert sup.call_count == 1
+        kinds = [b["kind"] for b in _event_bodies(dirs)]
+        assert "machine_block_handoff" in kinds
+
+
+def test_unreadable_gate_summary_escalate_is_not_pass(tmp_path: Path):
+    slice_id = "unit-path-esc"
+    root = tmp_path / "repo"
+    root.mkdir()
+    goal_id = "unit-path-esc-goal"
+    with _patched_dirs(tmp_path / "state") as dirs:
+        rc, chain, calls, sup = _drive(
+            dirs, root, slice_id, _unreadable_gate(slice_id),
+            max_rounds=2, goal_id=goal_id, supervisor="escalate",
+        )
+        assert rc == 1, chain
+        assert chain["state"] == "escalated", chain
+        assert chain["last_verdict"] == "question"
+        assert chain["last_verdict"] != "PASS"
+        assert chain["escalate_reason"] == "machine_block_missing"
+        goal = json.loads((dirs["goals"] / f"{goal_id}.json").read_text())
+        assert goal["status"] == "escalated"
+        assert goal["escalate_reason"] == "machine_block_missing"
+        assert len([c for c in calls if c.get("role") == "impl"]) == 1
+        assert sup.call_count == 1
+        kinds = [b["kind"] for b in _event_bodies(dirs)]
+        assert "machine_block_handoff" in kinds
+        assert "goal_terminal" in kinds
+
+
+def test_machine_block_supervisor_reuses_goal_session(tmp_path: Path):
+    slice_id = "unit-path-sup"
+    goal_id = "unit-path-sup-goal"
+    with _patched_dirs(tmp_path / "state") as dirs:
+        goal = {"goal": goal_id, "status": "running", "current_slice": slice_id}
+        (dirs["goals"] / f"{goal_id}.json").write_text(json.dumps(goal), encoding="utf-8")
+        job = {"goal": goal_id, "slice": slice_id, "cwd": str(tmp_path), "profile": "acp-lite"}
+        chain = {"slice": slice_id, "goal": goal_id, "state": "running", "rounds": []}
+
+        def fake_run(**kwargs):
+            assert kwargs["keep_open"] is True
+            assert kwargs["ticket"] == f"supervisor-goal-{goal_id}"
+            assert kwargs["prompt_mode"] == "supervisor-pause"
+            path = dirs["summaries"] / f"{kwargs['summary_name']}.md"
+            path.write_text(
+                '```json\n{"action": "machine_block_decision", "decision": "rerun_gate"}\n```\n',
+                encoding="utf-8",
+            )
+            return 0, {}, path
+
+        with mock.patch.object(tb, "run_supervisor_ticket", side_effect=fake_run):
+            decision = tb.auto_supervisor_machine_block_decision(
+                job, chain, round_n=1, reason="machine_block_missing", goal=goal,
+            )
+        assert decision == "rerun_gate"

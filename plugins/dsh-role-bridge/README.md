@@ -12,6 +12,8 @@ ACP 一票一进程；`dsh-acp-ask.py` 退出后对端不会被工具调用自�
 
 **开对端短票、拼上下文包、写答案文件** 全是 broker 按 **路由表** 做的。插件与 broker 必须成对使用。
 
+broker 接到 `ask_supervisor` 之后：开 `supervisor-answer-<slice>-askN`，把答复写回 `mailbox/answers/`。正在 `wait` 的实现票自己继续，不另开一轮实现。这张答复票还没有并进 Goal 级会话 `supervisor-goal-<id>`。工头关票摘要 `status=blocked`（不是闸审轮次触顶）是另一条路：broker 用答复短票问监理，有答复再开下一轮实现。触顶决策复用 `supervisor-goal-<id>`。
+
 ## 2. 消息格式
 
 `pending/<id>.json`：

@@ -129,9 +129,37 @@ python3 ./broker/trial-watchdog.py --once --dry-run   # 只打印 payload，不�
      findings-first `build_fix_pack` 另开一张新 impl 修复票再跑 gate（视作续跑，不是 slice 完成）。
    若 goal 上仍有 P0/P1 且 summary 写 `done` 却没逐条 `finding_resolutions`/`rework_fresh`，
    broker 不按干净完成推进：开 fix 票续跑，轮次耗尽则 `escalated`。  
-6. 工头 `blocked`/`question` → `awaiting_supervisor`；监理丢 `type: chain-reply`（见 `examples/job-chain-reply.json`）续跑；
-   若该 goal 上有 `last_gate_findings`，reply pack 同样 findings-first、监理答复仅附录。  
-7. 终态写 `thin-state/chains/<slice>.json` + outbox；`notify: hub` 时 kind=`dsh-trial-chain`。
+6. 工头 `question`，或摘要 `status=blocked` 且不是闸审轮次触顶：默认 `auto_supervisor_answer`
+   开监理答复短票，有答复就开下一轮实现。答复空、失败，或该开关关掉，才停 `awaiting_supervisor`
+   并通知。调试用的 `type: chain-reply` 见 `examples/job-chain-reply.json`。
+   若该 goal 上有 `last_gate_findings`，reply pack 同样 findings-first、监理答复仅附录。
+   票中工具 `ask_supervisor` 只把答复写回正在等待的那张实现票，不另开一轮。
+7. 步数硬顶、墙钟、上游重试耗尽（`paused_limit` / `paused_wallclock` / `paused_env`）走监理五选一：
+   `continue_same` / `new_ticket` / `close` / `split` / `escalate`。`continue_same` 续同一张实现票。
+8. `max_rounds` 或闸审轮次触顶：复用 Goal 级会话 `supervisor-goal-<id>`（keep-open + resume），
+   三选一 inplace(+1) / split / escalate。闸审触顶造成的 `blocked` 留在这条决策里。
+9. `split` 只收一个跟进片。pack 在磁盘上就追加到同一 Goal 并打开；没有新 pack 就停住，
+   后面已经计划好的片也不跳过。
+10. 终态写 `thin-state/chains/<slice>.json` + outbox。终态 kind 才通知 Hub。
+    过渡事件也进 outbox，kind 是过渡名。`notify_dry_run` 不发 webhook。
+
+### 增量查询
+
+```bash
+python3 broker/trial-broker.py --events-since <cursor.json>
+python3 broker/trial-broker.py --events-since <cursor.json> --peek
+```
+
+只读。游标不存在时打印 `{"init":true,"tracked":N}` 并创建游标，不倒历史。
+之后打印 `{"count":N,"records":[...]}` 并前移游标。`--peek` 不前移。
+来源是 outbox、failed、goals、chains 里改过的 JSON。
+
+### 并行与 worktree
+
+冲突键是 cwd 的真实路径，父子目录也算冲突。同一 Goal 串行。
+`DSH_TRIAL_WORKTREE_PREFIXES`（缺省 `/workspace/dsh-wt/`）下的 `<前缀>/<第一段>`
+若出现在 brief 里，或 job 写了 `worktree` / `extra_cwds`，也占冲突键。
+worktree 不要放进仓库目录里面。同一条分支不能检出两份。
 
 ### Chain-reply
 

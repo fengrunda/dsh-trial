@@ -2,6 +2,16 @@
 
 > Gate per_goal 单一审 + 口径/软顶 28 的交接见 [ops-handoff-gate-ab.md](ops-handoff-gate-ab.md)（含热更/重启清单与回滚）。
 
+## 2026-10-22 自动循环（PR #28，`3e4657e`）
+- 使用方只做三件事：投 Goal、`trial-broker.py --events-since <cursor>` 拉增量、终态或真正停车才当通知。`--peek` 不前移游标。`notify_dry_run` 不发 webhook，outbox 仍写。
+- 普通 `status=blocked` 与 `question`：默认开监理答复短票，有答复就开下一轮实现。答复空或失败才停车。
+- 闸审轮次触顶的 blocked，以及 `max_rounds` 触顶：复用 `supervisor-goal-<id>`，不另开新监理票。
+- `split` 只收一个跟进片，pack 在就打开。没有新 pack 就停住，已计划的后片不跳过。
+- `paused_limit` / `paused_wallclock` / `paused_env` 走五选一。`continue_same` 续同一张实现票。
+- 票中 `ask_supervisor` 把答复写回正在等待的实现票，不另开一轮。答复票名仍是 `supervisor-answer-<slice>-askN`，还没并进 Goal 级会话。
+- 并行：cwd 真实路径互斥。worktree 放在 `DSH_TRIAL_WORKTREE_PREFIXES` 下，不要放进仓库目录里。
+- 文档：`broker/README.md`、根 `README.md`、使用方 skill `khub-handoff/skills/dsh-trial.md`。
+
 ## 2026-10-21 max_gate_rounds 触顶与 max_rounds 同轨
 - gate_rounds_by_slice 触顶不再机械 escalate：Goal 停 awaiting_supervisor（awaiting_reason=max_gate_rounds），
   自动开监理决策短票 inplace(+1 有界) / split / escalate；工头随后写的 summary(status=blocked) 同样留在该决策道（不 notify Hub、不重开票）。

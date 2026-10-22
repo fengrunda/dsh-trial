@@ -176,8 +176,11 @@ python3 /workspace/dsh-trial/broker/trial-broker.py --status
 | Gate pack | `packs/<slice>-gate-r<N>.pack.md`（原 pack + acceptance + 工头块 + diff） |
 | Fix pack | `packs/<slice>-fix-r<N+1>.pack.md`（原 pack + findings，无 transcript） |
 | Gate 摘要 | `summaries/<slice>-gate-r<N>.md` · 机器块 `verdict` PASS\|HOLD |
-| 续答 | inbox `type: "chain-reply"` + `slice` + `answer` |
+| 续答 | 业务由监理短票接。`chain-reply` 只用于调试 |
 | 终态 | PASS / escalated / awaiting_supervisor / failed |
+| 增量 | `trial-broker.py --events-since <cursor.json>`（`--peek` 不前移） |
+
+2026-10-22 起的自动循环（blocked 先问监理、触顶复用 `supervisor-goal-<id>`、split 打开一个跟进片、暂停五选一）以 [broker/README.md](../broker/README.md) 为准。本节上面的「监理是 Hub Bot」是 2026-09-24 的旧写法。使用方投 Goal，不写 pack，不回答 question。
 | 通知 | `notify: "hub"` → kind `dsh-trial-chain`（可用 `notify_dry_run`） |
 
 示例：`/workspace/dsh-trial/broker/examples/job-chain-scratch.json`  

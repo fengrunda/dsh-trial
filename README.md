@@ -104,6 +104,8 @@ dsh-trial limits show
 底层仍是 `./broker/start.sh` / `./broker/stop.sh` / `python3 ./broker/trial-broker.py --status`。  
 Job 形态：单票 / `chain` / `chain-reply` / `goal`（详见 `broker/README.md` 与 `broker/trial-broker.py` 文档字符串）。
 
+使用方只做三件事：往 inbox 投 Goal、用 `trial-broker.py --events-since <cursor.json>` 拉增量、在终态或真正停车时看通知。角色、槽位、pack 路径不是调用方协议。`chain-reply` 只留给调试。自动循环（blocked 先问监理、触顶复用 Goal 级会话、split 打开一个跟进片、暂停五选一）写在 `broker/README.md`。
+
 ## Gate 分流与推理档位
 
 `open-slice.sh` 在 gate 模式调用 `broker/gate_effort.py --classify` 做两步判断（热生效）：

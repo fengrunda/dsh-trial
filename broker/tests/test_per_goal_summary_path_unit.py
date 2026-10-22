@@ -316,8 +316,26 @@ def test_parse_machine_block_decision_rejects_impl_choices():
     assert tb.parse_machine_block_decision({"decision": "question"}) == "question"
     assert tb.parse_machine_block_decision({"decision": "escalate"}) == "escalate"
     assert tb.parse_machine_block_decision({"decision": "continue_same"}) is None
+    assert tb.parse_machine_block_decision(
+        {"action": "pause_decision", "decision": "continue_same"}
+    ) is None
     assert tb.parse_machine_block_decision({"decision": "new_ticket"}) is None
     assert tb.parse_machine_block_decision(None, "") is None
+
+
+def test_machine_block_handoff_maps_pause_continue_same_to_rerun_gate():
+    pause = {"action": "pause_decision", "decision": "continue_same", "add_steps": 45}
+    assert tb.map_machine_block_handoff_decision(pause) == "rerun_gate"
+    assert tb.map_machine_block_handoff_decision({"decision": "rerun_gate"}) == "rerun_gate"
+    assert tb.map_machine_block_handoff_decision({"decision": "question"}) == "question"
+    assert tb.map_machine_block_handoff_decision(
+        {"action": "pause_decision", "decision": "escalate"}
+    ) == "escalate"
+    for decision in ("new_ticket", "close", "split", ""):
+        assert tb.map_machine_block_handoff_decision(
+            {"action": "pause_decision", "decision": decision}
+        ) == "question"
+    assert tb.map_machine_block_handoff_decision({"decision": "continue_same"}) == "question"
 
 
 def _unreadable_gate(slice_id: str):
@@ -581,3 +599,91 @@ def test_opened_handoff_without_decision_is_handed_once_more(tmp_path: Path):
         assert saved["machine_block_handoff"]["decision"] == "question"
         assert "escalate_reason" not in saved
         assert tb.collect_machine_block_park_items() == []
+
+
+def test_existing_pause_continue_same_summary_skips_supervisor_ticket(tmp_path: Path):
+    slice_id = "unit-pause-mapped"
+    goal_id = "unit-pause-mapped-goal"
+    with _patched_dirs(tmp_path / "state") as dirs:
+        goal = {"goal": goal_id, "status": "running", "current_slice": slice_id}
+        (dirs["goals"] / f"{goal_id}.json").write_text(json.dumps(goal), encoding="utf-8")
+        (dirs["summaries"] / f"{slice_id}-sup-machine-block-r1.md").write_text(
+            "\n".join([
+                "# already written",
+                "```json",
+                json.dumps({
+                    "action": "pause_decision",
+                    "slice": slice_id,
+                    "decision": "continue_same",
+                    "add_steps": 45,
+                    "add_timeout_sec": 1200,
+                    "notes": "gate only",
+                }),
+                "```",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        job = {"goal": goal_id, "slice": slice_id, "cwd": str(tmp_path), "profile": "acp-lite"}
+        chain = {"slice": slice_id, "goal": goal_id, "state": "awaiting_supervisor", "rounds": []}
+        with mock.patch.object(tb, "run_supervisor_ticket") as opened:
+            decision = tb.auto_supervisor_machine_block_decision(
+                job, chain, round_n=1, reason="machine_block_missing", goal=goal,
+            )
+        assert decision == "rerun_gate"
+        opened.assert_not_called()
+
+        impl = tmp_path / "impl.md"
+        impl.write_text("impl\n", encoding="utf-8")
+        root = tmp_path / "repo"
+        root.mkdir()
+        (dirs["chains"] / f"{slice_id}.json").write_text(
+            json.dumps({
+                "slice": slice_id,
+                "state": "awaiting_supervisor",
+                "awaiting_reason": "machine_block_missing",
+                "last_verdict": "question",
+                "goal": goal_id,
+                "cwd": str(root),
+                "pack": f"{slice_id}.pack.md",
+                "profile": "acp-lite",
+                "max_rounds": 2,
+                "rounds": [{"round": 1, "verdict": "question", "impl_summary": str(impl)}],
+                "machine_block_handoff": {"opened": True, "reason": "machine_block_missing"},
+            }),
+            encoding="utf-8",
+        )
+        items = tb.collect_machine_block_park_items()
+        assert [it["job"]["slice"] for it in items] == [slice_id]
+        with mock.patch.object(tb, "run_supervisor_ticket") as opened, mock.patch.object(
+            tb, "run_chain_rounds", return_value=0,
+        ) as rerun:
+            rc = tb.run_machine_block_park(items[0]["path"], items[0]["job"])
+        assert rc == 0
+        opened.assert_not_called()
+        assert rerun.call_count == 1
+        saved = json.loads((dirs["chains"] / f"{slice_id}.json").read_text())
+        assert saved["rerun_gate_only"] == 1
+        assert saved["machine_block_handoff"]["decision"] == "rerun_gate"
+        assert saved["state"] == "running"
+
+
+def test_pause_continue_same_still_resumes_impl(tmp_path: Path):
+    with _patched_dirs(tmp_path / "state"):
+        job = {"goal": "g1", "cwd": str(tmp_path), "profile": "acp-lite"}
+        chain = {"slice": "s1", "goal": "g1", "pack": "s1.pack.md", "rounds": []}
+        rc = tb.route_pause_decision(
+            job,
+            chain,
+            tmp_path / "out",
+            decision="continue_same",
+            pause_kind="paused_limit",
+            round_n=1,
+            pack_for_impl="s1.pack.md",
+            goal_obj={"goal": "g1"},
+            impl_ticket="impl-s1",
+        )
+        assert rc == tb.CONTINUE_SAME_INLINE
+        assert chain["pause_resume_mode"] == "continue_same"
+        assert chain["inline_continue_same"]["impl_ticket"] == "impl-s1"
+        assert "rerun_gate_only" not in chain

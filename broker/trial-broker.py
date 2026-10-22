@@ -6375,7 +6375,11 @@ _MACHINE_BLOCK_DECISIONS = ("rerun_gate", "question", "escalate")
 
 
 def parse_machine_block_decision(block: dict | None, text: str = "") -> str | None:
-    """rerun_gate | question | escalate. Anything else is not a decision."""
+    """rerun_gate | question | escalate. Anything else is not a decision.
+
+    A bare continue_same stays None. The pause five-way still resumes impl.
+    The machine-block handoff maps pause_decision + continue_same itself.
+    """
     block = block if isinstance(block, dict) else {}
     for key in ("decision", "verdict", "choice"):
         raw = str(block.get(key) or "").strip().lower()
@@ -6386,6 +6390,42 @@ def parse_machine_block_decision(block: dict | None, text: str = "") -> str | No
         if f'"decision": "{opt}"' in blob or f'"decision":"{opt}"' in blob:
             return opt
     return None
+
+
+def map_machine_block_handoff_decision(block: dict | None, text: str = "") -> str:
+    """Map one already-written gate-summary handoff. Do not call from pause.
+
+    rerun_gate / question / escalate pass through. pause_decision +
+    continue_same is rerun_gate (same-round gate only, not an impl resume).
+    new_ticket / close / split / an empty decision are question. Only an
+    explicit escalate escalates.
+    """
+    native = parse_machine_block_decision(block, text)
+    if native:
+        return native
+    block = block if isinstance(block, dict) else {}
+    action = str(block.get("action") or "").strip().lower()
+    decision = ""
+    for key in ("decision", "verdict", "choice"):
+        raw = str(block.get(key) or "").strip().lower()
+        if raw:
+            decision = raw
+            break
+    low = (text or "").lower()
+    if action != "pause_decision" and (
+        '"action": "pause_decision"' in low or '"action":"pause_decision"' in low
+    ):
+        action = "pause_decision"
+    if not decision:
+        for opt in ("continue_same", "new_ticket", "close", "split", "escalate"):
+            if f'"decision": "{opt}"' in low or f'"decision":"{opt}"' in low:
+                decision = opt
+                break
+    if action == "pause_decision" and decision == "continue_same":
+        return "rerun_gate"
+    if decision == "escalate":
+        return "escalate"
+    return "question"
 
 
 def _machine_block_pack(
@@ -6441,7 +6481,25 @@ def auto_supervisor_machine_block_decision(
     note: str = "",
     goal: dict | None = None,
 ) -> str | None:
-    """Open supervisor-goal-<id> (keep_open). Return rerun_gate|question|escalate."""
+    """Return rerun_gate|question|escalate for an unreadable gate summary.
+
+    An on-disk ``<slice>-sup-machine-block-r<N>.md`` is mapped in place.
+    pause_decision + continue_same becomes rerun_gate and does not open
+    another supervisor ticket. Otherwise open supervisor-goal-<id>.
+    """
+    slice_id = str(chain.get("slice") or job.get("slice") or "")
+    summary_path = SUMMARIES / f"{slice_id}-sup-machine-block-r{round_n}.md"
+    if summary_path.is_file():
+        parsed = _parse_supervisor_summary(summary_path)
+        decision = map_machine_block_handoff_decision(
+            parsed.get("block"), parsed.get("text") or ""
+        )
+        print(
+            f"[trial-broker] machine block summary already on disk "
+            f"decision={decision} path={summary_path.name}",
+            flush=True,
+        )
+        return decision
     goal_id = job.get("goal") or chain.get("goal")
     if goal is None and goal_id:
         goal = _read_goal(goal_id)
@@ -6453,7 +6511,6 @@ def auto_supervisor_machine_block_decision(
     if goal and int(goal.get("supervisor_ticket_count") or 0) >= max_sup:
         print(f"[trial-broker] supervisor ticket cap {max_sup} reached (machine block)", flush=True)
         return None
-    slice_id = str(chain.get("slice") or job.get("slice") or "")
     pack_name = _machine_block_pack(
         slice_id=slice_id,
         round_n=round_n,
@@ -6489,9 +6546,11 @@ def auto_supervisor_machine_block_decision(
         goal["supervisor_reuse_broken"] = True
         _write_goal(goal)
     parsed = _parse_supervisor_summary(summary_path)
-    decision = parse_machine_block_decision(parsed.get("block"), parsed.get("text") or "")
+    decision = map_machine_block_handoff_decision(
+        parsed.get("block"), parsed.get("text") or ""
+    )
     print(
-        f"[trial-broker] machine block supervisor decision={decision or '(empty)'} via {ticket}",
+        f"[trial-broker] machine block supervisor decision={decision} via {ticket}",
         flush=True,
     )
     return decision
@@ -12828,9 +12887,11 @@ def run_machine_block_park(path: Path, job: dict) -> int:
     First handoff writes opened, then the decision (including ""). A later
     collect sees the decision key and does not hand it again. An opened
     handoff with no decision key and retry missing or 0 gets one retry:
-    retry is set to 1 before the ticket opens. Question stays parked.
-    rerun_gate re-enters the same round's gate only. escalate is the only
-    path that writes ``status=escalated``.
+    retry is set to 1 before the ticket opens. The ticket itself is skipped
+    when ``<slice>-sup-machine-block-r<N>.md`` is already on disk; that
+    summary is mapped (pause_decision + continue_same → rerun_gate).
+    Question stays parked. rerun_gate re-enters the same round's gate only.
+    escalate is the only path that writes ``status=escalated``.
     """
     del path
     slice_id = str((job or {}).get("slice") or "")

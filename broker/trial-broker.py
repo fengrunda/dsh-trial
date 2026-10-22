@@ -12093,6 +12093,14 @@ def _escalate_orphan_goal(goal: dict, goal_id: str, status: str) -> bool:
     for a chain-reply or supervisor five-way — leave it alone (do not escalate
     and do not open the next slice).
     """
+    hand = goal.get("perceive_handoff")
+    if isinstance(hand, dict) and hand.get("handed"):
+        print(
+            f"[trial-broker] goal {goal_id} orphan sweep skipped: already handed "
+            f"to {hand.get('ticket') or 'supervisor'} (status={status})",
+            flush=True,
+        )
+        return False
     parked, sid = _goal_has_parked_awaiting_slice(goal)
     if parked:
         print(
@@ -12272,6 +12280,129 @@ def _start_job(running: dict, slot: int, *, label, path, job, dirs, goal_ids, ru
     return rec
 
 
+def collect_perceive_handoff_items() -> list[dict]:
+    """Goals the watchdog handed off, not yet opened by this loop.
+
+    Dispatched by ``scheduler_loop`` through the existing slot scheduler.
+    """
+    items: list[dict] = []
+    if not GOALS.is_dir():
+        return items
+    for path in sorted(GOALS.glob("*.json")):
+        try:
+            goal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(goal, dict):
+            continue
+        hand = goal.get("perceive_handoff")
+        if not isinstance(hand, dict) or not hand.get("handed") or hand.get("opened"):
+            continue
+        goal_id = str(goal.get("goal") or path.stem)
+        if not goal_id:
+            continue
+        items.append(
+            {
+                "goal": goal_id,
+                "label": f"perceive-handoff-{goal_id}",
+                "path": STATE_DIR / f"perceive-handoff-{goal_id}.json",
+                "job": {"goal": goal_id, "type": "perceive-handoff"},
+                "dirs": job_conflict_dirs({"cwd": goal.get("cwd")}),
+                "goal_ids": {goal_id},
+                "runner": run_perceive_handoff,
+            }
+        )
+    return items
+
+
+def run_perceive_handoff(path: Path, job: dict) -> int:
+    """Open the existing Goal supervisor session for a watchdog handoff.
+
+    Reuses ``auto_supervisor_pause_decision`` (keep_open, five-way pack).
+    ``status=escalated`` is written only when that session returns escalate.
+    """
+    del path
+    goal_id = str((job or {}).get("goal") or "")
+    goal = _read_goal(goal_id)
+    if not isinstance(goal, dict):
+        return 0
+    hand = goal.get("perceive_handoff")
+    if not isinstance(hand, dict) or not hand.get("handed") or hand.get("opened"):
+        return 0
+    hand = dict(hand)
+    hand["opened"] = True
+    goal["perceive_handoff"] = hand
+    _write_goal(goal)
+    slice_id = str(hand.get("slice") or goal.get("current_slice") or "").strip() or goal_id
+    chain = _read_chain(slice_id)
+    if not isinstance(chain, dict):
+        chain = {"slice": slice_id, "goal": goal_id, "state": "running", "rounds": []}
+    else:
+        chain = dict(chain)
+        chain.setdefault("slice", slice_id)
+        chain.setdefault("goal", goal_id)
+    pause_job = {
+        "goal": goal_id,
+        "slice": slice_id,
+        "cwd": str(goal.get("cwd") or chain.get("cwd") or "/workspace"),
+        "type": "goal",
+        "supervisor_profile": goal.get("supervisor_profile") or "acp-lite",
+        "profile": goal.get("profile") or "acp-lite",
+        "notify": goal.get("notify"),
+        "notify_dry_run": goal.get("notify_dry_run"),
+        "notify_prefix": goal.get("notify_prefix"),
+        "max_supervisor_tickets": goal.get("max_supervisor_tickets"),
+    }
+    round_n = len(chain.get("rounds") or []) + 1
+    impl_ticket = str(chain.get("last_impl_ticket") or "")
+    decision = auto_supervisor_pause_decision(
+        pause_job,
+        chain,
+        round_n=round_n,
+        pause_kind="orphan_running_no_processing",
+        goal=goal,
+        notes=(
+            "watchdog perceive: heartbeat slot, work pid, and processing job all absent"
+        ),
+        impl_ticket=impl_ticket,
+    )
+    if not decision:
+        # ponytail: a cap hit or empty decision is not retried here. The ticket
+        # was either refused by the existing cap or already opened once.
+        return 0
+    dest = PROCESSING / f"perceive-handoff-{goal_id}.absent"
+    rc = route_pause_decision(
+        pause_job,
+        chain,
+        dest,
+        decision=decision,
+        pause_kind="orphan_running_no_processing",
+        round_n=round_n,
+        pack_for_impl=str(chain.get("pending_impl_pack") or chain.get("pack") or ""),
+        goal_obj=goal,
+        impl_ticket=impl_ticket,
+    )
+    # ponytail: continue_same is recorded on the chain by route_pause_decision,
+    # but there is no live Goal thread to re-enter the impl session.
+    if decision == "escalate":
+        fresh = _read_goal(goal_id) or goal
+        fresh["status"] = "escalated"
+        fresh["escalate_reason"] = "supervisor_pause:orphan_running_no_processing"
+        fresh["error"] = "supervisor escalate after perceive handoff"
+        _write_goal(fresh)
+        try:
+            _notify_goal_event(
+                fresh,
+                kind="escalate",
+                ok=False,
+                reason=fresh["escalate_reason"],
+                suggested_action="监理已选择 escalate",
+            )
+        except Exception as e:  # noqa: BLE001 - notify must not undo the decision
+            print(f"[trial-broker] perceive escalate notify failed {goal_id}: {e}", flush=True)
+    return rc if isinstance(rc, int) else 0
+
+
 def scheduler_loop(
     interval: int,
     resume_items: list[dict] | None = None,
@@ -12338,12 +12469,18 @@ def scheduler_loop(
             dispatched = True
             return True
 
-        # Resume work first (oldest Goal), then the inbox in enqueue order.
+        # Resume work first (oldest Goal), then watchdog handoffs on the same
+        # scheduler, then the inbox in enqueue order.
         for item in pending_resume:
             if item["goal"] in started_resume:
                 continue
             if _try(item):
                 started_resume.add(item["goal"])
+
+        for item in collect_perceive_handoff_items():
+            if item["path"].name in in_flight:
+                continue
+            _try(item)
 
         for path in pending:
             if path.name in in_flight:

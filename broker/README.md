@@ -88,6 +88,8 @@ python3 ./broker/trial-watchdog.py --once --dry-run   # 只打印 payload，不�
    宽限期内 broker 续心跳即恢复正常，宽限过后仍不续才报 stalled。`no_broker_process`
    与 session-idle（纯单调钟）不受宽限影响。
 
+孤儿扫描（`running` / `planning` / `closeout`，没有 processing/inbox 里这份 Goal 的 job，年龄超过 `TRIAL_WATCHDOG_STALE_GATE_SEC`，默认 180s）只感知，不再把 Goal `status` 写成 `escalated`。下面三条有一条就留下：心跳文件还新鲜且 `slots` 里有这个 goal（`ticket` 为空也算活，拆片或换票的空隙 Goal 线程仍占着槽）；进程表能看到带这个 goal id 的 `open-slice.sh` / `dsh-acp-ask.py`（macOS 用 `ps` 列子进程，用已有的 `KERN_PROCARGS2` 读 argv 和环境，不读 `/proc`）；processing/inbox 里还有这份 job。三条都没有，才往现有 outbox 写过渡事件 `orphan_supervisor_handoff`（不发终态通知），交给已有的 Goal 级监理会话 `supervisor-goal-<id>`（keep_open，五选一）。只有监理能决定 escalate。已经 parked 等监理的 Goal 继续跳过。
+
 事件 payload 统一带 `goal` / `status` / `reason` / `suggested_action`；同一 `reason_key`
 在 `TRIAL_WATCHDOG_COOLDOWN_SEC`（默认 900s）内不重复发。
 

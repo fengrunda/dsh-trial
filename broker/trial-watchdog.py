@@ -77,6 +77,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import pause_supervisor as PS  # noqa: E402
 import trial_lib as T  # noqa: E402
 
 DSH_HOME = Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
@@ -84,6 +85,7 @@ STATE_DIR = Path(os.environ.get("TRIAL_BROKER_DIR") or (DSH_HOME / "broker-dsh-t
 TRIAL_SUP = DSH_HOME / "supervisor" / "trial"
 INBOX = TRIAL_SUP / "inbox"
 PROCESSING = TRIAL_SUP / "processing"
+OUTBOX = TRIAL_SUP / "outbox"
 GOALS = DSH_HOME / "supervisor" / "thin-state" / "goals"
 CHAINS = DSH_HOME / "supervisor" / "thin-state" / "chains"
 _PARKED_CHAIN_STATES = frozenset({
@@ -127,11 +129,9 @@ RUNNING_GOAL_STATES = ("running", "planning", "closeout")
 STALLED_KIND = "dsh-trial-stalled"
 FREEZE_KIND = "dsh-trial-resumed-after-freeze"
 STALE_GATE_KIND = "dsh-trial-stale-gate-running"
-ORPHAN_GOAL_KIND = "dsh-trial-orphan-running-goal"
+# Transitional outbox kind. Not a terminal notify and not ``status=escalated``.
+ORPHAN_HANDOFF_KIND = "orphan_supervisor_handoff"
 ORPHAN_ESCALATE_REASON = "orphan_running_no_processing"
-ORPHAN_ESCALATE_ERROR = (
-    "running/planning/closeout but processing job missing; no live ticket"
-)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -348,13 +348,12 @@ def _proc_env_has(pid: int, key: str, value: str, environ: bytes | None = None) 
 
     ``environ`` (the raw NUL-delimited block) is injectable for tests; a
     missing or unreadable environ block counts as "no match".
+    Darwin reads the env tail of ``KERN_PROCARGS2``; Linux reads
+    ``/proc/<pid>/environ``.
     """
-    raw = environ
-    if raw is None:
-        try:
-            raw = Path(f"/proc/{int(pid)}/environ").read_bytes()
-        except (OSError, ValueError):
-            return False
+    raw = environ if environ is not None else _read_proc_environ(pid)
+    if not raw:
+        return False
     try:
         return f"{key}={value}" in raw.decode("utf-8", "replace").split("\0")
     except (UnicodeDecodeError, ValueError):
@@ -379,22 +378,22 @@ def list_work_pids() -> list[int]:
     return out
 
 
-def _parse_kern_procargs2(raw: bytes) -> list[str]:
-    """argv from a macOS ``KERN_PROCARGS2`` blob.
+def _split_kern_procargs2(raw: bytes) -> tuple[list[str], bytes]:
+    """``(argv, env tail)`` from a macOS ``KERN_PROCARGS2`` blob.
 
     Layout: native ``argc``, NUL-terminated executable path, NUL padding,
     then ``argc`` NUL-terminated arguments. The environment block follows
-    and is ignored.
+    the arguments and is returned unparsed (NUL-delimited ``KEY=value``).
     """
     if len(raw) < 4:
-        return []
+        return [], b""
     argc = int.from_bytes(raw[:4], sys.byteorder)
     if argc <= 0:
-        return []
+        return [], b""
     rest = raw[4:]
     nul = rest.find(b"\0")
     if nul < 0:
-        return []
+        return [], b""
     rest = rest[nul + 1 :]
     while rest[:1] == b"\0":
         rest = rest[1:]
@@ -405,7 +404,36 @@ def _parse_kern_procargs2(raw: bytes) -> list[str]:
             break
         argv.append(rest[:nul].decode("utf-8", "replace"))
         rest = rest[nul + 1 :]
+    return argv, rest
+
+
+def _parse_kern_procargs2(raw: bytes) -> list[str]:
+    """argv from a macOS ``KERN_PROCARGS2`` blob. Env tail is ignored here."""
+    argv, _env = _split_kern_procargs2(raw)
     return [part for part in argv if part]
+
+
+def _kern_procargs2_environ(raw: bytes) -> bytes:
+    """NUL-delimited environment tail of a ``KERN_PROCARGS2`` blob."""
+    _argv, env = _split_kern_procargs2(raw)
+    return env
+
+
+def _read_proc_environ(pid: int) -> bytes | None:
+    """NUL-delimited environ, or None when the pid is unreadable.
+
+    Darwin has no ``/proc``. The env block is the tail of the same
+    ``sysctl(KERN_PROCARGS2)`` blob already used for argv.
+    """
+    if sys.platform == "darwin":
+        raw = _darwin_procargs2_bytes(pid)
+        if not raw:
+            return None
+        return _kern_procargs2_environ(raw)
+    try:
+        return Path(f"/proc/{int(pid)}/environ").read_bytes()
+    except (OSError, ValueError):
+        return None
 
 
 def _darwin_procargs2_bytes(pid: int) -> bytes | None:
@@ -504,12 +532,7 @@ def _proc_goal_id(pid: int, known: list[str], environ: bytes | None = None) -> s
 
     ``environ`` (the raw NUL-delimited block) is injectable for tests.
     """
-    raw = environ
-    if raw is None:
-        try:
-            raw = Path(f"/proc/{int(pid)}/environ").read_bytes()
-        except (OSError, ValueError):
-            raw = b""
+    raw = environ if environ is not None else (_read_proc_environ(pid) or b"")
     try:
         for chunk in raw.decode("utf-8", "replace").split("\0"):
             if chunk.startswith("DSH_TRIAL_GOAL="):
@@ -539,7 +562,39 @@ def work_pid_goals(
     return out
 
 
-def _proc_children(pid: int) -> list[int]:
+def _ppid_map() -> dict[int, int]:
+    """``pid -> ppid`` from ``ps``. Empty when ps cannot be read.
+
+    macOS has no ``/proc/<pid>/task/*/children``. One ``ps`` pass is the
+    process table the orphan scan walks for broker descendants.
+    """
+    try:
+        cp = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out: dict[int, int] = {}
+    for line in (cp.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            out[int(parts[0])] = int(parts[1])
+        except ValueError:
+            continue
+    return out
+
+
+def _proc_children(pid: int, ppid_map: dict[int, int] | None = None) -> list[int]:
+    """Direct child pids. Darwin uses ``ps``; Linux reads ``/proc``."""
+    if sys.platform == "darwin":
+        mapping = _ppid_map() if ppid_map is None else ppid_map
+        parent = int(pid)
+        return [child for child, ppid in mapping.items() if ppid == parent]
     out: list[int] = []
     try:
         tasks = list(Path(f"/proc/{int(pid)}/task").iterdir())
@@ -560,11 +615,12 @@ def _proc_children(pid: int) -> list[int]:
 
 def _descendant_pids(pid: int, *, limit: int = 64) -> list[int]:
     """Best-effort descendant pids of ``pid`` (empty when unknown)."""
+    ppid_map = _ppid_map() if sys.platform == "darwin" else None
     out: list[int] = []
     stack = [pid]
     while stack and len(out) < limit:
         cur = stack.pop()
-        for child in _proc_children(cur):
+        for child in _proc_children(cur, ppid_map):
             if child != pid and child not in out:
                 out.append(child)
                 stack.append(child)
@@ -1111,6 +1167,83 @@ def _clear_stale_gate_running(
     return ask_id
 
 
+def _goal_already_handed(goal: dict) -> bool:
+    """True once this Goal was handed to the supervisor session."""
+    hand = goal.get("perceive_handoff")
+    return isinstance(hand, dict) and bool(hand.get("handed"))
+
+
+def _write_handoff_outbox(body: dict) -> None:
+    """One transitional outbox JSON. Same directory ``--events-since`` reads."""
+    try:
+        OUTBOX.mkdir(parents=True, exist_ok=True)
+        path = OUTBOX / f"event-{body.get('kind')}-{time.time_ns()}.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(body, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _hand_orphan_to_supervisor(
+    path: Path,
+    goal: dict,
+    goal_id: str,
+    reason: str,
+    *,
+    dry_run: bool,
+) -> dict:
+    """Record a supervisor handoff. Does not write ``status=escalated``.
+
+    The broker loop opens ``supervisor-goal-<id>`` (keep_open, five-way) from
+    ``perceive_handoff``. The watchdog only perceives and writes the outbox fact.
+    """
+    slice_id = str(goal.get("current_slice") or "").strip()
+    if not slice_id:
+        slices = _goal_slice_ids(goal)
+        slice_id = slices[-1] if slices else ""
+    ticket = PS.supervisor_ticket_name(goal_id)
+    event = {
+        "kind": ORPHAN_HANDOFF_KIND,
+        "status": "handoff",
+        "goal": goal_id,
+        "slice": slice_id,
+        "reason": reason,
+        "suggested_action": (
+            f"交给监理会话 {ticket}（keep_open 五选一）；看门狗不写 escalated"
+        ),
+        "reason_key": f"orphan_supervisor_handoff:{goal_id}",
+        "supervisor_ticket": ticket,
+    }
+    if dry_run:
+        return event
+    _write_handoff_outbox(
+        {
+            "kind": ORPHAN_HANDOFF_KIND,
+            "goal": goal_id,
+            "slice": slice_id,
+            "decision": "",
+            "reason": reason,
+            "status": "handoff",
+            "supervisor_ticket": ticket,
+            "at": T.now_iso(),
+        }
+    )
+    goal["perceive_handoff"] = {
+        "handed": True,
+        "opened": False,
+        "reason": ORPHAN_ESCALATE_REASON,
+        "ticket": ticket,
+        "slice": slice_id,
+        "at": T.now_iso(),
+    }
+    try:
+        _write_goal_doc(path, goal)
+    except OSError:
+        pass
+    return event
+
+
 def sweep_stale_gate_running_and_orphans(
     now: float | None = None,
     *,
@@ -1120,10 +1253,10 @@ def sweep_stale_gate_running_and_orphans(
     """Light consistency sweep: phantom gate acks + orphaned non-terminal Goals.
 
     A ``gate_running`` ack older than ``TRIAL_WATCHDOG_STALE_GATE_SEC`` whose
-    gate ticket has no live process can never be finalized, and a Goal in
-    planning/running/closeout with no processing job can never advance. Both are
-    reported as events every round; unless ``dry_run`` they are also repaired
-    (ack archived + ERROR answer written, Goal escalated). Never kills a live
+    gate ticket has no live process can never be finalized. A Goal in
+    planning/running/closeout with no processing job, no live work pid, and no
+    fresh heartbeat slot is handed to the existing Goal supervisor session.
+    The watchdog does not write ``status=escalated``. Never kills a live
     process: a matching work pid means the gate/Goal is left alone.
     """
     now = time.time() if now is None else now
@@ -1174,6 +1307,10 @@ def sweep_stale_gate_running_and_orphans(
                 }
             )
 
+    hb_age = heartbeat_age(HEARTBEAT, now)
+    hb_fresh = hb_age is not None and hb_age <= heartbeat_timeout()
+    hb_goals = _heartbeat_goal_ids(read_heartbeat()) if hb_fresh else set()
+
     if GOALS.is_dir():
         for path in sorted(GOALS.glob("*.json")):
             try:
@@ -1196,29 +1333,20 @@ def sweep_stale_gate_running_and_orphans(
             parked = _goal_parked_slice(goal)
             if parked:
                 continue
+            if _goal_already_handed(goal):
+                continue
+            # Empty ``ticket`` still means the Goal thread holds the slot
+            # (between slices, or while a ticket name is being swapped).
+            if goal_id in hb_goals:
+                continue
             reason = (
                 f"orphan running goal status={status}: no processing job / live "
-                f"process for >{threshold:.0f}s"
+                f"process / heartbeat slot for >{threshold:.0f}s"
             )
-            if not dry_run:
-                goal["status"] = "escalated"
-                goal["escalate_reason"] = ORPHAN_ESCALATE_REASON
-                goal["error"] = ORPHAN_ESCALATE_ERROR
-                try:
-                    _write_goal_doc(path, goal)
-                except OSError:
-                    pass
             events.append(
-                {
-                    "kind": ORPHAN_GOAL_KIND,
-                    "status": "escalated",
-                    "goal": goal_id,
-                    "reason": reason,
-                    "suggested_action": (
-                        "无 processing job / 活票：人工收口或重新投递该 Goal"
-                    ),
-                    "reason_key": f"orphan_running_goal:{goal_id}",
-                }
+                _hand_orphan_to_supervisor(
+                    path, goal, goal_id, reason, dry_run=dry_run
+                )
             )
     return events
 
@@ -1751,6 +1879,10 @@ def run_once(
             # Parked in pending_freeze this round; the verdict (or silence)
             # arrives in a later round once the grace window has elapsed.
             suppressed.append(key)
+            continue
+        if str(ev.get("kind") or "") == ORPHAN_HANDOFF_KIND:
+            # Outbox already has the transitional fact. Do not webhook it
+            # as a terminal notify; only the supervisor may escalate.
             continue
         if not dedupe.should_send(key, now):
             suppressed.append(key)

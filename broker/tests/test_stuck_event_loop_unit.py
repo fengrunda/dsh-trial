@@ -195,6 +195,8 @@ def _patch_watchdog_dirs(tmp_path: Path):
         INBOX=dirs["inbox"],
         PROCESSING=dirs["processing"],
         CHAINS=dirs["chains"],
+        HEARTBEAT=tmp_path / "heartbeat.json",
+        OUTBOX=tmp_path / "outbox",
     ), dirs
 
 
@@ -248,7 +250,7 @@ def test_watchdog_stale_gate_leaves_live_process_alone(tmp_path: Path):
         ] == "gate_running"
 
 
-def test_watchdog_orphan_goal_event_and_escalation(tmp_path: Path):
+def test_watchdog_orphan_goal_hands_off_not_escalated(tmp_path: Path):
     patch, d = _patch_watchdog_dirs(tmp_path)
     goal_id = "watchdog-orphan"
     with patch, mock.patch.object(
@@ -265,17 +267,20 @@ def test_watchdog_orphan_goal_event_and_escalation(tmp_path: Path):
         events = wd.sweep_stale_gate_running_and_orphans(
             now=1_800_000_000.0, work_pids=[4242], dry_run=True
         )
-        assert [e["kind"] for e in events] == [wd.ORPHAN_GOAL_KIND]
+        assert [e["kind"] for e in events] == [wd.ORPHAN_HANDOFF_KIND]
+        assert events[0]["status"] == "handoff"
         assert events[0]["goal"] == goal_id
         assert json.loads(goal_path.read_text())["status"] == "running"
 
         events = wd.sweep_stale_gate_running_and_orphans(
             now=1_800_000_000.0, work_pids=[4242], dry_run=False
         )
-        assert [e["kind"] for e in events] == [wd.ORPHAN_GOAL_KIND]
+        assert [e["kind"] for e in events] == [wd.ORPHAN_HANDOFF_KIND]
         goal = json.loads(goal_path.read_text())
-        assert goal["status"] == "escalated"
-        assert goal["escalate_reason"] == wd.ORPHAN_ESCALATE_REASON
+        assert goal["status"] == "running"
+        assert "escalate_reason" not in goal
+        assert goal["perceive_handoff"]["handed"] is True
+        assert goal["perceive_handoff"]["ticket"] == f"supervisor-goal-{goal_id}"
 
 
 def test_watchdog_skips_parked_chain(tmp_path: Path):

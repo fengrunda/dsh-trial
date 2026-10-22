@@ -12185,6 +12185,8 @@ EXTRA_CWD_FIELDS = ("extra_cwds", "worktrees", "worktree", "engine_worktree")
 # Scheduler tick while work is outstanding (dispatch/reap latency, not polling).
 LOOP_TICK_SEC = 0.05
 RESUMABLE_GOAL_STATUSES = ("planning", "running", "closeout")
+# Inbox paths whose git worktree add already failed. One try, then stay queued.
+_WORKTREE_RELOCATE_FAILED: set[str] = set()
 
 
 def _canonical_dir(raw) -> str:  # noqa: ANN001 - str/Path-like
@@ -12575,6 +12577,132 @@ def _free_slot(running: dict, limit: int) -> int | None:
         if slot not in running:
             return slot
     return None
+
+
+def _cwd_under_worktree_prefix(cwd: str) -> bool:
+    canon = _canonical_dir(cwd)
+    if not canon:
+        return False
+    for prefix in worktree_prefixes():
+        base = _canonical_dir(prefix) or prefix.rstrip("/")
+        if canon == base or canon.startswith(base + os.sep):
+            return True
+    return False
+
+
+def _safe_goal_token(goal_id: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in str(goal_id))
+    cleaned = cleaned.strip("-.")
+    return cleaned or "goal"
+
+
+def _git_inside_worktree(cwd: str) -> bool:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def _worktree_start_ref(repo: str) -> str | None:
+    for ref in ("origin/main", "main"):
+        try:
+            proc = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "--verify", "--quiet", ref],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode == 0:
+            return ref
+    return None
+
+
+def relocate_goal_to_worktree(job: dict, path: Path) -> dict | None:
+    """Open a new-branch worktree and retarget one inbox goal.
+
+    Only for a goal whose cwd is a git checkout outside the worktree prefix.
+    chain-reply / goal-update stay queued. A failed git add is not retried.
+    """
+    if not isinstance(job, dict):
+        return None
+    kind = str(job.get("type") or "")
+    if kind in ("chain-reply", "goal-update"):
+        return None
+    if kind != "goal" and not job.get("goal"):
+        return None
+    key = str(path)
+    if key in _WORKTREE_RELOCATE_FAILED:
+        return None
+    cwd = str(job.get("cwd") or "").strip()
+    if not cwd or _cwd_under_worktree_prefix(cwd):
+        return None
+    if not _git_inside_worktree(cwd):
+        return None
+    prefixes = worktree_prefixes()
+    if not prefixes:
+        return None
+    start = _worktree_start_ref(cwd)
+    goal_id = str(job.get("goal") or path.stem)
+    if not start:
+        _WORKTREE_RELOCATE_FAILED.add(key)
+        print(
+            f"[trial-broker] worktree relocate skipped {goal_id}: no origin/main or main",
+            flush=True,
+        )
+        return None
+    token = _safe_goal_token(goal_id)
+    prefix = prefixes[0]
+    dest = Path(prefix) / token
+    branch = f"feat/{token}"
+    n = 2
+    while dest.exists():
+        dest = Path(prefix) / f"{token}-{n}"
+        branch = f"feat/{token}-{n}"
+        n += 1
+        if n > 20:
+            _WORKTREE_RELOCATE_FAILED.add(key)
+            print(f"[trial-broker] worktree relocate skipped {goal_id}: no free path", flush=True)
+            return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "worktree", "add", "-b", branch, str(dest), start],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _WORKTREE_RELOCATE_FAILED.add(key)
+        print(f"[trial-broker] worktree relocate failed {goal_id}: {exc}", flush=True)
+        return None
+    if proc.returncode != 0:
+        _WORKTREE_RELOCATE_FAILED.add(key)
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        print(
+            f"[trial-broker] worktree relocate failed {goal_id}: {err[-1] if err else proc.returncode}",
+            flush=True,
+        )
+        return None
+    moved = dict(job)
+    moved["cwd"] = str(dest)
+    moved["worktree_relocated_from"] = cwd
+    try:
+        path.write_text(json.dumps(moved, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"[trial-broker] worktree relocate inbox write failed {goal_id}: {exc}", flush=True)
+    print(
+        f"[trial-broker] relocated {goal_id} cwd {cwd} -> {dest} branch {branch}",
+        flush=True,
+    )
+    return moved
 
 
 def _block_reason(dirs: set[str], goal_ids: set[str], running: dict) -> str | None:
@@ -13086,6 +13214,11 @@ def scheduler_loop(
             if path.name in in_flight:
                 continue
             job = _job_for_dispatch(path)
+            reason = _block_reason(job_conflict_dirs(job), job_goal_ids(job), running)
+            if reason and reason.startswith("cwd-conflict:"):
+                moved = relocate_goal_to_worktree(job, path)
+                if moved is not None:
+                    job = moved
             _try(
                 {
                     "label": path.name,

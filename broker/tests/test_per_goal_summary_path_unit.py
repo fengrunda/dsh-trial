@@ -427,7 +427,7 @@ def test_machine_block_supervisor_reuses_goal_session(tmp_path: Path):
         def fake_run(**kwargs):
             assert kwargs["keep_open"] is True
             assert kwargs["ticket"] == f"supervisor-goal-{goal_id}"
-            assert kwargs["prompt_mode"] == "supervisor-pause"
+            assert kwargs["prompt_mode"] == "supervisor-machine-block"
             path = dirs["summaries"] / f"{kwargs['summary_name']}.md"
             path.write_text(
                 '```json\n{"action": "machine_block_decision", "decision": "rerun_gate"}\n```\n',
@@ -521,3 +521,63 @@ def test_parked_machine_block_chain_is_handed_once(tmp_path: Path):
         assert kinds == ["machine_block_handoff"]
         again = [it["job"]["slice"] for it in tb.collect_machine_block_park_items()]
         assert again == [missing]
+        assert chain["machine_block_handoff"]["decision"] == "question"
+
+
+def test_opened_handoff_without_decision_is_handed_once_more(tmp_path: Path):
+    """opened:true and no decision key is still collected, then only once."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    goal_id = "unit-retry-goal"
+    slice_id = "unit-retry-noblock"
+    with _patched_dirs(tmp_path / "state") as dirs:
+        (dirs["goals"] / f"{goal_id}.json").write_text(
+            json.dumps({
+                "goal": goal_id,
+                "status": "running",
+                "slices": [slice_id],
+                "current_slice": slice_id,
+                "cwd": str(root),
+            }),
+            encoding="utf-8",
+        )
+        (dirs["chains"] / f"{slice_id}.json").write_text(
+            json.dumps({
+                "slice": slice_id,
+                "state": "awaiting_supervisor",
+                "awaiting_reason": "machine_block_missing",
+                "last_verdict": "question",
+                "goal": goal_id,
+                "cwd": str(root),
+                "pack": f"{slice_id}.pack.md",
+                "profile": "acp-lite",
+                "max_rounds": 2,
+                "rounds": [{"round": 1, "verdict": "question"}],
+                "machine_block_handoff": {
+                    "opened": True,
+                    "reason": "machine_block_missing",
+                },
+            }),
+            encoding="utf-8",
+        )
+        items = tb.collect_machine_block_park_items()
+        assert [it["job"]["slice"] for it in items] == [slice_id]
+        target = items[0]
+
+        def fake_decision(*_args, **_kwargs):
+            saved = json.loads((dirs["chains"] / f"{slice_id}.json").read_text())
+            assert saved["machine_block_handoff"]["retry"] == 1
+            assert "decision" not in saved["machine_block_handoff"]
+            return "question"
+
+        with mock.patch.object(
+            tb, "auto_supervisor_machine_block_decision", side_effect=fake_decision,
+        ), mock.patch.object(tb, "maybe_notify_hub", return_value={"sent": True}):
+            rc = tb.run_machine_block_park(target["path"], target["job"])
+        assert rc == 0
+        saved = json.loads((dirs["chains"] / f"{slice_id}.json").read_text())
+        assert saved["state"] == "awaiting_supervisor"
+        assert saved["machine_block_handoff"]["retry"] == 1
+        assert saved["machine_block_handoff"]["decision"] == "question"
+        assert "escalate_reason" not in saved
+        assert tb.collect_machine_block_park_items() == []

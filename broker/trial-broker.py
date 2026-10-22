@@ -6476,7 +6476,7 @@ def auto_supervisor_machine_block_decision(
         profile=profile,
         cwd=str(job.get("cwd") or chain.get("cwd") or "/workspace"),
         summary_name=f"{slice_id}-sup-machine-block-r{round_n}",
-        prompt_mode="supervisor-pause",
+        prompt_mode="supervisor-machine-block",
         goal=goal,
         keep_open=True,
         resume=bool(reuse_kw["resume"]),
@@ -12700,7 +12700,12 @@ _MACHINE_BLOCK_PARK_REASONS = ("machine_block_missing", "summary_path_missing")
 
 
 def _machine_block_park_pending(chain: dict | None) -> bool:
-    """Parked on an unreadable gate summary, supervisor not opened yet."""
+    """Parked on an unreadable gate summary and still owed one supervisor pass.
+
+    No handoff yet: hand it once. Opened, no decision key, retry missing or 0:
+    one more pass (the prompt mode changed under an already-opened chain).
+    A decision key (even "") or retry >= 1 means do not hand it again.
+    """
     if not isinstance(chain, dict):
         return False
     if str(chain.get("state") or "") != "awaiting_supervisor":
@@ -12708,9 +12713,15 @@ def _machine_block_park_pending(chain: dict | None) -> bool:
     if str(chain.get("awaiting_reason") or "") not in _MACHINE_BLOCK_PARK_REASONS:
         return False
     hand = chain.get("machine_block_handoff")
-    if isinstance(hand, dict) and hand.get("opened"):
+    if not isinstance(hand, dict) or not hand.get("opened"):
+        return True
+    if "decision" in hand:
         return False
-    return True
+    try:
+        retry = int(hand.get("retry") or 0)
+    except (TypeError, ValueError):
+        retry = 0
+    return retry < 1
 
 
 def _goal_for_parked_chain(chain: dict, slice_id: str) -> tuple[str, dict | None]:
@@ -12733,10 +12744,10 @@ def _goal_for_parked_chain(chain: dict, slice_id: str) -> tuple[str, dict | None
 
 
 def collect_machine_block_park_items() -> list[dict]:
-    """Chains already parked on a missing machine block, supervisor not opened.
+    """Chains parked on a missing machine block that still need a decision.
 
-    A restart does not re-enter ``run_chain_rounds``, so the handoff added on
-    the gate return never runs for these. The scheduler opens it once.
+    A restart does not re-enter ``run_chain_rounds``. The scheduler hands each
+    chain once, plus one retry when opened is set and decision was never written.
     """
     items: list[dict] = []
     if not CHAINS.is_dir():
@@ -12812,10 +12823,14 @@ def _chain_job_for_machine_block(chain: dict, goal: dict | None, slice_id: str, 
 
 
 def run_machine_block_park(path: Path, job: dict) -> int:
-    """Hand one already-parked unreadable gate to supervisor-goal-<id> once.
+    """Hand one already-parked unreadable gate to supervisor-goal-<id>.
 
-    Question stays parked. rerun_gate re-enters the same round's gate only.
-    escalate is the only path that writes ``status=escalated``.
+    First handoff writes opened, then the decision (including ""). A later
+    collect sees the decision key and does not hand it again. An opened
+    handoff with no decision key and retry missing or 0 gets one retry:
+    retry is set to 1 before the ticket opens. Question stays parked.
+    rerun_gate re-enters the same round's gate only. escalate is the only
+    path that writes ``status=escalated``.
     """
     del path
     slice_id = str((job or {}).get("slice") or "")
@@ -12826,12 +12841,18 @@ def run_machine_block_park(path: Path, job: dict) -> int:
     reason = str(chain.get("awaiting_reason") or "machine_block_missing")
     goal = _read_goal(goal_id) if goal_id else None
     round_n = _parked_round_n(chain)
-    chain["machine_block_handoff"] = {
-        "opened": True,
-        "reason": reason,
-        "ticket": PS.supervisor_ticket_name(goal_id or slice_id),
-        "at": _iso(),
-    }
+    hand = chain.get("machine_block_handoff")
+    if isinstance(hand, dict) and hand.get("opened"):
+        hand = dict(hand)
+        hand["retry"] = 1
+        chain["machine_block_handoff"] = hand
+    else:
+        chain["machine_block_handoff"] = {
+            "opened": True,
+            "reason": reason,
+            "ticket": PS.supervisor_ticket_name(goal_id or slice_id),
+            "at": _iso(),
+        }
     _write_chain(chain)
     chain_job = _chain_job_for_machine_block(chain, goal, slice_id, goal_id)
     note = str(chain.get("error") or reason)
@@ -12843,6 +12864,12 @@ def run_machine_block_park(path: Path, job: dict) -> int:
         note=note,
         goal=goal,
     )
+    handoff = chain.get("machine_block_handoff")
+    if not isinstance(handoff, dict):
+        handoff = {"opened": True, "reason": reason}
+        chain["machine_block_handoff"] = handoff
+    handoff["decision"] = decision or ""
+    _write_chain(chain)
     dispatch_event(
         chain,
         chain_job,

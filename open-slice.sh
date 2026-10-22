@@ -13,7 +13,7 @@ Usage:
   open-slice.sh --ticket NAME --pack REL_OR_ABS [--profile acp|acp-lite]
                 [--cwd ABS] [--role gate|impl|supervisor] [--final] [--keep-open] [--resume]
                 [--log PATH] [--summary-name NAME]
-                [--prompt-mode baseline|foreman|gate|supervisor-plan|supervisor-answer|supervisor-close|supervisor-max-rounds|supervisor-pause] [--prompt-file PATH]
+                [--prompt-mode baseline|foreman|gate|supervisor-plan|supervisor-answer|supervisor-close|supervisor-max-rounds|supervisor-pause|supervisor-machine-block] [--prompt-file PATH]
                 [--reasoning-effort off|low|high|max] [--step-budget N]
                 [--print-prompt]
 
@@ -37,6 +37,7 @@ prompt-mode:
   supervisor-answer — dsh 监理：读问题 pack，写 chain_reply 机器块
   supervisor-close  — dsh 监理：读收尾 pack，写 goal_done 机器块
   supervisor-max-rounds — dsh 监理：max_rounds 触顶三选一 inplace|split|escalate
+  supervisor-machine-block — dsh 监理：闸审摘要没有机器块，三选一 rerun_gate|question|escalate
   ( --prompt-file overrides the built-in template entirely )
 
 print-prompt:
@@ -416,6 +417,37 @@ PROMPT
     '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
 }
 
+build_prompt_supervisor_machine_block() {
+  local _tpl
+  _tpl="$(cat <<'PROMPT'
+你是 dsh 试用**监理**短票（supervisor-machine-block）。**禁止 join 任何 team-room**，禁止 room_*。不要改业务 src。
+
+读 design_pack_read path=「@@PACK_BASENAME@@」。闸审摘要没有可解析机器块。这不是墙钟暂停，也不是步数暂停。
+在 rerun_gate / question / escalate 中**三选一**。
+- rerun_gate：只补一轮闸审，不新开实现票
+- question：停在 awaiting_supervisor
+- escalate：只有这个才算升级
+
+禁止 pause_decision。禁止 continue_same / new_ticket / close / split。
+
+写入摘要：「@@SUMMARY_OUT@@」，文末：
+```json
+{
+  "action": "machine_block_decision",
+  "slice": "<slice_id>",
+  "decision": "rerun_gate|question|escalate",
+  "notes": "一两句"
+}
+```
+硬禁：room_*；push / gh / dsh-trial-pr；空泛回复；打印 API key。
+Done when: summary 含 machine_block_decision，decision 为三选一之一。
+PROMPT
+)"
+  _render_prompt "$_tpl" \
+    '@@PACK_BASENAME@@' "$PACK_BASENAME" \
+    '@@SUMMARY_OUT@@' "$SUMMARY_OUT"
+}
+
 if [[ -n "$PROMPT_FILE" ]]; then
   [[ -f "$PROMPT_FILE" ]] || { echo "prompt-file missing: $PROMPT_FILE" >&2; exit 2; }
   PROMPT="$(cat "$PROMPT_FILE")"
@@ -429,6 +461,7 @@ else
     supervisor-close)  PROMPT="$(build_prompt_supervisor_close)" ;;
     supervisor-max-rounds) PROMPT="$(build_prompt_supervisor_max_rounds)" ;;
     supervisor-pause) PROMPT="$(build_prompt_supervisor_pause)" ;;
+    supervisor-machine-block) PROMPT="$(build_prompt_supervisor_machine_block)" ;;
     *) echo "unknown --prompt-mode: $PROMPT_MODE" >&2; exit 2 ;;
   esac
 fi

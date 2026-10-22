@@ -6371,6 +6371,132 @@ def auto_supervisor_pause_decision(
     return decision
 
 
+_MACHINE_BLOCK_DECISIONS = ("rerun_gate", "question", "escalate")
+
+
+def parse_machine_block_decision(block: dict | None, text: str = "") -> str | None:
+    """rerun_gate | question | escalate. Anything else is not a decision."""
+    block = block if isinstance(block, dict) else {}
+    for key in ("decision", "verdict", "choice"):
+        raw = str(block.get(key) or "").strip().lower()
+        if raw in _MACHINE_BLOCK_DECISIONS:
+            return raw
+    blob = (text or "").lower()
+    for opt in _MACHINE_BLOCK_DECISIONS:
+        if f'"decision": "{opt}"' in blob or f'"decision":"{opt}"' in blob:
+            return opt
+    return None
+
+
+def _machine_block_pack(
+    *,
+    slice_id: str,
+    round_n: int,
+    reason: str,
+    note: str,
+    goal_id: str,
+) -> str:
+    name = f"{slice_id}-machine-block-r{round_n}.pack.md"
+    body = f"""---
+kind: supervisor-pause
+slice_id: {slice_id}
+round: {round_n}
+goal: {goal_id}
+summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-sup-machine-block-r{round_n}.md
+---
+
+# 闸审摘要没有机器块 · {slice_id} · r{round_n}
+
+摘要文件在，或路径是空的，但没有可解析的机器块。这不是 PASS，也不是新的实现轮。
+
+- 原因: `{reason}`
+- 备注: {(note or '')[:800]}
+
+## Options（三选一）
+- **rerun_gate**: 只补一轮闸审，不新开实现票
+- **question**: 当成问题，停在 awaiting_supervisor
+- **escalate**: 升级（只有这个才通知终态）
+
+写 summary，机器块只许这一种：
+```json
+{{
+  "action": "machine_block_decision",
+  "slice": "{slice_id}",
+  "decision": "rerun_gate|question|escalate"
+}}
+```
+"""
+    path = PACKS / name
+    path.write_text(body, encoding="utf-8")
+    _enforce_pack_bytes(path)
+    return name
+
+
+def auto_supervisor_machine_block_decision(
+    job: dict,
+    chain: dict,
+    *,
+    round_n: int,
+    reason: str,
+    note: str = "",
+    goal: dict | None = None,
+) -> str | None:
+    """Open supervisor-goal-<id> (keep_open). Return rerun_gate|question|escalate."""
+    goal_id = job.get("goal") or chain.get("goal")
+    if goal is None and goal_id:
+        goal = _read_goal(goal_id)
+    max_sup = int(
+        (goal or {}).get("max_supervisor_tickets")
+        or job.get("max_supervisor_tickets")
+        or 8
+    )
+    if goal and int(goal.get("supervisor_ticket_count") or 0) >= max_sup:
+        print(f"[trial-broker] supervisor ticket cap {max_sup} reached (machine block)", flush=True)
+        return None
+    slice_id = str(chain.get("slice") or job.get("slice") or "")
+    pack_name = _machine_block_pack(
+        slice_id=slice_id,
+        round_n=round_n,
+        reason=reason,
+        note=note,
+        goal_id=str(goal_id or ""),
+    )
+    reuse_kw = _supervisor_reuse_kwargs(
+        goal if isinstance(goal, dict) else {"goal": goal_id or "goal"}
+    )
+    ticket = str(reuse_kw["reuse_ticket"])
+    profile = str(
+        job.get("supervisor_profile")
+        or (goal or {}).get("supervisor_profile")
+        or "acp-lite"
+    )
+    ec, _art, summary_path = run_supervisor_ticket(
+        ticket=ticket,
+        pack_name=pack_name,
+        profile=profile,
+        cwd=str(job.get("cwd") or chain.get("cwd") or "/workspace"),
+        summary_name=f"{slice_id}-sup-machine-block-r{round_n}",
+        prompt_mode="supervisor-pause",
+        goal=goal,
+        keep_open=True,
+        resume=bool(reuse_kw["resume"]),
+    )
+    if isinstance(goal, dict) and ec == 0:
+        goal["supervisor_reuse_ticket"] = ticket
+        goal.pop("supervisor_reuse_broken", None)
+        _write_goal(goal)
+    elif isinstance(goal, dict) and ec != 0:
+        goal["supervisor_reuse_broken"] = True
+        _write_goal(goal)
+    parsed = _parse_supervisor_summary(summary_path)
+    decision = parse_machine_block_decision(parsed.get("block"), parsed.get("text") or "")
+    print(
+        f"[trial-broker] machine block supervisor decision={decision or '(empty)'} via {ticket}",
+        flush=True,
+    )
+    return decision
+
+
 # route_pause_decision returns this instead of parking. run_chain_rounds must
 # stay inside the Goal thread and resume the same impl ticket.
 CONTINUE_SAME_INLINE = 3
@@ -8287,11 +8413,19 @@ def run_chain_rounds(
         reuse_impl = bool(resume) and not inline and (
             resumed_rec is not None or impl_summary.is_file()
         )
+        # Supervisor asked to re-run only the gate. The impl summary stays;
+        # a new impl ticket is not opened.
+        rerun_gate = False
+        if chain.get("rerun_gate_only") == round_n and impl_summary.is_file():
+            chain.pop("rerun_gate_only", None)
+            rerun_gate = True
+            reuse_impl = True
+            resumed_rec = None
         # T3: a bare summary file is not proof the impl ticket finished — the
         # broker may have died while it was still running (or after it died
         # mid-flight). Only the log's closing ``=== exit=`` line, a review
         # PASS, or a live ticket that later reaches its exit line counts.
-        if reuse_impl and resumed_rec is None and impl_summary.is_file():
+        if reuse_impl and resumed_rec is None and impl_summary.is_file() and not rerun_gate:
             state = _impl_ticket_state(impl_ticket, impl_log)
             if state != "ended" and _slice_has_review_pass(
                 goal_obj, slice_id, reload=True
@@ -8910,13 +9044,13 @@ def run_chain_rounds(
         gate_log = ARTIFACT_ROOT / f"{gate_ticket}.log"
         # T2 resume: a gate summary already on disk is this round's verdict.
         # Re-opening the gate ticket would overwrite evidence and double-count.
-        reuse_gate = bool(resume) and gate_summary.is_file()
+        reuse_gate = bool(resume) and gate_summary.is_file() and not rerun_gate
         # T1 dedup: this workspace content was already reviewed mid-ticket
         # (submit_for_review). Reuse that verdict instead of paying for a second
         # gate on identical code; resume keeps its own summary-based reuse.
         dedup_rec: dict | None = None
         gate_fp = ""
-        if not resume:
+        if not resume or rerun_gate:
             # F1: never overwrite a verdict already on disk — r<N> becomes
             # r<N>-2, r<N>-3 … instead (resume keeps the original name).
             gate_summary_name = _unique_review_names(slice_id, f"r{round_n}")[1]
@@ -9102,8 +9236,9 @@ def run_chain_rounds(
             return 0
 
         # Unreadable gate summary (path missing or no machine block). Do not
-        # open a fix round — that replays the same empty HOLD. At max_rounds
-        # the salvage / supervisor park below still runs.
+        # open a fix round and do not pretend PASS. The Goal supervisor decides
+        # rerun_gate / question / escalate. At max_rounds the salvage path below
+        # still runs.
         if gblock.get("machine_block_missing") and round_n < max_rounds:
             note = str(gblock.get("notes") or f"summary path missing: {gate_summary}")
             reason = (
@@ -9111,17 +9246,71 @@ def run_chain_rounds(
                 if not gate_summary.is_file() or not gparsed["text"].strip()
                 else "machine_block_missing"
             )
+            decision = auto_supervisor_machine_block_decision(
+                job,
+                chain,
+                round_n=round_n,
+                reason=reason,
+                note=note,
+                goal=goal_obj,
+            )
+            dispatch_event(
+                chain,
+                job,
+                kind="machine_block_handoff",
+                goal=str(job.get("goal") or chain.get("goal") or ""),
+                slice_id=slice_id,
+                decision=decision or "",
+                reason=reason,
+            )
+            reruns = [int(n) for n in (chain.get("machine_block_reruns") or [])]
+            if (
+                decision == "rerun_gate"
+                and round_n not in reruns
+                and impl_summary.is_file()
+            ):
+                chain["machine_block_reruns"] = reruns + [round_n]
+                chain["rerun_gate_only"] = round_n
+                chain["state"] = "running"
+                chain["last_verdict"] = "question"
+                chain["rounds"][-1] = round_rec
+                _write_chain(chain)
+                print(
+                    f"[trial-broker] chain {slice_id} r{round_n} "
+                    f"rerun gate only ({reason})",
+                    flush=True,
+                )
+                continue
             round_rec["verdict"] = "question"
             chain["rounds"][-1] = round_rec
-            chain["state"] = "awaiting_supervisor"
-            chain["awaiting_reason"] = reason
             chain["last_verdict"] = "question"
             chain["error"] = note
+            if decision == "escalate":
+                chain["state"] = "escalated"
+                chain["escalate_reason"] = reason
+                _write_chain(chain)
+                if goal_obj is not None and goal_id:
+                    goal_obj = _read_goal(str(goal_id)) or goal_obj
+                    goal_obj["status"] = "escalated"
+                    goal_obj["escalate_reason"] = reason
+                    goal_obj["error"] = note
+                    goal_obj["last_chain_state"] = "escalated"
+                    _write_goal(goal_obj)
+                    _notify_goal_terminal(str(goal_id))
+                out = _terminal_outbox(job, chain, dest, ok=False)
+                print(
+                    f"[trial-broker] chain {slice_id} escalated r{round_n} "
+                    f"({reason}) outbox={out.name}",
+                    flush=True,
+                )
+                return 1
+            chain["state"] = "awaiting_supervisor"
+            chain["awaiting_reason"] = reason
             _write_chain(chain)
             _notify_awaiting_hub(
                 job, chain, reason=reason, block={"notes": note}, goal=goal_obj,
             )
-            out = _terminal_outbox(job, chain, dest, ok=True)
+            out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
             print(
                 f"[trial-broker] chain {slice_id} question r{round_n} "
                 f"({reason}) outbox={out.name}",
@@ -12081,18 +12270,115 @@ def _goal_processing_file(goal: dict, goal_id: str) -> Path | None:
     return fallback
 
 
+_WD_MOD = None
+
+
+def _watchdog_mod():
+    """Lazy load of the watchdog module (process table + heartbeat rules)."""
+    global _WD_MOD
+    if _WD_MOD is False:
+        return None
+    if _WD_MOD is not None:
+        return _WD_MOD
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "trial_watchdog_from_broker",
+            Path(__file__).resolve().with_name("trial-watchdog.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        _WD_MOD = mod
+    except Exception as e:  # noqa: BLE001 - a missing watchdog must not escalate
+        print(f"[trial-broker] watchdog import failed: {e}", flush=True)
+        _WD_MOD = False
+        return None
+    return _WD_MOD
+
+
+def _inbox_has_goal(goal_id: str) -> bool:
+    if not INBOX.is_dir():
+        return False
+    for cand in sorted(INBOX.glob("*.json")):
+        if cand.name.endswith(".error.json"):
+            continue
+        try:
+            data = json.loads(cand.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(data, dict) and str(data.get("goal") or "") == goal_id:
+            return True
+    return False
+
+
+def _heartbeat_holds_goal(goal_id: str) -> bool:
+    wd = _watchdog_mod()
+    if wd is None:
+        return False
+    age = wd.heartbeat_age(HEARTBEAT, time.time())
+    if age is None or age > wd.heartbeat_timeout():
+        return False
+    return goal_id in wd._heartbeat_goal_ids(wd.read_heartbeat(HEARTBEAT))
+
+
+def _work_pid_holds_goal(goal_id: str) -> bool:
+    wd = _watchdog_mod()
+    if wd is None:
+        return False
+    return wd._work_pid_has_token(wd.list_work_pids(), goal_id)
+
+
+def _orphan_alive_signal(goal: dict, goal_id: str) -> str:
+    """heartbeat | process | job, or '' when none of the three is present."""
+    if _goal_processing_file(goal, goal_id) is not None or _inbox_has_goal(goal_id):
+        return "job"
+    if _heartbeat_holds_goal(goal_id):
+        return "heartbeat"
+    if _work_pid_holds_goal(goal_id):
+        return "process"
+    return ""
+
+
+def _write_orphan_handoff_outbox(goal_id: str, slice_id: str, ticket: str, reason: str) -> None:
+    body = {
+        "kind": "orphan_supervisor_handoff",
+        "goal": goal_id,
+        "slice": slice_id,
+        "decision": "",
+        "reason": reason,
+        "status": "handoff",
+        "supervisor_ticket": ticket,
+        "at": _iso(),
+    }
+    try:
+        OUTBOX.mkdir(parents=True, exist_ok=True)
+        path = OUTBOX / f"event-orphan_supervisor_handoff-{time.time_ns()}.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(body, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"[trial-broker] orphan handoff outbox failed {goal_id}: {e}", flush=True)
+
+
 def _escalate_orphan_goal(goal: dict, goal_id: str, status: str) -> bool:
-    """Escalate a non-terminal Goal whose processing job / live ticket is gone.
+    """Hand a jobless non-terminal Goal to the supervisor. Never writes escalated.
 
-    A Goal stuck in planning/running/closeout with no processing job can never
-    finish on its own: nothing will ever write its terminal state. Marking it
-    escalated is the only way to advance it (the incident: an orphan ran
-    forever because the old code merely logged ``left alone``).
+    Same three signals as the watchdog: a fresh heartbeat slot (empty ticket
+    still counts), a visible work pid, or a processing/inbox job. Any one of
+    them leaves the Goal alone. When all three are absent, record
+    ``perceive_handoff`` so the existing scheduler opens ``supervisor-goal-<id>``.
 
-    Exception: a Goal parked in ``awaiting_supervisor`` / pause_* is waiting
-    for a chain-reply or supervisor five-way — leave it alone (do not escalate
-    and do not open the next slice).
+    A Goal already handed off, or parked in ``awaiting_supervisor`` / pause_*,
+    is left alone.
     """
+    hand = goal.get("perceive_handoff")
+    if isinstance(hand, dict) and hand.get("handed"):
+        print(
+            f"[trial-broker] goal {goal_id} orphan sweep skipped: already handed "
+            f"to {hand.get('ticket') or 'supervisor'} (status={status})",
+            flush=True,
+        )
+        return False
     parked, sid = _goal_has_parked_awaiting_slice(goal)
     if parked:
         print(
@@ -12101,33 +12387,48 @@ def _escalate_orphan_goal(goal: dict, goal_id: str, status: str) -> bool:
             flush=True,
         )
         return False
-    goal["status"] = "escalated"
-    goal["escalate_reason"] = "orphan_running_no_processing"
-    goal["error"] = "running/planning/closeout but processing job missing; no live ticket"
-    _write_goal(goal)
-    try:
-        _notify_goal_event(
-            goal,
-            kind="escalate",
-            ok=False,
-            reason="orphan_running_no_processing",
-            suggested_action="无 processing job / 活票：人工收口或重新投递该 Goal",
+    alive = _orphan_alive_signal(goal, goal_id)
+    if alive:
+        print(
+            f"[trial-broker] goal {goal_id} orphan sweep skipped: {alive} still live "
+            f"(status={status})",
+            flush=True,
         )
-    except Exception as e:  # noqa: BLE001 - notify must never block reconciliation
-        print(f"[trial-broker] orphan escalate notify failed {goal_id}: {e}", flush=True)
+        return False
+    slice_id = str(goal.get("current_slice") or "").strip()
+    if not slice_id:
+        slices = _goal_slice_ids(goal)
+        slice_id = slices[-1] if slices else ""
+    ticket = PS.supervisor_ticket_name(goal_id)
+    reason = (
+        f"orphan running goal status={status}: no processing job / live "
+        "process / heartbeat slot"
+    )
+    _write_orphan_handoff_outbox(goal_id, slice_id, ticket, reason)
+    goal["perceive_handoff"] = {
+        "handed": True,
+        "opened": False,
+        "reason": "orphan_running_no_processing",
+        "ticket": ticket,
+        "slice": slice_id,
+        "at": _iso(),
+    }
+    _write_goal(goal)
     print(
-        f"[trial-broker] escalate orphan goal {goal_id} (no processing job) status={status}",
+        f"[trial-broker] hand orphan goal {goal_id} to {ticket} (status={status})",
         flush=True,
     )
-    return True
+    return False
 
 
 def reconcile_orphan_running_goals() -> list[str]:
-    """Escalate every non-terminal Goal with no processing job (startup sweep).
+    """Startup sweep: hand jobless non-terminal Goals to the supervisor.
 
-    Returns the escalated goal ids. Safe to call from startup and from the
-    watchdog's sibling sweep; a Goal that still owns a processing job is left
-    untouched.
+    Same three alive signals as the watchdog (heartbeat slot, work pid,
+    processing/inbox). Any one leaves the Goal untouched. When all three are
+    absent, write ``perceive_handoff`` instead of ``status=escalated``. The
+    returned list stays empty; only a later supervisor ``escalate`` changes
+    status.
     """
     escalated: list[str] = []
     if not GOALS.is_dir():
@@ -12155,8 +12456,8 @@ def collect_resume_items() -> list[dict]:
 
     A Goal is resumable when its status is planning/running/closeout and its
     processing job is still on disk. A running Goal whose processing job is
-    gone is escalated (``orphan_running_no_processing``) instead of being
-    logged and left stuck forever.
+    gone is handed to ``supervisor-goal-<id>`` (``orphan_running_no_processing``)
+    instead of being logged and left stuck, and is not written ``escalated``.
     """
     items: list[dict] = []
     if not GOALS.is_dir():
@@ -12272,6 +12573,343 @@ def _start_job(running: dict, slot: int, *, label, path, job, dirs, goal_ids, ru
     return rec
 
 
+def collect_perceive_handoff_items() -> list[dict]:
+    """Goals the watchdog handed off, not yet opened by this loop.
+
+    Dispatched by ``scheduler_loop`` through the existing slot scheduler.
+    """
+    items: list[dict] = []
+    if not GOALS.is_dir():
+        return items
+    for path in sorted(GOALS.glob("*.json")):
+        try:
+            goal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(goal, dict):
+            continue
+        hand = goal.get("perceive_handoff")
+        if not isinstance(hand, dict) or not hand.get("handed") or hand.get("opened"):
+            continue
+        goal_id = str(goal.get("goal") or path.stem)
+        if not goal_id:
+            continue
+        items.append(
+            {
+                "goal": goal_id,
+                "label": f"perceive-handoff-{goal_id}",
+                "path": STATE_DIR / f"perceive-handoff-{goal_id}.json",
+                "job": {"goal": goal_id, "type": "perceive-handoff"},
+                "dirs": job_conflict_dirs({"cwd": goal.get("cwd")}),
+                "goal_ids": {goal_id},
+                "runner": run_perceive_handoff,
+            }
+        )
+    return items
+
+
+def run_perceive_handoff(path: Path, job: dict) -> int:
+    """Open the existing Goal supervisor session for a watchdog handoff.
+
+    Reuses ``auto_supervisor_pause_decision`` (keep_open, five-way pack).
+    ``status=escalated`` is written only when that session returns escalate.
+    """
+    del path
+    goal_id = str((job or {}).get("goal") or "")
+    goal = _read_goal(goal_id)
+    if not isinstance(goal, dict):
+        return 0
+    hand = goal.get("perceive_handoff")
+    if not isinstance(hand, dict) or not hand.get("handed") or hand.get("opened"):
+        return 0
+    hand = dict(hand)
+    hand["opened"] = True
+    goal["perceive_handoff"] = hand
+    _write_goal(goal)
+    slice_id = str(hand.get("slice") or goal.get("current_slice") or "").strip() or goal_id
+    chain = _read_chain(slice_id)
+    if not isinstance(chain, dict):
+        chain = {"slice": slice_id, "goal": goal_id, "state": "running", "rounds": []}
+    else:
+        chain = dict(chain)
+        chain.setdefault("slice", slice_id)
+        chain.setdefault("goal", goal_id)
+    pause_job = {
+        "goal": goal_id,
+        "slice": slice_id,
+        "cwd": str(goal.get("cwd") or chain.get("cwd") or "/workspace"),
+        "type": "goal",
+        "supervisor_profile": goal.get("supervisor_profile") or "acp-lite",
+        "profile": goal.get("profile") or "acp-lite",
+        "notify": goal.get("notify"),
+        "notify_dry_run": goal.get("notify_dry_run"),
+        "notify_prefix": goal.get("notify_prefix"),
+        "max_supervisor_tickets": goal.get("max_supervisor_tickets"),
+    }
+    round_n = len(chain.get("rounds") or []) + 1
+    impl_ticket = str(chain.get("last_impl_ticket") or "")
+    decision = auto_supervisor_pause_decision(
+        pause_job,
+        chain,
+        round_n=round_n,
+        pause_kind="orphan_running_no_processing",
+        goal=goal,
+        notes=(
+            "watchdog perceive: heartbeat slot, work pid, and processing job all absent"
+        ),
+        impl_ticket=impl_ticket,
+    )
+    if not decision:
+        # ponytail: a cap hit or empty decision is not retried here. The ticket
+        # was either refused by the existing cap or already opened once.
+        return 0
+    dest = PROCESSING / f"perceive-handoff-{goal_id}.absent"
+    rc = route_pause_decision(
+        pause_job,
+        chain,
+        dest,
+        decision=decision,
+        pause_kind="orphan_running_no_processing",
+        round_n=round_n,
+        pack_for_impl=str(chain.get("pending_impl_pack") or chain.get("pack") or ""),
+        goal_obj=goal,
+        impl_ticket=impl_ticket,
+    )
+    # ponytail: continue_same is recorded on the chain by route_pause_decision,
+    # but there is no live Goal thread to re-enter the impl session.
+    if decision == "escalate":
+        fresh = _read_goal(goal_id) or goal
+        fresh["status"] = "escalated"
+        fresh["escalate_reason"] = "supervisor_pause:orphan_running_no_processing"
+        fresh["error"] = "supervisor escalate after perceive handoff"
+        _write_goal(fresh)
+        try:
+            _notify_goal_event(
+                fresh,
+                kind="escalate",
+                ok=False,
+                reason=fresh["escalate_reason"],
+                suggested_action="监理已选择 escalate",
+            )
+        except Exception as e:  # noqa: BLE001 - notify must not undo the decision
+            print(f"[trial-broker] perceive escalate notify failed {goal_id}: {e}", flush=True)
+    return rc if isinstance(rc, int) else 0
+
+
+_MACHINE_BLOCK_PARK_REASONS = ("machine_block_missing", "summary_path_missing")
+
+
+def _machine_block_park_pending(chain: dict | None) -> bool:
+    """Parked on an unreadable gate summary, supervisor not opened yet."""
+    if not isinstance(chain, dict):
+        return False
+    if str(chain.get("state") or "") != "awaiting_supervisor":
+        return False
+    if str(chain.get("awaiting_reason") or "") not in _MACHINE_BLOCK_PARK_REASONS:
+        return False
+    hand = chain.get("machine_block_handoff")
+    if isinstance(hand, dict) and hand.get("opened"):
+        return False
+    return True
+
+
+def _goal_for_parked_chain(chain: dict, slice_id: str) -> tuple[str, dict | None]:
+    goal_id = str(chain.get("goal") or "").strip()
+    if goal_id:
+        return goal_id, _read_goal(goal_id)
+    if not GOALS.is_dir():
+        return "", None
+    for path in sorted(GOALS.glob("*.json")):
+        try:
+            goal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(goal, dict):
+            continue
+        slices = [str(s) for s in (goal.get("slices") or []) if str(s)]
+        if slice_id in slices or str(goal.get("current_slice") or "") == slice_id:
+            return str(goal.get("goal") or path.stem), goal
+    return "", None
+
+
+def collect_machine_block_park_items() -> list[dict]:
+    """Chains already parked on a missing machine block, supervisor not opened.
+
+    A restart does not re-enter ``run_chain_rounds``, so the handoff added on
+    the gate return never runs for these. The scheduler opens it once.
+    """
+    items: list[dict] = []
+    if not CHAINS.is_dir():
+        return items
+    for path in sorted(CHAINS.glob("*.json")):
+        try:
+            chain = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not _machine_block_park_pending(chain):
+            continue
+        slice_id = str(chain.get("slice") or path.stem)
+        goal_id, goal = _goal_for_parked_chain(chain, slice_id)
+        if not goal_id:
+            continue
+        if isinstance(goal, dict):
+            status = str(goal.get("status") or "")
+            if status in ("done", "failed", "cancelled", "escalated"):
+                continue
+            if _goal_processing_file(goal, goal_id) is not None or _inbox_has_goal(goal_id):
+                continue
+        cwd = str(chain.get("cwd") or (goal or {}).get("cwd") or "")
+        items.append(
+            {
+                "goal": goal_id,
+                "label": f"machine-block-park-{slice_id}",
+                "path": path,
+                "job": {
+                    "goal": goal_id,
+                    "slice": slice_id,
+                    "type": "machine-block-park",
+                },
+                "dirs": job_conflict_dirs({"cwd": cwd}),
+                "goal_ids": {goal_id},
+                "runner": run_machine_block_park,
+            }
+        )
+    return items
+
+
+def _parked_round_n(chain: dict) -> int:
+    rounds = [r for r in (chain.get("rounds") or []) if isinstance(r, dict)]
+    if not rounds:
+        return 1
+    try:
+        return int(rounds[-1].get("round") or len(rounds) or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _chain_job_for_machine_block(chain: dict, goal: dict | None, slice_id: str, goal_id: str) -> dict:
+    profile = str(chain.get("profile") or (goal or {}).get("profile") or "acp-lite")
+    return {
+        "id": f"machine-block-{slice_id}",
+        "type": "chain",
+        "slice": slice_id,
+        "goal": goal_id,
+        "from_goal": bool(goal_id),
+        "pack": str(chain.get("pack") or ""),
+        "acceptance": chain.get("acceptance") or [],
+        "profile": profile,
+        "gate_profile": str(chain.get("gate_profile") or profile),
+        "supervisor_profile": str(
+            (goal or {}).get("supervisor_profile") or chain.get("supervisor_profile") or "acp-lite"
+        ),
+        "cwd": str(chain.get("cwd") or (goal or {}).get("cwd") or "/workspace"),
+        "max_rounds": int(chain.get("max_rounds") or (goal or {}).get("max_rounds") or 2),
+        "notify": chain.get("notify") if chain.get("notify") is not None else (goal or {}).get("notify"),
+        "notify_dry_run": chain.get("notify_dry_run"),
+        "notify_prefix": chain.get("notify_prefix"),
+        "max_supervisor_tickets": (goal or {}).get("max_supervisor_tickets"),
+    }
+
+
+def run_machine_block_park(path: Path, job: dict) -> int:
+    """Hand one already-parked unreadable gate to supervisor-goal-<id> once.
+
+    Question stays parked. rerun_gate re-enters the same round's gate only.
+    escalate is the only path that writes ``status=escalated``.
+    """
+    del path
+    slice_id = str((job or {}).get("slice") or "")
+    goal_id = str((job or {}).get("goal") or "")
+    chain = _read_chain(slice_id)
+    if not _machine_block_park_pending(chain) or not isinstance(chain, dict):
+        return 0
+    reason = str(chain.get("awaiting_reason") or "machine_block_missing")
+    goal = _read_goal(goal_id) if goal_id else None
+    round_n = _parked_round_n(chain)
+    chain["machine_block_handoff"] = {
+        "opened": True,
+        "reason": reason,
+        "ticket": PS.supervisor_ticket_name(goal_id or slice_id),
+        "at": _iso(),
+    }
+    _write_chain(chain)
+    chain_job = _chain_job_for_machine_block(chain, goal, slice_id, goal_id)
+    note = str(chain.get("error") or reason)
+    decision = auto_supervisor_machine_block_decision(
+        chain_job,
+        chain,
+        round_n=round_n,
+        reason=reason,
+        note=note,
+        goal=goal,
+    )
+    dispatch_event(
+        chain,
+        chain_job,
+        kind="machine_block_handoff",
+        goal=goal_id,
+        slice_id=slice_id,
+        decision=decision or "",
+        reason=reason,
+    )
+    if decision == "rerun_gate":
+        reruns = [int(n) for n in (chain.get("machine_block_reruns") or [])]
+        impl_raw = ""
+        for rec in reversed(chain.get("rounds") or []):
+            if isinstance(rec, dict) and int(rec.get("round") or 0) == round_n:
+                impl_raw = str(rec.get("impl_summary") or "")
+                break
+        impl_summary = Path(impl_raw) if impl_raw else None
+        if round_n not in reruns and impl_summary is not None and impl_summary.is_file():
+            chain["machine_block_reruns"] = reruns + [round_n]
+            chain["rerun_gate_only"] = round_n
+            chain["state"] = "running"
+            chain["last_verdict"] = "question"
+            _write_chain(chain)
+            print(
+                f"[trial-broker] parked chain {slice_id} r{round_n} "
+                f"rerun gate only ({reason})",
+                flush=True,
+            )
+            dest = PROCESSING / f"machine-block-{slice_id}.absent"
+            return run_chain_rounds(
+                chain_job,
+                chain,
+                dest,
+                start_round=round_n,
+                start_pack=str(chain.get("pack") or ""),
+                resume=True,
+            )
+    if decision == "escalate":
+        chain["state"] = "escalated"
+        chain["escalate_reason"] = reason
+        chain["last_verdict"] = "question"
+        _write_chain(chain)
+        if goal_id:
+            fresh = _read_goal(goal_id) or goal or {"goal": goal_id}
+            fresh["status"] = "escalated"
+            fresh["escalate_reason"] = reason
+            fresh["error"] = note
+            fresh["last_chain_state"] = "escalated"
+            _write_goal(fresh)
+            _notify_goal_terminal(goal_id)
+        print(
+            f"[trial-broker] parked chain {slice_id} escalated by supervisor ({reason})",
+            flush=True,
+        )
+        return 1
+    chain["state"] = "awaiting_supervisor"
+    chain["awaiting_reason"] = reason
+    chain["last_verdict"] = "question"
+    _write_chain(chain)
+    print(
+        f"[trial-broker] parked chain {slice_id} stays awaiting ({reason}, "
+        f"decision={decision or '(empty)'})",
+        flush=True,
+    )
+    return 0
+
+
 def scheduler_loop(
     interval: int,
     resume_items: list[dict] | None = None,
@@ -12338,12 +12976,23 @@ def scheduler_loop(
             dispatched = True
             return True
 
-        # Resume work first (oldest Goal), then the inbox in enqueue order.
+        # Resume work first (oldest Goal), then watchdog handoffs and
+        # already-parked unreadable gates on the same scheduler, then inbox.
         for item in pending_resume:
             if item["goal"] in started_resume:
                 continue
             if _try(item):
                 started_resume.add(item["goal"])
+
+        for item in collect_perceive_handoff_items():
+            if item["path"].name in in_flight:
+                continue
+            _try(item)
+
+        for item in collect_machine_block_park_items():
+            if item["path"].name in in_flight:
+                continue
+            _try(item)
 
         for path in pending:
             if path.name in in_flight:

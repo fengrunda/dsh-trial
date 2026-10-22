@@ -189,16 +189,24 @@ def build_pause_pack_body(
     notes: str = "",
 ) -> str:
     """Markdown pack body for supervisor-pause decision."""
-    kind = pause_kind if pause_kind in PAUSE_KINDS else PAUSE_LIMIT
-    if kind == PAUSE_LIMIT:
-        title = "步数硬阈值"
-        suggest = "建议 continue_same 并 +0.5×budget 步 / 或适量延长 hard timeout"
-    elif kind == PAUSE_ENV:
-        title = "上游瞬态故障"
-        suggest = "建议 continue_same 续跑原会话；这不是设计被否"
+    if pause_kind == "orphan_running_no_processing":
+        kind = pause_kind
+        title = "无活票交接"
+        suggest = (
+            "看门狗没看到心跳槽、活进程、processing。"
+            "五选一；只有 escalate 才升级。"
+        )
     else:
-        title = "墙钟到点"
-        suggest = "建议 continue_same 并延长 idle/hard，或 close/split"
+        kind = pause_kind if pause_kind in PAUSE_KINDS else PAUSE_LIMIT
+        if kind == PAUSE_LIMIT:
+            title = "步数硬阈值"
+            suggest = "建议 continue_same 并 +0.5×budget 步 / 或适量延长 hard timeout"
+        elif kind == PAUSE_ENV:
+            title = "上游瞬态故障"
+            suggest = "建议 continue_same 续跑原会话；这不是设计被否"
+        else:
+            title = "墙钟到点"
+            suggest = "建议 continue_same 并延长 idle/hard，或 close/split"
     env_line = ""
     if kind == PAUSE_ENV:
         env_line = (

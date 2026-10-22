@@ -116,14 +116,27 @@ ensure_role_pack_bridge() {
 }
 
 # Render a literal prompt template: substitute @@NAME@@ markers in bash.
-# The replacement is quoted so bash 5.2 patsub_replacement does not treat
-# "&" (or backslashes) inside a value as special.
+# bash >= 5.2 enables patsub_replacement, so the replacement must be quoted or
+# "&" and backslashes inside a value are rewritten. bash 3.2 treats those
+# quotes as literal characters, which would put quotes into the pack path.
 _render_prompt() {
   local _text="$1"; shift
-  local _ph _val
+  local _ph _val _head
+  local _quote=0
+  if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 2) )); then
+    _quote=1
+  fi
   while [[ $# -ge 2 ]]; do
     _ph="$1"; _val="$2"; shift 2
-    _text="${_text//"$_ph"/"$_val"}"
+    if [[ "$_quote" -eq 1 ]]; then
+      _text="${_text//"$_ph"/"$_val"}"
+    else
+      while [[ "$_text" == *"$_ph"* ]]; do
+        _head="${_text%%"$_ph"*}"
+        _text="${_text#*"$_ph"}"
+        _text="${_head}${_val}${_text}"
+      done
+    fi
   done
   printf '%s\n' "$_text"
 }

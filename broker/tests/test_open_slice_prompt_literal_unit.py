@@ -33,8 +33,16 @@ MODES = (
     "supervisor-plan",
     "supervisor-answer",
     "supervisor-close",
+    "supervisor-machine-block",
 )
-JSON_MODES = ("foreman", "gate", "supervisor-plan", "supervisor-answer", "supervisor-close")
+JSON_MODES = (
+    "foreman",
+    "gate",
+    "supervisor-plan",
+    "supervisor-answer",
+    "supervisor-close",
+    "supervisor-machine-block",
+)
 GIT_PUSH_MODES = ("foreman", "supervisor-close")
 # The controlled-PR wrapper: backticks, `<...>`, `|` and `>` must stay literal.
 PR_LINE = (
@@ -231,6 +239,17 @@ def test_special_chars_in_cwd_are_inserted_literally(sb: Sandbox, mode: str):
     assert sb.fake_calls() == []
     assert sb.ask_calls() == []
     assert sb.snapshot() == before
+
+
+def test_supervisor_machine_block_is_three_way_not_pause(sb: Sandbox):
+    proc = sb.run_print_prompt("supervisor-machine-block")
+    assert proc.returncode == 0, proc.stderr
+    prompt = proc.stdout
+    assert "machine_block_decision" in prompt
+    assert "rerun_gate|question|escalate" in prompt
+    assert "墙钟或步数暂停" not in prompt
+    assert "pause_decision" in prompt
+    assert "continue_same" in prompt
 
 
 def test_supervisor_plan_expands_dsh_home_paths(sb: Sandbox):

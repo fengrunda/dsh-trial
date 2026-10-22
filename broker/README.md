@@ -150,6 +150,8 @@ python3 ./broker/trial-watchdog.py --once --dry-run   # 只打印 payload，不�
 10. 终态写 `thin-state/chains/<slice>.json` + outbox。终态 kind 才通知 Hub。
     过渡事件也进 outbox，kind 是过渡名。`notify_dry_run` 不发 webhook。
 
+读不懂的闸审摘要交给同一个 Goal 监理会话 `supervisor-goal-<id>`。提示词是 `supervisor-machine-block`（三选一 `rerun_gate` / `question` / `escalate`），不是暂停五选一。已经 `opened` 但还没有 `decision` 的停住链允许再交一次；写下 `decision`（含空字符串）或 `retry>=1` 之后不再交。看门狗仍不直接写 `escalated`。这条交接上已写下的 `pause_decision`/`continue_same` 按只重跑闸审执行，不再重问。
+
 ### 增量查询
 
 ```bash

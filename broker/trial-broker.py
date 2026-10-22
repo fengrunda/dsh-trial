@@ -2265,13 +2265,16 @@ def _handle_foreman_blocked(
     pack_for_impl: str,
     goal_obj: dict | None,
     block: dict | None,
+    resume: bool = False,
 ) -> int:
     """Settle ``summary(status=blocked)``; gate-cap blocks stay in-lane.
 
     Gate-cap produced blocks keep ``awaiting_reason=max_gate_rounds`` and the
     already-open supervisor decision ticket (re-opened only when missing), so
-    no Hub chain-reply event is emitted. Every other block keeps the legacy
-    behaviour: await the Hub and notify once.
+    no Hub chain-reply event is emitted. A normal block with
+    ``auto_supervisor_answer`` opens the same answer ticket as ask_supervisor
+    and continues the next impl round. Only a failed or empty answer, or
+    auto-answer off, parks and wakes the Hub.
 
     A split that already opened a follow-up must not be re-parked here: the
     foreman was told to end the ticket, and the plan loop owns the child.
@@ -2324,6 +2327,38 @@ def _handle_foreman_blocked(
             flush=True,
         )
         return 0
+    auto = job.get("auto_supervisor_answer")
+    if auto is None:
+        auto = True
+    block = block if isinstance(block, dict) else {}
+    if auto:
+        # Same answer ticket as ask_supervisor / status=question. Do not park
+        # first. A failed or empty answer falls through to the Hub park below.
+        q_action = dispatch_event(
+            chain,
+            job,
+            kind="question",
+            goal=str(job.get("goal") or chain.get("goal") or ""),
+            slice_id=slice_id,
+            reason="blocked",
+        )
+        if q_action == "answer_same_impl":
+            answer = auto_supervisor_answer(
+                job, chain, round_n=round_n, block=block
+            )
+            if answer:
+                return _resume_impl_after_supervisor_answer(
+                    job,
+                    chain,
+                    dest,
+                    slice_id=slice_id,
+                    round_n=round_n,
+                    max_rounds=int(chain.get("max_rounds") or job.get("max_rounds") or 2),
+                    pack_for_impl=pack_for_impl,
+                    answer=answer,
+                    goal_obj=goal_obj,
+                    resume=resume,
+                )
     chain["state"] = "awaiting_supervisor"
     chain["awaiting_answer_for_round"] = round_n
     chain["awaiting_reason"] = FOREMAN_STATUS_BLOCKED
@@ -5876,6 +5911,56 @@ def auto_supervisor_answer(job: dict, chain: dict, *, round_n: int, block: dict)
     return answer
 
 
+def _resume_impl_after_supervisor_answer(
+    job: dict,
+    chain: dict,
+    dest: Path,
+    *,
+    slice_id: str,
+    round_n: int,
+    max_rounds: int,
+    pack_for_impl: str,
+    answer: str,
+    goal_obj: dict | None,
+    resume: bool,
+) -> int:
+    """Open the next impl round with the supervisor answer. No Hub park."""
+    next_round = round_n + 1
+    max_rounds_local = int(chain.get("max_rounds") or max_rounds)
+    if next_round > max_rounds_local:
+        chain["max_rounds"] = next_round
+    try:
+        reply_pack = build_reply_addendum_pack(
+            slice_id=slice_id,
+            round_n=next_round,
+            prior_pack_name=Path(pack_for_impl).name,
+            answer=answer,
+            gate_findings=list((goal_obj or {}).get("last_gate_findings") or []),
+        )
+    except ValueError as e:
+        chain["state"] = "failed"
+        chain["error"] = f"auto reply pack: {e}"
+        _write_chain(chain)
+        _terminal_outbox(job, chain, dest, ok=False)
+        return 1
+    chain["state"] = "running"
+    chain["awaiting_answer_for_round"] = None
+    chain["awaiting_reason"] = None
+    chain["last_supervisor_answer"] = answer[:2000]
+    chain["reply_pack"] = reply_pack
+    _write_chain(chain)
+    print(
+        f"[trial-broker] auto supervisor answer → continue r{next_round} "
+        f"pack={reply_pack}",
+        flush=True,
+    )
+    return run_chain_rounds(
+        job, chain, dest,
+        start_round=next_round,
+        start_pack=reply_pack,
+        resume=resume,
+    )
+
 
 # --- max_rounds → awaiting_supervisor decision (2026-10-14) -----------------
 # Park instead of mechanical escalate when round_n >= max_rounds with
@@ -6118,15 +6203,15 @@ def auto_supervisor_max_rounds_decision(
         wip_tip=str(chain.get("wip_tip") or (goal or {}).get("wip_tip") or ""),
         kind=kind,
     )
-    ticket_tag = "supervisor-maxgaterounds" if gate_cap else "supervisor-maxrounds"
     summary_tag = "sup-maxgaterounds" if gate_cap else "sup-maxrounds"
-    ticket = f"{ticket_tag}-{chain['slice']}-r{round_n}"
     summary_name = f"{chain['slice']}-{summary_tag}-r{round_n}"
     profile = str(
         job.get("supervisor_profile")
         or (goal or {}).get("supervisor_profile")
         or "acp-lite"
     )
+    reuse_kw = _supervisor_reuse_kwargs(goal if isinstance(goal, dict) else {"goal": goal_id or "goal"})
+    ticket = str(reuse_kw["reuse_ticket"])
     ec, art, summary_path = run_supervisor_ticket(
         ticket=ticket,
         pack_name=ask_pack,
@@ -6135,7 +6220,16 @@ def auto_supervisor_max_rounds_decision(
         summary_name=summary_name,
         prompt_mode="supervisor-max-rounds",
         goal=goal,
+        keep_open=True,
+        resume=bool(reuse_kw["resume"]),
     )
+    if isinstance(goal, dict) and ec == 0:
+        goal["supervisor_reuse_ticket"] = ticket
+        goal.pop("supervisor_reuse_broken", None)
+        _write_goal(goal)
+    elif isinstance(goal, dict) and ec != 0:
+        goal["supervisor_reuse_broken"] = True
+        _write_goal(goal)
     chain.setdefault("supervisor_events", []).append({
         "kind": "max_rounds_decision",
         "ticket": ticket,
@@ -8698,6 +8792,7 @@ def run_chain_rounds(
                 pack_for_impl=pack_for_impl,
                 goal_obj=goal_obj,
                 block=block,
+                resume=resume,
             )
         if status == FOREMAN_STATUS_QUESTION:
             q_action = dispatch_event(
@@ -8721,45 +8816,16 @@ def run_chain_rounds(
                     job, chain, round_n=round_n, block=block
                 )
                 if answer:
-                    # resume inline via reply pack (same as chain-reply)
-                    prior_round = round_n
-                    next_round = prior_round + 1
-                    max_rounds_local = int(chain.get("max_rounds") or max_rounds)
-                    if next_round > max_rounds_local:
-                        max_rounds_local = next_round
-                        chain["max_rounds"] = max_rounds_local
-                        max_rounds = max_rounds_local
-                    try:
-                        reply_pack = build_reply_addendum_pack(
-                            slice_id=slice_id,
-                            round_n=next_round,
-                            prior_pack_name=Path(pack_for_impl).name,
-                            answer=answer,
-                            gate_findings=list(
-                                (goal_obj or {}).get("last_gate_findings") or []
-                            ),
-                        )
-                    except ValueError as e:
-                        chain["state"] = "failed"
-                        chain["error"] = f"auto reply pack: {e}"
-                        _write_chain(chain)
-                        _terminal_outbox(job, chain, dest, ok=False)
-                        return 1
-                    chain["state"] = "running"
-                    chain["awaiting_answer_for_round"] = None
-                    chain["last_supervisor_answer"] = answer[:2000]
-                    chain["reply_pack"] = reply_pack
-                    _write_chain(chain)
-                    pack_for_impl = reply_pack
-                    print(
-                        f"[trial-broker] auto supervisor answer → continue r{next_round} "
-                        f"pack={reply_pack}",
-                        flush=True,
-                    )
-                    return run_chain_rounds(
-                        job, chain, dest,
-                        start_round=next_round,
-                        start_pack=reply_pack,
+                    return _resume_impl_after_supervisor_answer(
+                        job,
+                        chain,
+                        dest,
+                        slice_id=slice_id,
+                        round_n=round_n,
+                        max_rounds=max_rounds,
+                        pack_for_impl=pack_for_impl,
+                        answer=answer,
+                        goal_obj=goal_obj,
                         resume=resume,
                     )
             # Fix 1: question parked (auto-answer off / failed) — wake the Hub

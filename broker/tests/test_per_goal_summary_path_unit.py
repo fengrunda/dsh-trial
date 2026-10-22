@@ -440,3 +440,84 @@ def test_machine_block_supervisor_reuses_goal_session(tmp_path: Path):
                 job, chain, round_n=1, reason="machine_block_missing", goal=goal,
             )
         assert decision == "rerun_gate"
+
+
+def test_parked_machine_block_chain_is_handed_once(tmp_path: Path):
+    """A chain already awaiting before this code shipped is picked up once."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    goal_id = "unit-parked-goal"
+    parked = "unit-parked-noblock"
+    missing = "unit-parked-nosummary"
+    other = "unit-parked-other"
+
+    def _chain(slice_id: str, reason: str, *, opened: bool = False) -> dict:
+        body = {
+            "slice": slice_id,
+            "state": "awaiting_supervisor",
+            "awaiting_reason": reason,
+            "last_verdict": "question",
+            "goal": goal_id,
+            "cwd": str(root),
+            "pack": f"{slice_id}.pack.md",
+            "profile": "acp-lite",
+            "gate_profile": "acp-lite",
+            "max_rounds": 2,
+            "rounds": [{"round": 1, "verdict": "question"}],
+        }
+        if opened:
+            body["machine_block_handoff"] = {"opened": True, "reason": reason}
+        return body
+
+    with _patched_dirs(tmp_path / "state") as dirs:
+        (dirs["goals"] / f"{goal_id}.json").write_text(
+            json.dumps({
+                "goal": goal_id,
+                "status": "running",
+                "slices": [parked, missing, other],
+                "current_slice": parked,
+                "cwd": str(root),
+            }),
+            encoding="utf-8",
+        )
+        (dirs["chains"] / f"{parked}.json").write_text(
+            json.dumps(_chain(parked, "machine_block_missing")), encoding="utf-8",
+        )
+        (dirs["chains"] / f"{missing}.json").write_text(
+            json.dumps(_chain(missing, "summary_path_missing")), encoding="utf-8",
+        )
+        (dirs["chains"] / f"{other}.json").write_text(
+            json.dumps(_chain(other, "max_rounds")), encoding="utf-8",
+        )
+        items = tb.collect_machine_block_park_items()
+        assert [it["job"]["slice"] for it in items] == [parked, missing]
+        assert all(it["runner"] is tb.run_machine_block_park for it in items)
+        target = next(it for it in items if it["job"]["slice"] == parked)
+        with mock.patch.object(
+            tb, "auto_supervisor_machine_block_decision", return_value="question",
+        ) as sup, mock.patch.object(tb, "run_open_slice") as opened, mock.patch.object(
+            tb, "run_chain_rounds",
+        ) as rerun, mock.patch.object(
+            tb, "maybe_notify_hub", return_value={"sent": True},
+        ):
+            rc = tb.run_machine_block_park(target["path"], target["job"])
+        assert rc == 0
+        assert sup.call_count == 1
+        assert sup.call_args.kwargs["reason"] == "machine_block_missing"
+        assert opened.call_count == 0
+        assert rerun.call_count == 0
+        chain = json.loads((dirs["chains"] / f"{parked}.json").read_text())
+        assert chain["state"] == "awaiting_supervisor"
+        assert chain["awaiting_reason"] == "machine_block_missing"
+        assert chain["last_verdict"] == "question"
+        assert chain["last_verdict"] != "PASS"
+        assert "escalate_reason" not in chain
+        assert chain["machine_block_handoff"]["opened"] is True
+        assert chain["machine_block_handoff"]["ticket"] == f"supervisor-goal-{goal_id}"
+        goal = json.loads((dirs["goals"] / f"{goal_id}.json").read_text())
+        assert goal["status"] == "running"
+        assert "escalate_reason" not in goal
+        kinds = [b["kind"] for b in _event_bodies(dirs)]
+        assert kinds == ["machine_block_handoff"]
+        again = [it["job"]["slice"] for it in tb.collect_machine_block_park_items()]
+        assert again == [missing]

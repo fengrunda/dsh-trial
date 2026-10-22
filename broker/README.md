@@ -125,7 +125,9 @@ python3 ./broker/trial-watchdog.py --once --dry-run   # 只打印 payload，不�
 3. Gate 写 `summaries/<slice>-gate-r<N>.md`（verdict PASS|HOLD + findings）。
    摘要在但没有可解析机器块，且 round 还没到 `max_rounds`：不新开实现轮，也不当成 PASS。
    交给已有的 `supervisor-goal-<id>`（keep_open）三选一 `rerun_gate` / `question` / `escalate`。
-   过渡事件 kind=`machine_block_handoff`。只有 `escalate` 才是终态。  
+   过渡事件 kind=`machine_block_handoff`。只有 `escalate` 才是终态。
+   重启前已经停在 `awaiting_supervisor`、原因是 `machine_block_missing` 或
+   `summary_path_missing`、且链上还没有 `machine_block_handoff.opened` 的，调度循环用同一张监理票接一次。接过的不再每轮重开。  
 4. HOLD 且 round < max → 写 fix pack：**Gate findings 是主任务**（正文最前），
    Done when 要求逐条 `finding_resolutions`，**原 pack 缩略作附录** → 下一轮工头；满轮 HOLD → `escalated`。  
 5. 工头票中 `submit_for_review` 返回 HOLD：

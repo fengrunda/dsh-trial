@@ -56,6 +56,11 @@ python3 ./trial-broker.py --status
 ./stop.sh
 ```
 
+启动脚本（`start.sh` / `watchdog-start.sh`）会在 `source $DSH_HOME/load-env.sh` 之后按需
+`set -a; source $DSH_HOME/watchdog-webhook.env; set +a`：文件存在就把
+`DSH_KHUB_COMPLETE_WEBHOOK_URL` / `DSH_KHUB_COMPLETE_WEBHOOK_KEY` 注入本进程及其子进程
+（broker / watchdog 报警共用），文件缺失照常启动；改完 env 需重启才生效，脚本不回显取值。
+
 ## Watchdog（broker 死了也能喊）
 
 `trial-watchdog.py` 是**独立进程**（不 import broker 主循环），即使 `trial-broker.py`

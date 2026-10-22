@@ -17,6 +17,14 @@ mkdir -p "$STATE_DIR"
 if [[ -f "$DSH_HOME/load-env.sh" ]]; then
   source "$DSH_HOME/load-env.sh"
 fi
+
+# Hub/watchdog complete webhook（改 env 后需重启 broker 空窗重起才生效；勿回显取值）
+if [[ -f "$DSH_HOME/watchdog-webhook.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$DSH_HOME/watchdog-webhook.env"
+  set +a
+fi
 export DSH_HOME
 unset NEW_API_KEY 2>/dev/null || true
 

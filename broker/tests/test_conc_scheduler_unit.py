@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -372,6 +373,120 @@ def test_different_cwds_run_in_parallel(tmp_path):
             assert ctl.wait_started(2)
             assert ctl.finished == []
             assert _wait_for(lambda: len(_heartbeat().get("slots") or []) == 2)
+
+
+def _git_proc(argv, code: int = 0, out: str = "", err: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(argv, code, out, err)
+
+
+def test_cwd_conflict_opens_worktree_and_runs(tmp_path):
+    """Two Goals, one checkout: the second is moved under the prefix and starts."""
+    tb._WORKTREE_RELOCATE_FAILED.clear()
+    prefix = tmp_path / "wt"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    adds: list[list[str]] = []
+    real_run = subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if not (isinstance(argv, (list, tuple)) and argv and argv[0] == "git"):
+            return real_run(argv, **kwargs)
+        if "--is-inside-work-tree" in argv:
+            return _git_proc(argv, 0, "true\n")
+        if "worktree" in argv and "add" in argv:
+            adds.append(list(argv))
+            Path(argv[-2]).mkdir(parents=True, exist_ok=True)
+            return _git_proc(argv, 0)
+        if "worktree" in argv and "list" in argv:
+            return _git_proc(argv, 0, f"worktree {repo}\nbranch refs/heads/main\n")
+        if "rev-parse" in argv and "origin/main" in argv:
+            return _git_proc(argv, 0, "abc\n")
+        return _git_proc(argv, 1, err="unexpected")
+
+    with _patched(tmp_path / "state") as dirs, _limits(tmp_path, {"max_concurrent_goals": 2}):
+        ctl = _Ctl()
+        seen: dict[str, str] = {}
+
+        def on_run(name, job):
+            seen[name] = str(job.get("cwd") or "")
+
+        ctl.on_run = on_run
+        paths = [
+            _write_job(dirs["inbox"], "a.json", goal="goal-a", cwd=str(repo)),
+            _write_job(dirs["inbox"], "b.json", goal="goal/b", cwd=str(repo)),
+        ]
+        _write_mtimes(paths)
+        env = {"DSH_TRIAL_WORKTREE_PREFIXES": str(prefix)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(
+            tb.subprocess, "run", side_effect=fake_run
+        ), mock.patch.object(tb, "run_job", ctl.run_job), _Sched():
+            assert ctl.wait_started(2), ctl.order
+        assert set(ctl.order) == {"a.json", "b.json"}
+        assert os.path.realpath(seen["a.json"]) == os.path.realpath(repo)
+        assert os.path.realpath(seen["b.json"]) == os.path.realpath(prefix / "goalb")
+        assert len(adds) == 1
+        add = adds[0]
+        assert add[add.index("-b") + 1] == "feat/goalb"
+        assert add[-1] == "origin/main"
+        assert os.path.realpath(add[-2]) == os.path.realpath(prefix / "goalb")
+
+
+def test_goal_busy_does_not_open_worktree(tmp_path):
+    tb._WORKTREE_RELOCATE_FAILED.clear()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    real_run = subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if isinstance(argv, (list, tuple)) and argv and argv[0] == "git":
+            raise AssertionError(argv)
+        return real_run(argv, **kwargs)
+
+    with _patched(tmp_path / "state") as dirs, _limits(tmp_path, {"max_concurrent_goals": 2}):
+        ctl = _Ctl()
+        paths = [
+            _write_job(dirs["inbox"], "a.json", goal="same-goal", cwd=str(repo)),
+            _write_job(dirs["inbox"], "b.json", goal="same-goal", cwd=str(repo)),
+        ]
+        _write_mtimes(paths)
+        with mock.patch.object(tb.subprocess, "run", side_effect=fake_run), mock.patch.object(
+            tb, "run_job", ctl.run_job
+        ), _Sched():
+            assert ctl.wait_started(1)
+            assert _wait_for(lambda: _queued_reason("b.json") == "goal-busy:same-goal")
+            assert ctl.order == ["a.json"]
+        saved = json.loads((dirs["inbox"] / "b.json").read_text(encoding="utf-8"))
+        assert saved["cwd"] == str(repo)
+
+
+def test_worktree_cwd_conflict_does_not_nest(tmp_path):
+    tb._WORKTREE_RELOCATE_FAILED.clear()
+    prefix = tmp_path / "wt"
+    slot = prefix / "already"
+    slot.mkdir(parents=True)
+    real_run = subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if isinstance(argv, (list, tuple)) and argv and argv[0] == "git":
+            raise AssertionError(argv)
+        return real_run(argv, **kwargs)
+
+    with _patched(tmp_path / "state") as dirs, _limits(tmp_path, {"max_concurrent_goals": 2}):
+        ctl = _Ctl()
+        paths = [
+            _write_job(dirs["inbox"], "a.json", goal="goal-a", cwd=str(slot)),
+            _write_job(dirs["inbox"], "b.json", goal="goal-b", cwd=str(slot)),
+        ]
+        _write_mtimes(paths)
+        env = {"DSH_TRIAL_WORKTREE_PREFIXES": str(prefix)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(
+            tb.subprocess, "run", side_effect=fake_run
+        ), mock.patch.object(tb, "run_job", ctl.run_job), _Sched():
+            assert ctl.wait_started(1)
+            assert _wait_for(lambda: _queued_reason("b.json") == "cwd-conflict:a.json")
+            assert ctl.order == ["a.json"]
+        saved = json.loads((dirs["inbox"] / "b.json").read_text(encoding="utf-8"))
+        assert saved["cwd"] == str(slot)
 
 
 # ---------------------------------------------------------------------------

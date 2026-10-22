@@ -46,6 +46,7 @@ def _patched_dirs(root: Path):
         PROCESSING=dirs["processing"], OUTBOX=dirs["outbox"], FAILED=dirs["failed"],
         INBOX=dirs["inbox"], MAILBOX=dirs["mailbox"],
         maybe_offload_gc=lambda **k: None,
+        maybe_notify_hub=lambda *a, **k: {"sent": False},
     ), mock.patch.object(tb.T, "MAILBOX", dirs["mailbox"]):
         yield dirs
 
@@ -220,7 +221,10 @@ def test_plain_blocked_still_notifies_hub(tmp_path):
         goal = {"goal": "g-test", "status": "running"}
         (dirs["goals"] / "g-test.json").write_text(json.dumps(goal) + "\n", encoding="utf-8")
         chain = _seed_chain(dirs, state="running", round_n=1, last_verdict="HOLD")
-        job = {"goal": "g-test", "cwd": str(tmp_path), "id": "job-3"}
+        job = {
+            "goal": "g-test", "cwd": str(tmp_path), "id": "job-3",
+            "auto_supervisor_answer": False,
+        }
         with mock.patch.object(tb, "_notify_awaiting_hub") as notify:
             rc = tb._handle_foreman_blocked(
                 job, chain, dirs["processing"] / "job-3.json",
@@ -232,3 +236,159 @@ def test_plain_blocked_still_notifies_hub(tmp_path):
         assert notify.call_count == 1
         assert notify.call_args.kwargs["reason"] == "blocked"
         assert chain["awaiting_reason"] == "blocked"
+
+
+def test_plain_blocked_answers_then_opens_impl(tmp_path):
+    with _patched_dirs(tmp_path) as dirs:
+        goal = {
+            "goal": "g-test", "status": "running",
+            "supervisor_ticket_count": 0, "max_supervisor_tickets": 8,
+        }
+        (dirs["goals"] / "g-test.json").write_text(json.dumps(goal) + "\n", encoding="utf-8")
+        chain = _seed_chain(dirs, state="running", supervisor_events=[])
+        job = {
+            "goal": "g-test", "cwd": str(tmp_path), "id": "job-ans",
+            "auto_supervisor_answer": True, "notify_dry_run": True,
+            "profile": "acp-lite",
+        }
+        seen = {}
+
+        def fake_ticket(**kwargs):
+            seen.update(kwargs)
+            summary = dirs["summaries"] / f"{kwargs['summary_name']}.md"
+            summary.write_text(
+                '```json\n{"answer":"use the catalog rule"}\n```\n',
+                encoding="utf-8",
+            )
+            return 0, {"assert_clean": True, "composition": None}, summary
+
+        with mock.patch.object(tb, "run_supervisor_ticket", side_effect=fake_ticket) as ticket, \
+                mock.patch.object(tb, "run_chain_rounds", return_value=0) as nxt, \
+                mock.patch.object(tb, "_notify_awaiting_hub") as notify, \
+                mock.patch.object(tb, "run_open_slice", side_effect=AssertionError("no acp")):
+            rc = tb._handle_foreman_blocked(
+                job, chain, dirs["processing"] / "job-ans.json",
+                slice_id=SLICE, round_n=1, pack_for_impl=f"{SLICE}.pack.md",
+                goal_obj=goal,
+                block={"status": "blocked", "questions": ["which rule?"], "notes": "stuck"},
+            )
+        assert rc == 0
+        ticket.assert_called_once()
+        assert seen["prompt_mode"] == "supervisor-answer"
+        assert notify.call_count == 0
+        nxt.assert_called_once()
+        assert nxt.call_args.kwargs["start_round"] == 2
+        pack = dirs["packs"] / nxt.call_args.kwargs["start_pack"]
+        assert "use the catalog rule" in pack.read_text(encoding="utf-8")
+        assert chain["state"] == "running"
+        assert chain.get("awaiting_reason") in (None, "")
+
+
+def test_plain_blocked_empty_answer_parks(tmp_path):
+    with _patched_dirs(tmp_path) as dirs:
+        goal = {"goal": "g-test", "status": "running", "supervisor_ticket_count": 0}
+        (dirs["goals"] / "g-test.json").write_text(json.dumps(goal) + "\n", encoding="utf-8")
+        chain = _seed_chain(dirs, state="running", supervisor_events=[])
+        job = {
+            "goal": "g-test", "cwd": str(tmp_path), "auto_supervisor_answer": True,
+            "notify_dry_run": True, "profile": "acp-lite",
+        }
+
+        def fake_ticket(**kwargs):
+            summary = dirs["summaries"] / f"{kwargs['summary_name']}.md"
+            summary.write_text("", encoding="utf-8")
+            return 1, {"assert_clean": True, "composition": None}, summary
+
+        with mock.patch.object(tb, "run_supervisor_ticket", side_effect=fake_ticket), \
+                mock.patch.object(tb, "run_chain_rounds", side_effect=AssertionError("no impl")), \
+                mock.patch.object(tb, "_notify_awaiting_hub") as notify:
+            rc = tb._handle_foreman_blocked(
+                job, chain, dirs["processing"] / "job-empty.json",
+                slice_id=SLICE, round_n=1, pack_for_impl=f"{SLICE}.pack.md",
+                goal_obj=goal, block={"status": "blocked", "questions": ["which rule?"]},
+            )
+        assert rc == 0
+        assert notify.call_count == 1
+        assert chain["awaiting_reason"] == "blocked"
+
+
+def test_max_rounds_and_gate_cap_reuse_goal_supervisor(tmp_path):
+    with _patched_dirs(tmp_path) as dirs:
+        goal = {
+            "goal": "g-test", "status": "running",
+            "supervisor_ticket_count": 0, "max_supervisor_tickets": 8,
+            "supervisor_reuse_ticket": "supervisor-goal-g-test",
+        }
+        (dirs["goals"] / "g-test.json").write_text(json.dumps(goal) + "\n", encoding="utf-8")
+        chain = {
+            "slice": SLICE, "goal": "g-test", "state": "running",
+            "pack": f"{SLICE}.pack.md", "supervisor_events": [],
+        }
+        seen = []
+
+        def fake_ticket(**kwargs):
+            seen.append(kwargs)
+            summary = dirs["summaries"] / f"{kwargs['summary_name']}.md"
+            summary.write_text(
+                '```json\n{"action":"max_rounds_decision","decision":"inplace"}\n```\n',
+                encoding="utf-8",
+            )
+            return 0, {"assert_clean": True, "composition": None}, summary
+
+        job = {"goal": "g-test", "cwd": str(tmp_path), "profile": "acp-lite"}
+        with mock.patch.object(tb, "run_supervisor_ticket", side_effect=fake_ticket), \
+                mock.patch.object(tb, "run_open_slice", side_effect=AssertionError("no acp")):
+            d_rounds = tb.auto_supervisor_max_rounds_decision(
+                job, chain, round_n=2, max_rounds=2, findings=[{"tier": "P1", "issue": "x"}],
+                reason="cap", goal=goal, kind="max_rounds",
+            )
+            d_gate = tb.auto_supervisor_max_rounds_decision(
+                job, chain, round_n=3, max_rounds=2, findings=[{"tier": "P1", "issue": "x"}],
+                reason="gate cap", goal=goal, kind="max_gate_rounds",
+            )
+        assert d_rounds == "inplace" and d_gate == "inplace"
+        assert len(seen) == 2
+        for kw in seen:
+            assert kw["keep_open"] is True
+            assert kw["resume"] is True
+            assert kw["ticket"] == "supervisor-goal-g-test"
+            assert "maxrounds" not in kw["ticket"]
+            assert "maxgaterounds" not in kw["ticket"]
+        assert goal["supervisor_reuse_ticket"] == "supervisor-goal-g-test"
+        assert "supervisor_reuse_broken" not in goal
+
+
+def test_max_rounds_opens_goal_supervisor_when_reuse_missing(tmp_path):
+    with _patched_dirs(tmp_path) as dirs:
+        goal = {
+            "goal": "g-test", "status": "running",
+            "supervisor_ticket_count": 0, "supervisor_reuse_broken": True,
+            "supervisor_reuse_ticket": "supervisor-goal-g-test",
+        }
+        chain = {
+            "slice": SLICE, "goal": "g-test", "state": "running",
+            "pack": f"{SLICE}.pack.md", "supervisor_events": [],
+        }
+        seen = {}
+
+        def fake_ticket(**kwargs):
+            seen.update(kwargs)
+            summary = dirs["summaries"] / f"{kwargs['summary_name']}.md"
+            summary.write_text(
+                '```json\n{"decision":"escalate"}\n```\n',
+                encoding="utf-8",
+            )
+            return 0, {"assert_clean": True, "composition": None}, summary
+
+        with mock.patch.object(tb, "run_supervisor_ticket", side_effect=fake_ticket):
+            decision = tb.auto_supervisor_max_rounds_decision(
+                {"goal": "g-test", "cwd": str(tmp_path)},
+                chain, round_n=1, max_rounds=2, findings=[], reason="cap",
+                goal=goal, kind="max_gate_rounds",
+            )
+        assert decision == "escalate"
+        assert seen["keep_open"] is True
+        assert seen["resume"] is False
+        assert seen["ticket"] == "supervisor-goal-g-test"
+        assert goal["supervisor_reuse_ticket"] == "supervisor-goal-g-test"
+        assert "supervisor_reuse_broken" not in goal

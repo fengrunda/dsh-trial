@@ -133,7 +133,8 @@ def test_blocked_path_notifies_awaiting_hub(tmp_path):
             mock.patch.object(tb, "_terminal_outbox", return_value=d["outbox"] / "o.json"), \
             mock.patch.object(tb, "maybe_notify_hub",
                               side_effect=lambda *a, **k: sent.append(k) or {"sent": True}):
-        rc = tb.run_chain_rounds(_chain_job(tmp_path), _chain_state(), dest,
+        rc = tb.run_chain_rounds(
+            _chain_job(tmp_path, auto_supervisor_answer=False), _chain_state(), dest,
                                  start_round=1, start_pack="orig.pack.md")
     assert rc == 0
     kinds = [c.get("kind") for c in sent]

@@ -137,7 +137,9 @@ def _run_cap(tmp_path, goal, decision=None, *, name="ask-cap", chain=None):
             side_effect=AssertionError("run_open_slice must not be called"),
         ), mock.patch.object(
             tb, "auto_supervisor_max_rounds_decision", return_value=decision,
-        ) as auto, mock.patch.object(tb, "_notify_awaiting_hub") as notify:
+        ) as auto, mock.patch.object(tb, "_notify_awaiting_hub") as notify, mock.patch.object(
+            tb, "maybe_notify_hub", return_value={"sent": False},
+        ):
             tb._handle_submit_for_review(
                 ask, ask_path, default_profile="default",
                 cwd=str(tmp_path), goal=goal,
@@ -237,6 +239,27 @@ def test_gate_round_cap_second_inplace_escalates(tmp_path):
     assert ans["rework_mode"] == "escalate"
     assert ans.get("escalate") is True
     notify.assert_called_once()
+
+
+def test_gate_round_cap_split_opens_followup(tmp_path):
+    goal = {
+        "goal": "g1",
+        "slice": "s1",
+        "gate_rounds_by_slice": {"s1": 2},
+        "review_seq": 2,
+    }
+    with mock.patch.object(tb, "emit_split_followup", return_value=True) as emit:
+        ans, _, notify = _run_cap(tmp_path, goal, "split", name="ask-split-open")
+    emit.assert_called_once()
+    assert emit.call_args.kwargs["source"] == "max_gate_rounds"
+    notify.assert_not_called()
+    assert goal["status"] == "running"
+    assert goal["last_chain_state"] == "split"
+    assert "awaiting_reason" not in goal
+    assert ans["rework_mode"] == "split"
+    assert ans.get("escalate") is False
+    assert "awaiting_reason" not in ans
+    assert "跟进片已另开" in ans["instruction"]
 
 
 def test_gate_round_cap_split_stays_resumable(tmp_path):

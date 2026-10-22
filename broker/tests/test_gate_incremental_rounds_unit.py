@@ -137,7 +137,9 @@ def _run_cap(tmp_path, goal, decision=None, *, name="ask-cap", chain=None):
             side_effect=AssertionError("run_open_slice must not be called"),
         ), mock.patch.object(
             tb, "auto_supervisor_max_rounds_decision", return_value=decision,
-        ) as auto, mock.patch.object(tb, "_notify_awaiting_hub") as notify:
+        ) as auto, mock.patch.object(tb, "_notify_awaiting_hub") as notify, mock.patch.object(
+            tb, "maybe_notify_hub", return_value={"sent": False},
+        ):
             tb._handle_submit_for_review(
                 ask, ask_path, default_profile="default",
                 cwd=str(tmp_path), goal=goal,

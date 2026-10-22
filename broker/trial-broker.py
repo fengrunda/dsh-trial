@@ -90,6 +90,12 @@ Usage
   trial-broker.py --once
   trial-broker.py --poll 20
   trial-broker.py --status
+  trial-broker.py --events-since <cursor-file>
+  trial-broker.py --events-since <cursor-file> --peek
+
+对外只三件事：投 Goal（inbox JSON，协议不变）、``--events-since`` 拉增量、
+终态或真正停车才以终态 kind 通知 Hub。中间过渡也走同一通知函数，但 kind
+是过渡名，不是完成。角色、槽位、pack 路径不是调用方协议。
 """
 from __future__ import annotations
 
@@ -2660,7 +2666,27 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
             print("[trial-broker] gate inplace refused (bonus already used)", flush=True)
             decision = "escalate"
 
-        if decision == "inplace":
+        sup_action = "park"
+        if decision in _MAX_ROUNDS_DECISIONS:
+            sup_action = dispatch_event(
+                fake_chain,
+                job,
+                kind="supervisor",
+                goal=str(goal.get("goal") or ""),
+                slice_id=slice_id,
+                decision=decision,
+                reason=reason,
+            )
+            real = _read_chain(slice_id)
+            fresh = (fake_chain.get("supervisor_events") or [])[-1:]
+            if isinstance(real, dict) and fresh:
+                real.setdefault("supervisor_events", []).append(fresh[0])
+                _write_chain(real)
+        events = list(fake_chain.get("supervisor_events") or [])
+        if events:
+            goal["supervisor_events"] = events
+
+        if sup_action == "inplace_plus":
             goal.setdefault("max_gate_rounds_by_slice", {})[slice_id] = max_gate + 1
             goal.setdefault("max_gate_rounds_bonus_used", {})[slice_id] = True
             goal["status"] = "running"
@@ -2685,7 +2711,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                 f"[trial-broker] gate cap inplace {slice_id} → {max_gate + 1}",
                 flush=True,
             )
-        elif decision == "split":
+        elif sup_action == "split_followup":
             goal["supervisor_decision"] = {
                 "decision": "split",
                 "slice": slice_id,
@@ -2744,7 +2770,7 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                     f"(r{round_n}/{max_gate}; no follow-up pack)",
                     flush=True,
                 )
-        elif decision == "escalate":
+        elif sup_action == "terminal":
             goal["escalate_reason"] = (
                 f"max_gate_rounds={max_gate} reached slice={slice_id} (supervisor)"
             )
@@ -3956,6 +3982,22 @@ def _synthetic_gate_pass(
     chain["state"] = VERDICT_PASS
     chain["gate_mode"] = gate_mode
     _write_chain(chain)
+    dispatch_event(
+        chain,
+        job,
+        kind="gate",
+        goal=str((job or {}).get("goal") or chain.get("goal") or ""),
+        slice_id=slice_id,
+        verdict=VERDICT_PASS,
+    )
+    dispatch_event(
+        chain,
+        job,
+        kind="slice_pass",
+        goal=str((job or {}).get("goal") or chain.get("goal") or ""),
+        slice_id=slice_id,
+        verdict=VERDICT_PASS,
+    )
     if goal_obj is not None:
         T.record_ticket_metric(goal_obj, {
             "role": "gate",
@@ -4371,6 +4413,236 @@ def maybe_notify_hub(
         }
     except (OSError, subprocess.SubprocessError) as e:
         return {"sent": False, "error": str(e), "kind": kind}
+
+
+def trial_event(
+    *,
+    kind: str,
+    goal: str = "",
+    slice_id: str = "",
+    verdict: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    """One transition. Exactly one of verdict / decision / reason."""
+    event = {
+        "kind": str(kind),
+        "goal": str(goal or ""),
+        "slice": str(slice_id or ""),
+        "at": _iso(),
+    }
+    if verdict is not None and str(verdict) != "":
+        event["verdict"] = str(verdict)
+    elif decision is not None and str(decision) != "":
+        event["decision"] = str(decision)
+    else:
+        event["reason"] = "" if reason is None else str(reason)
+    return event
+
+
+def next_ticket(event: dict) -> str:
+    """The only next-ticket table. Call sites execute this return; they do not invent another."""
+    kind = str(event.get("kind") or "")
+    decision = str(event.get("decision") or "")
+    verdict = str(event.get("verdict") or "")
+    if kind == "impl_done":
+        return "gate"
+    if kind == "gate":
+        return "next_or_close" if verdict == VERDICT_PASS else "hold"
+    if kind == "supervisor":
+        return {
+            "inplace": "inplace_plus",
+            "split": "split_followup",
+            "escalate": "terminal",
+        }.get(decision, "park")
+    if kind == "question":
+        return "answer_same_impl"
+    if kind == "pause":
+        return {
+            "continue_same": "continue_same",
+            "new_ticket": "new_ticket",
+            "close": "close",
+            "split": "split_followup",
+            "escalate": "terminal",
+        }.get(decision, "park")
+    if kind == "followup_opened":
+        return "followup"
+    if kind == "slice_pass":
+        return "next_or_close"
+    if kind == "goal_terminal":
+        return "stop"
+    return "park"
+
+
+def dispatch_event(
+    chain: dict | None,
+    job: dict | None,
+    *,
+    kind: str,
+    goal: str = "",
+    slice_id: str = "",
+    verdict: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+) -> str:
+    """Append one chain event, drop one outbox JSON, notify with that kind.
+
+    Returns ``next_ticket``. Does not open a ticket itself. ``notify_dry_run``
+    still writes the outbox; the webhook command gets ``--dry-run``.
+    Intermediate kinds are never ``dsh-trial-complete``.
+    """
+    event = trial_event(
+        kind=kind,
+        goal=goal,
+        slice_id=slice_id,
+        verdict=verdict,
+        decision=decision,
+        reason=reason,
+    )
+    action = next_ticket(event)
+    if isinstance(chain, dict):
+        chain.setdefault("supervisor_events", []).append(event)
+        if chain.get("slice") and chain.get("state"):
+            try:
+                _write_chain(chain)
+            except (OSError, KeyError, TypeError) as e:
+                print(f"[trial-broker] event chain write failed: {e}", flush=True)
+    body = {
+        "kind": event["kind"],
+        "goal": event["goal"],
+        "slice": event["slice"],
+        "decision": event.get("decision") or event.get("verdict") or event.get("reason") or "",
+        "at": event["at"],
+    }
+    try:
+        OUTBOX.mkdir(parents=True, exist_ok=True)
+        name = f"{_stamp()}-event-{event['kind']}-{time.time_ns()}.json"
+        (OUTBOX / name).write_text(
+            json.dumps(body, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except OSError as e:
+        print(f"[trial-broker] event outbox write failed: {e}", flush=True)
+    notify_job = dict(job or {})
+    if event["goal"]:
+        notify_job.setdefault("goal", event["goal"])
+    if event["slice"]:
+        notify_job.setdefault("slice", event["slice"])
+    # Status is the transition kind so a mid-flight event cannot look complete.
+    out_body = {
+        "status": event["kind"],
+        "goal": event["goal"],
+        "slice": event["slice"],
+    }
+    try:
+        maybe_notify_hub(
+            notify_job,
+            out_body,
+            {"ticket": event["slice"] or event["goal"] or event["kind"]},
+            kind=event["kind"],
+            extra_summary=(
+                f"dsh-trial-event kind={event['kind']} goal={event['goal']} "
+                f"slice={event['slice']} decision={body['decision']}"
+            ),
+            payload_extra={
+                "goal": event["goal"],
+                "slice": event["slice"],
+                "decision": body["decision"],
+                "reason": event.get("reason") or body["decision"],
+            },
+        )
+    except Exception as e:  # noqa: BLE001 — outbox already landed
+        print(f"[trial-broker] event notify failed: {e}", flush=True)
+    return action
+
+
+def _event_snapshot() -> dict[str, int]:
+    """path → mtime_ns for JSON under outbox, failed, goals, chains."""
+    snap: dict[str, int] = {}
+    for root in (OUTBOX, FAILED, GOALS, CHAINS):
+        if not root.is_dir():
+            continue
+        for path in root.glob("*.json"):
+            if not path.is_file() or path.name.lower() == "readme.json":
+                continue
+            try:
+                snap[str(path)] = path.stat().st_mtime_ns
+            except OSError:
+                continue
+    return snap
+
+
+def _event_record(path: Path) -> dict:
+    rec: dict = {"path": str(path), "goal": "", "slice": ""}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    job = data.get("job") if isinstance(data.get("job"), dict) else {}
+    goal = data.get("goal") or job.get("goal") or ""
+    slice_id = data.get("slice") or job.get("slice") or ""
+    rec["goal"] = str(goal or "")
+    rec["slice"] = str(slice_id or "")
+    if "status" in data:
+        rec["status"] = data.get("status")
+    if "state" in data:
+        rec["state"] = data.get("state")
+    if "status" not in rec and "state" not in rec:
+        rec["status"] = data.get("kind") or ""
+    decision = data.get("decision")
+    if decision is None and isinstance(data.get("supervisor_decision"), dict):
+        decision = data["supervisor_decision"].get("decision")
+    if decision is not None:
+        rec["decision"] = decision
+    if data.get("last_verdict") is not None:
+        rec["last_verdict"] = data.get("last_verdict")
+    if data.get("kind"):
+        rec["kind"] = data.get("kind")
+    return rec
+
+
+def events_since(cursor_path: Path, *, peek: bool = False) -> dict:
+    """Read-only delta against a cursor file.
+
+    Missing cursor: write it and return ``{"init": true, "tracked": N}``
+    without listing history. ``peek`` prints a later delta without moving
+    an existing cursor. Does not write inbox, goals, chains, outbox, or failed.
+    """
+    snap = _event_snapshot()
+    cursor_path = Path(cursor_path)
+    if not cursor_path.is_file():
+        cursor_path.parent.mkdir(parents=True, exist_ok=True)
+        cursor_path.write_text(
+            json.dumps({"files": snap}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return {"init": True, "tracked": len(snap)}
+    try:
+        prev = json.loads(cursor_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        prev = {}
+    prev_files = prev.get("files") if isinstance(prev, dict) else {}
+    if not isinstance(prev_files, dict):
+        prev_files = {}
+    records = []
+    for path, mtime in sorted(snap.items()):
+        old = prev_files.get(path)
+        if old is None or int(mtime) > int(old):
+            records.append(_event_record(Path(path)))
+    if not peek:
+        cursor_path.write_text(
+            json.dumps({"files": snap}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    return {"count": len(records), "records": records}
+
+
+def cmd_events_since(args: argparse.Namespace) -> int:
+    result = events_since(Path(args.events_since), peek=bool(args.peek))
+    # file= bypasses the goal/slot log prefix so the caller gets one JSON line.
+    print(json.dumps(result, ensure_ascii=False), file=sys.stdout, flush=True)
+    return 0
 
 
 def _parse_foreman_summary(summary_path: Path) -> dict:
@@ -6119,21 +6391,30 @@ def route_pause_decision(
         "round_n": round_n,
         "impl_ticket": impl_ticket,
     }
-    if decision == "escalate":
+    pause_action = dispatch_event(
+        chain,
+        job,
+        kind="pause",
+        goal=str(job.get("goal") or chain.get("goal") or ""),
+        slice_id=str(chain.get("slice") or ""),
+        decision=decision,
+        reason=pause_kind,
+    )
+    if pause_action == "terminal":
         chain["state"] = "escalated"
         chain["escalate_reason"] = f"pause:{pause_kind}"
         _write_chain(chain)
         _notify_awaiting_hub(job, chain, reason=f"pause_escalate:{pause_kind}", block={}, goal=goal_obj)
         _terminal_outbox(job, chain, dest, ok=False)
         return 1
-    if decision == "close":
+    if pause_action == "close":
         chain["state"] = "closeout"
         chain["closeout_note"] = f"supervisor close after {pause_kind}"
         chain["handoff_summary"] = str((chain.get("last_pause") or {}))
         _write_chain(chain)
         _terminal_outbox(job, chain, dest, ok=True)
         return 2
-    if decision == "split":
+    if pause_action == "split_followup":
         chain["supervisor_decision"] = {
             "decision": "split",
             "at": _iso(),
@@ -6165,7 +6446,7 @@ def route_pause_decision(
         _notify_awaiting_hub(job, chain, reason="pause_split", block={}, goal=goal_obj)
         _terminal_outbox(job, chain, dest, ok=True, notify=False)
         return 0
-    if decision == "new_ticket":
+    if pause_action == "new_ticket":
         # Park with pending pack; Hub/chain-reply or inline continue with fresh ticket.
         chain["state"] = "awaiting_supervisor"
         chain["awaiting_reason"] = f"pause_new_ticket:{pause_kind}"
@@ -6452,13 +6733,22 @@ def _open_recorded_split_followup(
         g.pop("awaiting_reason", None)
         _write_goal(g)
     _sync_goal_dict(goal, g)
+    follow_action = dispatch_event(
+        chain,
+        job,
+        kind="followup_opened",
+        goal=goal_id,
+        slice_id=str(spec.get("slice") or ""),
+        decision="split",
+        reason=source,
+    )
     print(
         f"[trial-broker] split follow-up opened parent={parent_id} "
         f"slice={spec['slice']} child_state={child_state or '?'} "
-        f"round={round_n}",
+        f"round={round_n} next={follow_action}",
         flush=True,
     )
-    return True
+    return follow_action == "followup"
 
 
 def emit_split_followup(
@@ -6694,7 +6984,19 @@ def handle_max_rounds_touch(
             print(f"[trial-broker] max_rounds supervisor ticket error: {e}", flush=True)
             decision = None
 
-    if decision == "inplace":
+    sup_action = "park"
+    if decision in _MAX_ROUNDS_DECISIONS:
+        sup_action = dispatch_event(
+            chain,
+            job,
+            kind="supervisor",
+            goal=str(job.get("goal") or chain.get("goal") or ""),
+            slice_id=slice_id,
+            decision=decision,
+            reason=reason,
+        )
+
+    if sup_action == "inplace_plus":
         # Bounded +1 only once.
         chain["max_rounds_bonus_used"] = True
         new_max = max(int(chain.get("max_rounds") or max_rounds), round_n) + 1
@@ -6726,7 +7028,7 @@ def handle_max_rounds_touch(
         )
         return "inplace"
 
-    if decision == "split":
+    if sup_action == "split_followup":
         chain["supervisor_decision"] = {
             "decision": "split",
             "at": _iso(),
@@ -6780,7 +7082,7 @@ def handle_max_rounds_touch(
         )
         return "split"
 
-    if decision == "escalate":
+    if sup_action == "terminal":
         chain["supervisor_decision"] = {
             "decision": "escalate",
             "at": _iso(),
@@ -6879,12 +7181,29 @@ def handle_ticket_max_rounds_touch(
             print(f"[trial-broker] ticket max_rounds supervisor error: {e}", flush=True)
             decision = None
 
+    sup_action = "park"
+    if decision in _MAX_ROUNDS_DECISIONS:
+        sup_action = dispatch_event(
+            fake_chain,
+            job,
+            kind="supervisor",
+            goal=str(goal_id or ""),
+            slice_id=slice_id,
+            decision=decision,
+            reason=reason,
+        )
+        real = _read_chain(slice_id)
+        fresh = (fake_chain.get("supervisor_events") or [])[-1:]
+        if isinstance(real, dict) and fresh:
+            real.setdefault("supervisor_events", []).append(fresh[0])
+            _write_chain(real)
+
     if goal_id and fake_chain.get("supervisor_events") and goal_obj is not None:
         g = _read_goal(goal_id) or goal_obj
         g["supervisor_events"] = list(fake_chain.get("supervisor_events") or [])
         _write_goal(g)
 
-    if decision == "inplace":
+    if sup_action == "inplace_plus":
         if goal_id:
             g = _read_goal(goal_id) or goal_obj
             if g is not None:
@@ -6903,7 +7222,7 @@ def handle_ticket_max_rounds_touch(
                 _write_goal(g)
         return "inplace"
 
-    if decision == "split":
+    if sup_action == "split_followup":
         if goal_id:
             g = _read_goal(goal_id) or goal_obj
             if g is not None:
@@ -6949,7 +7268,7 @@ def handle_ticket_max_rounds_touch(
                 _write_goal(g)
         return "split"
 
-    if decision == "escalate":
+    if sup_action == "terminal":
         return "escalate"
 
     # Parked: do not call _ticket_goal_terminal (that would escalate/fail).
@@ -8381,6 +8700,14 @@ def run_chain_rounds(
                 block=block,
             )
         if status == FOREMAN_STATUS_QUESTION:
+            q_action = dispatch_event(
+                chain,
+                job,
+                kind="question",
+                goal=str(job.get("goal") or chain.get("goal") or ""),
+                slice_id=slice_id,
+                reason=str(block.get("notes") or status)[:500],
+            )
             chain["state"] = "awaiting_supervisor"
             chain["awaiting_answer_for_round"] = round_n
             chain["awaiting_reason"] = status
@@ -8389,7 +8716,7 @@ def run_chain_rounds(
             auto = job.get("auto_supervisor_answer")
             if auto is None:
                 auto = True
-            if auto:
+            if auto and q_action == "answer_same_impl":
                 answer = auto_supervisor_answer(
                     job, chain, round_n=round_n, block=block
                 )
@@ -8446,7 +8773,21 @@ def run_chain_rounds(
             )
             return 0
 
-        # Gate (per_goal / defer / skip / per_slice)
+        # Gate (per_goal / defer / skip / per_slice). impl_done always opens a gate.
+        impl_action = dispatch_event(
+            chain,
+            job,
+            kind="impl_done",
+            goal=str(job.get("goal") or chain.get("goal") or ""),
+            slice_id=slice_id,
+            reason="foreman done",
+        )
+        if impl_action != "gate":
+            chain["state"] = "failed"
+            chain["error"] = f"impl_done routed to {impl_action}"
+            _write_chain(chain)
+            _terminal_outbox(job, chain, dest, ok=False)
+            return 1
         gate_policy = str(job.get("gate_policy") or GE.GATE_POLICY_PER_SLICE)
         pack_meta, pack_body = _pack_meta_text(str(original_pack or ""))
         paths_now = _foreman_changed_paths(block)
@@ -8661,6 +9002,28 @@ def run_chain_rounds(
         _write_chain(chain)
 
         if verdict == VERDICT_PASS:
+            gate_action = dispatch_event(
+                chain,
+                job,
+                kind="gate",
+                goal=str(job.get("goal") or chain.get("goal") or ""),
+                slice_id=slice_id,
+                verdict=VERDICT_PASS,
+            )
+            pass_action = dispatch_event(
+                chain,
+                job,
+                kind="slice_pass",
+                goal=str(job.get("goal") or chain.get("goal") or ""),
+                slice_id=slice_id,
+                verdict=VERDICT_PASS,
+            )
+            if gate_action != "next_or_close" or pass_action != "next_or_close":
+                chain["state"] = "failed"
+                chain["error"] = f"gate PASS routed to {gate_action}/{pass_action}"
+                _write_chain(chain)
+                _terminal_outbox(job, chain, dest, ok=False)
+                return 1
             chain["state"] = "PASS"
             _write_chain(chain)
             if (job.get("from_goal") or job.get("goal")) and not job.get("defer_supervisor_close"):
@@ -8700,7 +9063,22 @@ def run_chain_rounds(
             )
             return 0
 
-        # HOLD
+        # HOLD → existing fix round, or max_rounds supervisor when the cap is hit.
+        if verdict == VERDICT_HOLD and not gblock.get("machine_block_missing"):
+            hold_action = dispatch_event(
+                chain,
+                job,
+                kind="gate",
+                goal=str(job.get("goal") or chain.get("goal") or ""),
+                slice_id=slice_id,
+                verdict=VERDICT_HOLD,
+            )
+            if hold_action != "hold":
+                chain["state"] = "failed"
+                chain["error"] = f"gate HOLD routed to {hold_action}"
+                _write_chain(chain)
+                _terminal_outbox(job, chain, dest, ok=False)
+                return 1
         if round_n >= max_rounds:
             # Salvage: the final-round gate timed out or wrote no usable
             # summary (file absent / empty text). That used to parse as an
@@ -9864,6 +10242,20 @@ def _escalate_pause_chain_reply(
         "reason": reason,
     }
     _write_chain(chain)
+    pause_action = dispatch_event(
+        chain,
+        job,
+        kind="pause",
+        goal=str(parent_goal_id or ""),
+        slice_id=slice_id,
+        decision="escalate",
+        reason=reason,
+    )
+    if pause_action != "terminal":
+        print(
+            f"[trial-broker] pause escalate routed to {pause_action}; no new ticket",
+            flush=True,
+        )
     if goal_obj is not None:
         goal_obj["status"] = "escalated"
         goal_obj["last_chain_state"] = "escalated"
@@ -9872,7 +10264,7 @@ def _escalate_pause_chain_reply(
         goal_obj["supervisor_decision"] = dict(chain["supervisor_decision"])
         _write_goal(goal_obj)
     out = _terminal_outbox(job, chain, dest, ok=False)
-    if parent_goal_id:
+    if parent_goal_id and pause_action == "terminal":
         _notify_goal_terminal(str(parent_goal_id))
     print(
         f"[trial-broker] chain-reply pause escalate "
@@ -9905,7 +10297,24 @@ def _park_pause_split_chain_reply(
         "note": "pause split: remaining work → new slice; do not reopen this impl",
     }
     _write_chain(chain)
+    pause_action = dispatch_event(
+        chain,
+        job,
+        kind="pause",
+        goal=str(parent_goal_id or ""),
+        slice_id=slice_id,
+        decision="split",
+        reason=awaiting_reason,
+    )
     opened = False
+    if pause_action != "split_followup":
+        out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+        print(
+            f"[trial-broker] chain-reply pause split not opened "
+            f"slice={slice_id} action={pause_action} outbox={out.name}",
+            flush=True,
+        )
+        return 0
     try:
         opened = emit_split_followup(
             job,
@@ -10264,7 +10673,18 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         )
         if decision == "inplace" and chain.get("max_rounds_bonus_used"):
             decision = "escalate"
-        if decision == "inplace":
+        sup_action = "park"
+        if decision in _MAX_ROUNDS_DECISIONS:
+            sup_action = dispatch_event(
+                chain,
+                job,
+                kind="supervisor",
+                goal=str(parent_goal_id or ""),
+                slice_id=slice_id,
+                decision=decision,
+                reason=touch_reason,
+            )
+        if sup_action == "inplace_plus":
             chain["max_rounds_bonus_used"] = True
             new_max = max(max_rounds, round_n) + 1
             chain["max_rounds"] = new_max
@@ -10290,7 +10710,7 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
                 f"slice={slice_id} max_rounds={new_max}",
                 flush=True,
             )
-        elif decision == "split":
+        elif sup_action == "split_followup":
             chain["supervisor_decision"] = {
                 "decision": "split",
                 "at": _iso(),
@@ -10334,7 +10754,7 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
                 flush=True,
             )
             return 0
-        elif decision == "escalate":
+        elif sup_action == "terminal":
             chain["state"] = "escalated"
             chain["escalate_reason"] = touch_reason
             chain["supervisor_decision"] = {
@@ -10871,6 +11291,27 @@ def _notify_goal_terminal(goal_id: str) -> None:
     """Notify Hub once for a terminal Goal event (complete / escalated / failed / limit)."""
     goal = _read_goal(goal_id)
     if not goal:
+        return
+    slices = [str(s) for s in (goal.get("slices") or []) if str(s)]
+    slice_id = str(goal.get("current_slice") or (slices[-1] if slices else "") or "")
+    chain = _read_chain(slice_id) if slice_id else None
+    status = str(goal.get("status") or "")
+    terminal_action = dispatch_event(
+        chain,
+        {
+            "goal": goal_id,
+            "slice": slice_id,
+            "notify": goal.get("notify"),
+            "notify_dry_run": goal.get("notify_dry_run"),
+            "notify_prefix": goal.get("notify_prefix"),
+        },
+        kind="goal_terminal",
+        goal=goal_id,
+        slice_id=slice_id,
+        decision=status or "terminal",
+        reason=str(goal.get("escalate_reason") or goal.get("error") or status or "terminal"),
+    )
+    if terminal_action != "stop":
         return
     notified = _notify_kinds_since_resume(goal)
     hit = goal.get("limit_hit")
@@ -11954,7 +12395,19 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="process one inbox job then exit")
     ap.add_argument("--poll", type=int, default=20, help="poll interval seconds (default 20)")
     ap.add_argument("--status", action="store_true", help="print inbox/outbox/pid status")
+    ap.add_argument(
+        "--events-since",
+        metavar="CURSOR",
+        help="read-only: list outbox/failed/goals/chains JSON newer than the cursor",
+    )
+    ap.add_argument(
+        "--peek",
+        action="store_true",
+        help="with --events-since, print the delta and do not move an existing cursor",
+    )
     args = ap.parse_args()
+    if args.events_since:
+        return cmd_events_since(args)
     if args.status:
         return cmd_status(args)
     return cmd_run(args)

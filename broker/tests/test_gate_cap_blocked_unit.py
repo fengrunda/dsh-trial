@@ -46,6 +46,7 @@ def _patched_dirs(root: Path):
         PROCESSING=dirs["processing"], OUTBOX=dirs["outbox"], FAILED=dirs["failed"],
         INBOX=dirs["inbox"], MAILBOX=dirs["mailbox"],
         maybe_offload_gc=lambda **k: None,
+        maybe_notify_hub=lambda *a, **k: {"sent": False},
     ), mock.patch.object(tb.T, "MAILBOX", dirs["mailbox"]):
         yield dirs
 

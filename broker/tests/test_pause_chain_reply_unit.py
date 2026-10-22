@@ -44,6 +44,7 @@ def _patched_dirs(root: Path):
         ARTIFACT_ROOT=dirs["artifacts"],
         INBOX=dirs["inbox"],
         maybe_offload_gc=lambda **k: None,
+        maybe_notify_hub=lambda *a, **k: {"sent": False},
     ), dirs
 
 

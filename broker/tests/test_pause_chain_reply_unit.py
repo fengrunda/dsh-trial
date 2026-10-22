@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """chain-reply on pause_* parks must not need an awaiting_reason remap.
 
-pause_split + decision=split stays parked (no impl rN+1).
-max_rounds_split + decision=split is unchanged.
+pause_split + decision=split does not reopen impl rN+1. It tries one
+follow-up slice; if that emit does not land a pack, the chain stays parked.
+max_rounds_split + decision=split does not reopen the old impl either; it
+tries the same follow-up emit.
 """
 from __future__ import annotations
 
@@ -108,6 +110,18 @@ def _read(dirs, kind: str, name: str) -> dict:
     return json.loads((dirs[kind] / f"{name}.json").read_text(encoding="utf-8"))
 
 
+def _block_supervisor_emit(dirs):
+    """Record the supervisor-plan attempt and do not run ACP."""
+    modes: list[str] = []
+
+    def _sup(**kwargs):
+        modes.append(str(kwargs.get("prompt_mode") or ""))
+        missing = dirs["summaries"] / "split-emit-missing.md"
+        return 1, {}, missing
+
+    return modes, _sup
+
+
 def test_pause_split_chain_reply_does_not_open_impl_round(tmp_path: Path):
     patcher, dirs = _patched_dirs(tmp_path)
     with patcher:
@@ -120,17 +134,21 @@ def test_pause_split_chain_reply_does_not_open_impl_round(tmp_path: Path):
             decision="split",
             answer="remaining work goes to a new slice",
         )
-        opened: list[str] = []
+        modes, _sup = _block_supervisor_emit(dirs)
+        launched: list[str] = []
 
-        def _open(**kwargs):
-            opened.append(str(kwargs.get("prompt_mode") or kwargs.get("ticket")))
-            raise AssertionError("pause_split split must not open an impl round")
+        def _rounds(*args, **kwargs):
+            launched.append("run_chain_rounds")
+            raise AssertionError("failed emit must not open a slice")
 
-        with mock.patch.object(tb, "run_open_slice", side_effect=_open):
+        with mock.patch.object(tb, "run_open_slice", side_effect=AssertionError("no acp")), \
+                mock.patch.object(tb, "run_supervisor_ticket", side_effect=_sup), \
+                mock.patch.object(tb, "run_chain_rounds", side_effect=_rounds):
             rc = tb.run_job(inbox)
 
         assert rc == 0
-        assert opened == []
+        assert modes == ["supervisor-plan"]
+        assert launched == []
         chain = _read(dirs, "chains", slice_id)
         goal = _read(dirs, "goals", goal_id)
         assert chain["state"] == "awaiting_supervisor"
@@ -142,9 +160,13 @@ def test_pause_split_chain_reply_does_not_open_impl_round(tmp_path: Path):
         assert goal["awaiting_reason"] == "pause_split:paused_limit"
         assert "max_rounds" not in str(goal["awaiting_reason"])
         assert not list(dirs["packs"].glob("*-reply-r*.pack.md"))
+        ask = (dirs["packs"] / f"{slice_id}-split-r2.pack.md").read_text(encoding="utf-8")
+        assert "emit_chain" in ask
+        assert "不要重写整个 Goal" in ask
 
 
 def test_max_rounds_split_chain_reply_unchanged(tmp_path: Path):
+    """Do not reopen the old impl. Do try to open one follow-up slice."""
     patcher, dirs = _patched_dirs(tmp_path)
     with patcher:
         slice_id, goal_id = _write_parked(
@@ -159,29 +181,132 @@ def test_max_rounds_split_chain_reply_unchanged(tmp_path: Path):
             decision="split",
             answer="split remaining P0",
         )
-        opened: list[str] = []
+        modes, _sup = _block_supervisor_emit(dirs)
+        launched: list[str] = []
 
-        def _open(**kwargs):
-            opened.append(str(kwargs.get("ticket")))
-            raise AssertionError("max_rounds_split must not open an impl round")
+        def _rounds(*args, **kwargs):
+            launched.append("run_chain_rounds")
+            raise AssertionError("failed emit must not open a slice")
 
-        with mock.patch.object(tb, "run_open_slice", side_effect=_open):
+        with mock.patch.object(tb, "run_open_slice", side_effect=AssertionError("no acp")), \
+                mock.patch.object(tb, "run_supervisor_ticket", side_effect=_sup), \
+                mock.patch.object(tb, "run_chain_rounds", side_effect=_rounds):
             rc = tb.run_job(inbox)
 
         assert rc == 0
-        assert opened == []
+        assert modes == ["supervisor-plan"]
+        assert launched == []
         chain = _read(dirs, "chains", slice_id)
         goal = _read(dirs, "goals", goal_id)
         assert chain["state"] == "awaiting_supervisor"
         assert chain["awaiting_reason"] == "max_rounds_split"
         assert chain["supervisor_decision"]["decision"] == "split"
         assert chain["supervisor_decision"]["via"] == "chain-reply"
-        assert "Goal resumable" in str(chain["supervisor_decision"].get("note") or "")
+        assert "do not reopen this impl" in str(chain["supervisor_decision"].get("note") or "")
         assert len(chain["rounds"]) == 2
         assert goal["status"] == "running"
         assert goal["awaiting_reason"] == "max_rounds_split"
         assert goal["last_chain_state"] == "awaiting_supervisor"
         assert not list(dirs["packs"].glob("*-reply-r*.pack.md"))
+        ask = (dirs["packs"] / f"{slice_id}-split-r2.pack.md").read_text(encoding="utf-8")
+        assert "split remaining P0" in ask
+        assert "emit_chain" in ask
+
+
+def test_max_rounds_split_chain_reply_launches_one_followup(tmp_path: Path):
+    patcher, dirs = _patched_dirs(tmp_path)
+    with patcher:
+        slice_id, goal_id = _write_parked(
+            dirs,
+            tmp_path,
+            awaiting_reason="max_rounds_split",
+            goal_reason="max_rounds_split",
+        )
+        inbox = _reply(dirs, slice_id, decision="split", answer="split remaining P0")
+        child_id = "follow-slice"
+        launched: list[str] = []
+
+        def _sup(**kwargs):
+            assert kwargs.get("prompt_mode") == "supervisor-plan"
+            summary = dirs["summaries"] / f"{slice_id}-sup-split-r2.md"
+            summary.write_text(
+                "```json\n"
+                + json.dumps({
+                    "action": "emit_chain",
+                    "slice": child_id,
+                    "pack": f"{child_id}.pack.md",
+                    "acceptance": ["remainder"],
+                })
+                + "\n```\n",
+                encoding="utf-8",
+            )
+            (dirs["packs"] / f"{child_id}.pack.md").write_text("# follow\n", encoding="utf-8")
+            return 0, {}, summary
+
+        def _rounds(job, chain, dest, **kwargs):
+            launched.append(str(job.get("slice")))
+            assert kwargs.get("start_pack") == f"{child_id}.pack.md"
+            assert str(job.get("slice")) != slice_id
+            chain["state"] = "PASS"
+            tb._write_chain(chain)
+            return 0
+
+        with mock.patch.object(tb, "run_open_slice", side_effect=AssertionError("no acp")), \
+                mock.patch.object(tb, "run_supervisor_ticket", side_effect=_sup), \
+                mock.patch.object(tb, "run_chain_rounds", side_effect=_rounds):
+            rc = tb.run_job(inbox)
+
+        assert rc == 0
+        assert launched == [child_id]
+        chain = _read(dirs, "chains", slice_id)
+        goal = _read(dirs, "goals", goal_id)
+        child = _read(dirs, "chains", child_id)
+        assert chain["state"] == "split"
+        assert len(chain["rounds"]) == 2
+        assert chain.get("awaiting_reason") in (None, "")
+        assert child["state"] == "PASS"
+        assert child_id in goal["slices"]
+        assert goal["split_followup"]["slice"] == child_id
+        assert not list(dirs["packs"].glob("*-reply-r*.pack.md"))
+
+
+def test_max_rounds_split_rejects_two_slices(tmp_path: Path):
+    patcher, dirs = _patched_dirs(tmp_path)
+    with patcher:
+        slice_id, goal_id = _write_parked(
+            dirs, tmp_path, awaiting_reason="max_rounds_split", goal_reason="max_rounds_split",
+        )
+        inbox = _reply(dirs, slice_id, decision="split", answer="too many")
+
+        def _sup(**kwargs):
+            summary = dirs["summaries"] / f"{slice_id}-sup-split-r2.md"
+            summary.write_text(
+                "```json\n"
+                + json.dumps({
+                    "action": "emit_chains",
+                    "slices": [
+                        {"slice": "a", "pack": "a.pack.md"},
+                        {"slice": "b", "pack": "b.pack.md"},
+                    ],
+                })
+                + "\n```\n",
+                encoding="utf-8",
+            )
+            return 0, {}, summary
+
+        with mock.patch.object(tb, "run_open_slice", side_effect=AssertionError("no acp")), \
+                mock.patch.object(tb, "run_supervisor_ticket", side_effect=_sup), \
+                mock.patch.object(tb, "run_chain_rounds", side_effect=AssertionError("no launch")):
+            rc = tb.run_job(inbox)
+
+        assert rc == 0
+        chain = _read(dirs, "chains", slice_id)
+        goal = _read(dirs, "goals", goal_id)
+        assert chain["state"] == "awaiting_supervisor"
+        assert chain["awaiting_reason"] == "max_rounds_split"
+        assert len(chain["rounds"]) == 2
+        assert "split_followup" not in goal
+        assert not (dirs["chains"] / "a.json").is_file()
 
 
 def test_pause_split_escalate_does_not_open_impl_round(tmp_path: Path):

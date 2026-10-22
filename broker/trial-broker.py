@@ -70,9 +70,13 @@ routes to the supervisor five-way (continue_same / new_ticket / close /
 split / escalate) instead of marking the slice failed. Soft step reminders
 are unchanged. ``continue_same`` still resumes the same impl session.
 ``limit_stop_closeout`` remains as a legacy fallback when classification
-does not match. Only ``escalate`` wakes Hub/human; other decisions park or
-close under supervisor control. Same-Goal supervisor tickets reuse via
-keep-open + resume.
+does not match. Only ``escalate`` wakes Hub/human. ``split`` (max_rounds, gate cap, or
+pause) ends this slice and asks the supervisor for exactly one follow-up
+pack via the ``emit_chain`` / ``emit_chains`` block. The broker appends
+that slice to the same Goal and opens it when the pack file is on disk;
+otherwise the slice stays parked. A park that did not produce a new pack
+still blocks the next already-planned slice. Same-Goal supervisor tickets
+reuse via keep-open + resume.
 
 ``type:goal-update`` with ``resume: true`` on a goal already ``failed``
 continues only when that failure is a missing impl summary and the slice
@@ -2262,7 +2266,25 @@ def _handle_foreman_blocked(
     already-open supervisor decision ticket (re-opened only when missing), so
     no Hub chain-reply event is emitted. Every other block keeps the legacy
     behaviour: await the Hub and notify once.
+
+    A split that already opened a follow-up must not be re-parked here: the
+    foreman was told to end the ticket, and the plan loop owns the child.
     """
+    if _split_followup_is_open(chain, goal_obj) or str(chain.get("state") or "") == "split":
+        chain["state"] = "split"
+        chain["awaiting_reason"] = None
+        _write_chain(chain)
+        if isinstance(goal_obj, dict):
+            goal_obj["last_chain_state"] = "split"
+            goal_obj["status"] = "running"
+            goal_obj.pop("awaiting_reason", None)
+            _write_goal(goal_obj)
+        print(
+            f"[trial-broker] chain {slice_id} blocked after split; "
+            "follow-up already opened",
+            flush=True,
+        )
+        return 0
     if _blocked_from_gate_cap(chain, goal_obj):
         pending = (goal_obj or {}).get("max_gate_rounds_decision_pending")
         pending = pending if isinstance(pending, dict) else {}
@@ -2664,27 +2686,64 @@ def _handle_submit_for_review(ask: dict, path: Path, *, default_profile: str, cw
                 flush=True,
             )
         elif decision == "split":
-            goal["status"] = "running"
-            goal["last_chain_state"] = "awaiting_supervisor"
-            goal["awaiting_reason"] = "max_gate_rounds_split"
-            goal.pop("max_gate_rounds_decision_pending", None)
             goal["supervisor_decision"] = {
                 "decision": "split",
                 "slice": slice_id,
                 "at": _iso(),
                 "reason": reason,
             }
-            answer["rework_mode"] = "split"
-            answer["escalate"] = False
-            answer["awaiting_reason"] = "max_gate_rounds_split"
-            answer["instruction"] = (
-                f"监理决定 split（max_gate_rounds={max_gate}）：本 slice 拆分收口，"
-                "写 summary 结束票"
-            )
-            print(
-                f"[trial-broker] gate cap split {slice_id} (r{round_n}/{max_gate})",
-                flush=True,
-            )
+            real_chain = _read_chain(slice_id) or fake_chain
+            opened = False
+            try:
+                opened = emit_split_followup(
+                    job,
+                    real_chain,
+                    goal,
+                    findings=list(goal.get("last_gate_findings") or []),
+                    reason=reason,
+                    source="max_gate_rounds",
+                    round_n=round_n,
+                )
+            except Exception as e:  # noqa: BLE001 — park beats a crash
+                print(f"[trial-broker] gate cap split follow-up error: {e}", flush=True)
+                opened = False
+            if opened:
+                fresh = _read_goal(str(goal.get("goal") or ""))
+                if isinstance(fresh, dict):
+                    goal.clear()
+                    goal.update(fresh)
+                goal.pop("max_gate_rounds_decision_pending", None)
+                goal.pop("awaiting_reason", None)
+                goal["status"] = "running"
+                goal["last_chain_state"] = "split"
+                answer["rework_mode"] = "split"
+                answer["escalate"] = False
+                answer.pop("awaiting_reason", None)
+                answer["instruction"] = (
+                    f"监理决定 split（max_gate_rounds={max_gate}）：本 slice 到此为止，"
+                    "跟进片已另开；写 summary 结束票，勿再改本片代码"
+                )
+                print(
+                    f"[trial-broker] gate cap split follow-up opened {slice_id}",
+                    flush=True,
+                )
+            else:
+                goal["status"] = "running"
+                goal["last_chain_state"] = "awaiting_supervisor"
+                goal["awaiting_reason"] = "max_gate_rounds_split"
+                goal.pop("max_gate_rounds_decision_pending", None)
+                answer["rework_mode"] = "split"
+                answer["escalate"] = False
+                answer["awaiting_reason"] = "max_gate_rounds_split"
+                answer["instruction"] = (
+                    f"监理决定 split（max_gate_rounds={max_gate}）：本 slice 拆分收口，"
+                    "写 summary 结束票"
+                )
+                print(
+                    f"[trial-broker] gate cap split parked {slice_id} "
+                    f"(r{round_n}/{max_gate}; no follow-up pack)",
+                    flush=True,
+                )
         elif decision == "escalate":
             goal["escalate_reason"] = (
                 f"max_gate_rounds={max_gate} reached slice={slice_id} (supervisor)"
@@ -5626,6 +5685,111 @@ Write summary with machine block:
     return name
 
 
+def build_split_followup_pack(
+    *,
+    slice_id: str,
+    round_n: int,
+    findings: list,
+    reason: str,
+    goal_id: str,
+    forbidden: set[str] | list[str],
+) -> str:
+    """One-slice supervisor-plan pack for the remainder of a split.
+
+    Same machine block as a Goal plan (``emit_chain`` / ``emit_chains``).
+    Scope is this split's findings and reason, not a fresh Goal brief.
+    """
+    name = f"{slice_id}-split-r{round_n}.pack.md"
+    path = PACKS / name
+    ranked = sorted(
+        list(findings or []),
+        key=lambda f: (0 if str((f or {}).get("tier") or "").upper() == "P0" else 1),
+    )
+    forbidden_ids = [str(s) for s in forbidden if str(s).strip()]
+    body = f"""---
+kind: supervisor-plan
+slice_id: {slice_id}
+round: {round_n}
+goal: {goal_id}
+max_slices: 1
+summary_out: $DSH_HOME/supervisor/thin-state/summaries/{slice_id}-sup-split-r{round_n}.md
+---
+
+# Split follow-up · {slice_id} · r{round_n}
+
+当前片到此为止。只为下面这份剩余工作写恰好一个新 slice pack。
+不要重开当前片，不要重写整个 Goal，不要改业务 src。
+
+## Reason
+{(reason or '')[:1500]}
+
+## Unresolved findings (this split only)
+```json
+{json.dumps(ranked[:12], ensure_ascii=False, indent=2)}
+```
+
+## Forbidden slice ids
+```json
+{json.dumps(forbidden_ids, ensure_ascii=False)}
+```
+
+## Instruction
+Write exactly one pack under `packs/`. Machine block must be `action=emit_chain`
+(top-level `slice` / `pack` / `acceptance`) or `action=emit_chains` with a
+`slices` list of length 1. The slice id must be new.
+```json
+{{
+  "action": "emit_chain",
+  "slice": "<new-slice-id>",
+  "pack": "<new-slice-id>.pack.md",
+  "acceptance": ["..."]
+}}
+```
+"""
+    path.write_text(body, encoding="utf-8")
+    _enforce_pack_bytes(path)
+    return name
+
+
+def _parse_one_emit_slice(block: dict | None) -> dict | None:
+    """Exactly one slice from ``emit_chain`` / ``emit_chains``.
+
+    No job-hint fallback and no invented id. Zero slices, or more than one,
+    is ``None`` (caller keeps the park).
+    """
+    if not isinstance(block, dict):
+        return None
+    action = str(block.get("action") or "").strip()
+    if action not in ("emit_chain", "emit_chains"):
+        return None
+    raw = block.get("slices")
+    items = [it for it in raw if isinstance(it, dict)] if isinstance(raw, list) else []
+    if action == "emit_chains":
+        if len(items) != 1:
+            return None
+        item: dict = items[0]
+    elif items:
+        if len(items) != 1:
+            return None
+        item = items[0]
+    else:
+        item = block
+    slice_id = str(item.get("slice") or item.get("id") or "").strip()
+    pack_name = Path(str(item.get("pack") or "")).name
+    if not slice_id and pack_name.endswith(".pack.md"):
+        slice_id = pack_name[: -len(".pack.md")]
+    if not slice_id or "/" in slice_id or "\\" in slice_id or slice_id in (".", ".."):
+        return None
+    if not pack_name.endswith(".pack.md"):
+        return None
+    acc = item.get("acceptance") or []
+    if isinstance(acc, str):
+        acc = [acc]
+    if not isinstance(acc, list):
+        acc = []
+    return {"slice": slice_id, "pack": pack_name, "acceptance": acc}
+
+
 def parse_max_rounds_decision(block: dict | None, text: str = "") -> str | None:
     """Extract inplace|split|escalate from supervisor summary block or prose."""
     block = block if isinstance(block, dict) else {}
@@ -5970,6 +6134,31 @@ def route_pause_decision(
         _terminal_outbox(job, chain, dest, ok=True)
         return 2
     if decision == "split":
+        chain["supervisor_decision"] = {
+            "decision": "split",
+            "at": _iso(),
+            "reason": pause_kind,
+            "source": "pause",
+            "note": "remaining work → new slice",
+        }
+        _write_chain(chain)
+        opened = False
+        try:
+            opened = emit_split_followup(
+                job,
+                chain,
+                goal_obj,
+                findings=[],
+                reason=f"pause_split:{pause_kind}",
+                source="pause_split",
+                round_n=round_n,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[trial-broker] pause split follow-up error: {e}", flush=True)
+            opened = False
+        if opened:
+            # Leave the Goal job in place so the plan loop can visit the child.
+            return 0
         chain["state"] = "awaiting_supervisor"
         chain["awaiting_reason"] = f"pause_split:{pause_kind}"
         _write_chain(chain)
@@ -6009,6 +6198,397 @@ def route_pause_decision(
     }
     _write_chain(chain)
     return CONTINUE_SAME_INLINE
+
+
+def _split_followup_is_open(chain: dict | None = None, goal: dict | None = None) -> bool:
+    for src in (chain, goal):
+        if not isinstance(src, dict):
+            continue
+        rec = src.get("split_followup")
+        if isinstance(rec, dict) and rec.get("opened") and str(rec.get("slice") or "").strip():
+            return True
+    return False
+
+
+def _is_recorded_split_followup(goal: dict | None, slice_id: str) -> bool:
+    if not isinstance(goal, dict):
+        return False
+    sid = str(slice_id or "")
+    rec = goal.get("split_followup")
+    if isinstance(rec, dict) and str(rec.get("slice") or "") == sid:
+        return True
+    for extra in goal.get("split_followup_specs") or []:
+        if isinstance(extra, dict) and str(extra.get("slice") or "") == sid:
+            return True
+    return False
+
+
+def _planned_slice_ids(goal: dict) -> list[str]:
+    """Slice ids named in the plan summary. Read-only; does not invent one."""
+    path_s = str(goal.get("plan_summary") or "").strip()
+    if not path_s:
+        return []
+    path = Path(path_s)
+    if not path.is_file():
+        return []
+    try:
+        block = _parse_supervisor_summary(path).get("block") or {}
+    except OSError:
+        return []
+    if not isinstance(block, dict):
+        return []
+    ids: list[str] = []
+    raw = block.get("slices")
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("slice") or item.get("id") or "").strip()
+            if sid:
+                ids.append(sid)
+    one = str(block.get("slice") or "").strip()
+    if one and one not in ids:
+        ids.append(one)
+    return ids
+
+
+def _split_forbidden_slice_ids(goal: dict | None, parent: str) -> set[str]:
+    """Ids a follow-up must not reuse (parent, already owned, already planned)."""
+    ids = {str(parent or "").strip()}
+    if isinstance(goal, dict):
+        ids.update(_goal_slice_ids(goal))
+        ids.update(_planned_slice_ids(goal))
+    ids.discard("")
+    return ids
+
+
+def _insert_split_followups(slice_specs: list, goal: dict | None) -> None:
+    """Insert recorded follow-ups just after their parent slice.
+
+    Idempotent. Used by the plan loop so a split child is visited before the
+    next already-planned pack, including after a broker restart.
+    """
+    if not isinstance(goal, dict):
+        return
+    ids = [str(s.get("slice") or "") for s in slice_specs]
+    for extra in goal.get("split_followup_specs") or []:
+        if not isinstance(extra, dict):
+            continue
+        sid = str(extra.get("slice") or "").strip()
+        pack = Path(str(extra.get("pack") or "")).name
+        if not sid or not pack or sid in ids:
+            continue
+        spec = {
+            "slice": sid,
+            "pack": pack,
+            "acceptance": extra.get("acceptance") or [],
+        }
+        after = str(extra.get("after") or "")
+        at = ids.index(after) + 1 if after in ids else len(slice_specs)
+        slice_specs.insert(at, spec)
+        ids.insert(at, sid)
+
+
+def _launch_split_followup_slice(
+    job: dict,
+    parent: dict,
+    goal: dict,
+    spec: dict,
+) -> int:
+    """Open the follow-up with the existing chain runner. New ACP session.
+
+    ``dest`` is a path we never create: ``_terminal_outbox`` moves ``dest``
+    when it exists, and this must not steal the parent Goal job.
+    """
+    slice_id = spec["slice"]
+    goal_id = str(goal.get("goal") or "")
+    profile = str(
+        job.get("profile") or parent.get("profile") or goal.get("profile") or "acp-lite"
+    )
+    gate_profile = str(job.get("gate_profile") or parent.get("gate_profile") or profile)
+    chain_job = {
+        "id": f"split-followup-{slice_id}",
+        "type": "chain",
+        "slice": slice_id,
+        "pack": spec["pack"],
+        "acceptance": list(spec.get("acceptance") or []),
+        "profile": profile,
+        "gate_profile": gate_profile,
+        "supervisor_profile": str(
+            job.get("supervisor_profile") or goal.get("supervisor_profile") or "acp-lite"
+        ),
+        "cwd": str(job.get("cwd") or parent.get("cwd") or goal.get("cwd") or "/workspace"),
+        "max_rounds": int(
+            goal.get("max_rounds") or job.get("max_rounds") or parent.get("max_rounds") or 2
+        ),
+        "notify": job.get("notify") if job.get("notify") is not None else goal.get("notify"),
+        "notify_dry_run": (
+            job.get("notify_dry_run")
+            if job.get("notify_dry_run") is not None
+            else goal.get("notify_dry_run")
+        ),
+        "notify_prefix": job.get("notify_prefix") or goal.get("notify_prefix"),
+        "goal": goal_id,
+        "from_goal": True,
+        "auto_supervisor_answer": job.get("auto_supervisor_answer", True),
+        "max_supervisor_tickets": int(
+            goal.get("max_supervisor_tickets") or job.get("max_supervisor_tickets") or 8
+        ),
+        "defer_supervisor_close": True,
+        "gate_policy": parent.get("gate_policy") or job.get("gate_policy") or GE.GATE_POLICY_PER_SLICE,
+        "gate_grain": parent.get("gate_grain") or job.get("gate_grain"),
+        "gate_deferred_slices": [],
+    }
+    child = _new_chain_state(chain_job)
+    child["from_goal"] = True
+    child["goal"] = goal_id
+    child["split_parent"] = str(parent.get("slice") or "")
+    child["defer_supervisor_close"] = True
+    child["supervisor_profile"] = chain_job["supervisor_profile"]
+    child["auto_supervisor_answer"] = chain_job["auto_supervisor_answer"]
+    child["max_supervisor_tickets"] = chain_job["max_supervisor_tickets"]
+    child["gate_policy"] = chain_job["gate_policy"]
+    if chain_job.get("gate_grain"):
+        child["gate_grain"] = chain_job["gate_grain"]
+    _write_chain(child)
+    dest = PROCESSING / f".split-followup-{slice_id}.absent"
+    print(
+        f"[trial-broker] split follow-up open slice={slice_id} pack={spec['pack']}",
+        flush=True,
+    )
+    return run_chain_rounds(
+        chain_job, child, dest, start_round=1, start_pack=spec["pack"]
+    )
+
+
+def _sync_goal_dict(goal: dict | None, fresh: dict) -> None:
+    if isinstance(goal, dict) and goal is not fresh:
+        goal.clear()
+        goal.update(fresh)
+
+
+def _open_recorded_split_followup(
+    job: dict,
+    chain: dict,
+    goal: dict,
+    spec: dict,
+    *,
+    source: str,
+    round_n: int | None,
+) -> bool:
+    """Append ``spec`` to the Goal and open it. Parent slice stops."""
+    goal_id = str(goal.get("goal") or "")
+    parent_id = str(chain.get("slice") or "")
+    g = _read_goal(goal_id) or goal
+    specs = [x for x in (g.get("split_followup_specs") or []) if isinstance(x, dict)]
+    if not any(str(x.get("slice") or "") == spec["slice"] for x in specs):
+        specs.append({
+            "slice": spec["slice"],
+            "pack": spec["pack"],
+            "acceptance": list(spec.get("acceptance") or []),
+            "after": parent_id,
+            "source": source,
+            "at": _iso(),
+        })
+    g["split_followup_specs"] = specs
+    slices = list(dict.fromkeys(list(g.get("slices") or []) + [spec["slice"]]))
+    g["slices"] = slices
+    g["split_followup"] = {
+        "slice": spec["slice"],
+        "pack": spec["pack"],
+        "acceptance": list(spec.get("acceptance") or []),
+        "parent": parent_id,
+        "opened": True,
+        "source": source,
+        "at": _iso(),
+    }
+    g["status"] = "running"
+    g["last_chain_state"] = "split"
+    g.pop("awaiting_reason", None)
+    g.pop("error", None)
+    _write_goal(g)
+    _sync_goal_dict(goal, g)
+    update_active_goal(goal_id, slices=slices)
+    chain["split_followup"] = dict(g["split_followup"])
+    # "split" is not a parked state: the plan loop may visit the child.
+    # It is also not PASS, and it does not reopen this slice's impl.
+    chain["state"] = "split"
+    chain["awaiting_reason"] = None
+    chain.pop("max_rounds_decision_pending", None)
+    _write_chain(chain)
+    try:
+        _launch_split_followup_slice(job, chain, g, spec)
+    except Exception as e:  # noqa: BLE001 — park beats a crash
+        print(f"[trial-broker] split follow-up launch error: {e}", flush=True)
+        chain["state"] = "awaiting_supervisor"
+        chain["awaiting_reason"] = "split_followup_launch_error"
+        _write_chain(chain)
+        g = _read_goal(goal_id) or g
+        g["awaiting_reason"] = "split_followup_launch_error"
+        g["last_chain_state"] = "awaiting_supervisor"
+        g["status"] = "running"
+        _write_goal(g)
+        _sync_goal_dict(goal, g)
+        return False
+    child = _read_chain(spec["slice"]) or {}
+    child_state = str(child.get("state") or "")
+    chain["state"] = "split"
+    chain["awaiting_reason"] = None
+    _write_chain(chain)
+    g = _read_goal(goal_id) or g
+    if child_state == VERDICT_PASS:
+        metrics = g.setdefault("metrics", T.empty_metrics())
+        metrics["slices_completed"] = int(metrics.get("slices_completed") or 0) + 1
+        g["last_chain_state"] = "split"
+        g["status"] = "running"
+        g.pop("awaiting_reason", None)
+        _write_goal(g)
+    elif not (
+        _chain_is_parked_awaiting(child)
+        or child_state in ("failed", "escalated", "cancelled")
+    ):
+        g["last_chain_state"] = "split"
+        g["status"] = "running"
+        g.pop("awaiting_reason", None)
+        _write_goal(g)
+    _sync_goal_dict(goal, g)
+    print(
+        f"[trial-broker] split follow-up opened parent={parent_id} "
+        f"slice={spec['slice']} child_state={child_state or '?'} "
+        f"round={round_n}",
+        flush=True,
+    )
+    return True
+
+
+def emit_split_followup(
+    job: dict,
+    chain: dict,
+    goal: dict | None,
+    *,
+    findings: list | None,
+    reason: str,
+    source: str,
+    round_n: int | None = None,
+) -> bool:
+    """After a split decision: one new slice pack, then open it.
+
+    Returns False when the supervisor ticket fails, the summary is not
+    exactly one new slice, or the pack file is not on disk. Caller keeps
+    the existing park. Does not reopen the parent impl / fix round.
+    """
+    if not isinstance(chain, dict) or not str(chain.get("slice") or "").strip():
+        return False
+    parent_id = str(chain.get("slice") or "")
+    goal_id = str(
+        (goal or {}).get("goal") or job.get("goal") or chain.get("goal") or ""
+    )
+    if not goal_id:
+        print("[trial-broker] split follow-up skipped: no goal", flush=True)
+        return False
+    g = _read_goal(goal_id) or (goal if isinstance(goal, dict) else None)
+    if not isinstance(g, dict):
+        return False
+    rec = chain.get("split_followup")
+    if isinstance(rec, dict) and rec.get("opened") and rec.get("slice"):
+        child = _read_chain(str(rec["slice"]))
+        if isinstance(child, dict):
+            if str(chain.get("state") or "") != "split":
+                chain["state"] = "split"
+                chain["awaiting_reason"] = None
+                chain["split_followup"] = dict(rec)
+                _write_chain(chain)
+            return True
+        pack = Path(str(rec.get("pack") or "")).name
+        if pack and (PACKS / pack).is_file():
+            spec = {
+                "slice": str(rec["slice"]),
+                "pack": pack,
+                "acceptance": rec.get("acceptance") or [],
+            }
+            return _open_recorded_split_followup(
+                job, chain, g, spec, source=source, round_n=round_n,
+            )
+    max_sup = int(
+        g.get("max_supervisor_tickets") or job.get("max_supervisor_tickets") or 8
+    )
+    if int(g.get("supervisor_ticket_count") or 0) >= max_sup:
+        print(
+            f"[trial-broker] supervisor ticket cap {max_sup} reached (split)",
+            flush=True,
+        )
+        return False
+    if round_n is None:
+        round_n = int(
+            chain.get("awaiting_answer_for_round")
+            or len(chain.get("rounds") or [])
+            or 1
+        )
+    try:
+        ask_pack = build_split_followup_pack(
+            slice_id=parent_id,
+            round_n=int(round_n),
+            findings=list(findings or []),
+            reason=reason,
+            goal_id=goal_id,
+            forbidden=_split_forbidden_slice_ids(g, parent_id),
+        )
+    except (OSError, ValueError) as e:
+        print(f"[trial-broker] split follow-up pack error: {e}", flush=True)
+        return False
+    ticket = f"supervisor-plan-split-{parent_id}-r{round_n}"
+    summary_name = f"{parent_id}-sup-split-r{round_n}"
+    profile = str(
+        job.get("supervisor_profile") or g.get("supervisor_profile") or "acp-lite"
+    )
+    try:
+        ec, _art, summary_path = run_supervisor_ticket(
+            ticket=ticket,
+            pack_name=ask_pack,
+            profile=profile,
+            cwd=str(job.get("cwd") or chain.get("cwd") or g.get("cwd") or "/workspace"),
+            summary_name=summary_name,
+            prompt_mode="supervisor-plan",
+            goal=g,
+        )
+    except Exception as e:  # noqa: BLE001 — park beats a crash; tests block ACP here
+        print(f"[trial-broker] split follow-up supervisor error: {e}", flush=True)
+        return False
+    chain.setdefault("supervisor_events", []).append({
+        "kind": "split_followup",
+        "ticket": ticket,
+        "exit": ec,
+        "summary": str(summary_path),
+        "source": source,
+    })
+    _write_chain(chain)
+    g = _read_goal(goal_id) or g
+    _sync_goal_dict(goal, g)
+    if ec != 0 and not summary_path.is_file():
+        print(f"[trial-broker] split follow-up ticket exit {ec}", flush=True)
+        return False
+    parsed = _parse_supervisor_summary(summary_path)
+    spec = _parse_one_emit_slice(parsed.get("block"))
+    if not spec:
+        print(
+            "[trial-broker] split follow-up: summary is not exactly one slice",
+            flush=True,
+        )
+        return False
+    forbidden = _split_forbidden_slice_ids(g, parent_id)
+    if spec["slice"] in forbidden or _read_chain(spec["slice"]):
+        print(
+            f"[trial-broker] split follow-up rejected slice={spec['slice']} "
+            "(existing, planned, or parent id)",
+            flush=True,
+        )
+        return False
+    if not (PACKS / spec["pack"]).is_file():
+        print(f"[trial-broker] split follow-up pack missing {spec['pack']}", flush=True)
+        return False
+    return _open_recorded_split_followup(
+        job, chain, g, spec, source=source, round_n=round_n,
+    )
 
 
 def _park_chain_awaiting_max_rounds(
@@ -6075,7 +6655,7 @@ def handle_max_rounds_touch(
 
     Returns one of:
       - ``\"inplace\"`` — caller should open the next fix round (max_rounds bumped)
-      - ``\"split\"`` — decision recorded; caller returns 0 (Goal resumable)
+      - ``\"split\"`` — follow-up slice opened when one pack lands; otherwise parked. Caller returns 0 either way (no parent impl reopen)
       - ``\"escalate\"`` — caller should write escalated + Hub notify + return 1
       - ``\"parked\"`` — awaiting_supervisor; caller returns 0
     """
@@ -6155,6 +6735,27 @@ def handle_max_rounds_touch(
             "source": source,
             "note": "remaining P0/P1 should go to a new slice/pack; Goal resumable",
         }
+        _write_chain(chain)
+        opened = False
+        try:
+            opened = emit_split_followup(
+                job,
+                chain,
+                goal_obj,
+                findings=findings,
+                reason=reason,
+                source=source,
+                round_n=round_n,
+            )
+        except Exception as e:  # noqa: BLE001 — park beats a crash
+            print(f"[trial-broker] max_rounds split follow-up error: {e}", flush=True)
+            opened = False
+        if opened:
+            print(
+                f"[trial-broker] chain {slice_id} max_rounds split follow-up opened",
+                flush=True,
+            )
+            return "split"
         chain["state"] = "awaiting_supervisor"
         chain["awaiting_reason"] = "max_rounds_split"
         _write_chain(chain)
@@ -6173,8 +6774,8 @@ def handle_max_rounds_touch(
             goal=goal_obj,
         )
         print(
-            f"[trial-broker] chain {slice_id} max_rounds split recorded "
-            f"(Goal resumable)",
+            f"[trial-broker] chain {slice_id} max_rounds split parked "
+            f"(no follow-up pack)",
             flush=True,
         )
         return "split"
@@ -6303,6 +6904,36 @@ def handle_ticket_max_rounds_touch(
         return "inplace"
 
     if decision == "split":
+        if goal_id:
+            g = _read_goal(goal_id) or goal_obj
+            if g is not None:
+                g["supervisor_decision"] = {
+                    "decision": "split",
+                    "at": _iso(),
+                    "reason": reason,
+                    "findings": list(findings or [])[:20],
+                }
+                _write_goal(g)
+                goal_obj = g
+        opened = False
+        chain_for_split = _read_chain(slice_id)
+        if not isinstance(chain_for_split, dict):
+            chain_for_split = fake_chain
+        try:
+            opened = emit_split_followup(
+                job,
+                chain_for_split,
+                goal_obj,
+                findings=findings,
+                reason=reason,
+                source="ticket_max_rounds",
+                round_n=round_n,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[trial-broker] ticket max_rounds split follow-up error: {e}", flush=True)
+            opened = False
+        if opened:
+            return "split"
         if goal_id:
             g = _read_goal(goal_id) or goal_obj
             if g is not None:
@@ -7638,7 +8269,17 @@ def run_chain_rounds(
                         _notify_goal_terminal(str(goal_id))
                     return 1
                 else:
-                    # parked / split — Goal resumable; no terminal escalate.
+                    # parked — Goal resumable; no terminal escalate.
+                    # split with a follow-up leaves state=split and must not
+                    # move the Goal job out of PROCESSING (the plan loop
+                    # still has slices to run).
+                    if outcome == "split" and str(chain.get("state") or "") == "split":
+                        print(
+                            f"[trial-broker] chain {slice_id} max_rounds split "
+                            "follow-up opened; not moving goal job",
+                            flush=True,
+                        )
+                        return 0
                     out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
                     print(
                         f"[trial-broker] chain {slice_id} max_rounds {outcome} "
@@ -8148,6 +8789,13 @@ def run_chain_rounds(
                 )
                 return 1
             else:
+                if outcome == "split" and str(chain.get("state") or "") == "split":
+                    print(
+                        f"[trial-broker] chain {slice_id} max_rounds split "
+                        "follow-up opened; not moving goal job",
+                        flush=True,
+                    )
+                    return 0
                 out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
                 print(
                     f"[trial-broker] chain {slice_id} max_rounds {outcome} "
@@ -8504,6 +9152,10 @@ def _execute_goal_slices(
         lim = T.load_global_limits()
     goal_grain = GE.resolve_goal_gate_grain(goal=goal_state, job=job, limits=lim)
     planned_policies = _plan_goal_gate_policies(goal_grain, slice_specs)
+    policy_by_slice = {
+        str(spec.get("slice") or ""): pol
+        for spec, pol in zip(slice_specs, planned_policies)
+    }
     # Deferred slice ids that the bearer must include (all prior defer).
     deferred_for_bearer: list[str] = [
         str(spec["slice"])
@@ -8524,12 +9176,28 @@ def _execute_goal_slices(
     # Slices already PASS: fresh slices get a thin-state digest appended to
     # their pack so every slice runs in a brand-new ACP session (no resume).
     done_slices: list[str] = []
-    for spec in slice_specs:
+    # Follow-ups recorded by a previous split (or a crash before launch)
+    # sit immediately after their parent. Already-planned packs stay behind
+    # them. A parked slice with no follow-up pack is unchanged (hub-k7c).
+    _insert_split_followups(slice_specs, goal_state)
+    spec_i = 0
+    while spec_i < len(slice_specs):
+        spec = slice_specs[spec_i]
+        spec_i += 1
+        goal_state = _read_goal(goal_id) or goal_state
         slice_id = str(spec["slice"])
-        existing = _read_chain(slice_id) if (skip_passed or resume) else None
+        is_followup = _is_recorded_split_followup(goal_state, slice_id)
+        existing = _read_chain(slice_id) if (skip_passed or resume or is_followup) else None
         if not isinstance(existing, dict):
             existing = None
         existing_state = str((existing or {}).get("state") or "")
+        if existing_state == "split":
+            _insert_split_followups(slice_specs, goal_state)
+            print(
+                f"[trial-broker] goal {goal_id} skip split-closed slice={slice_id}",
+                flush=True,
+            )
+            continue
         if existing_state == VERDICT_PASS:
             last_chain = existing
             last_chain_job = _chain_job_from_chain(job, existing, slice_id, spec, goal_id)
@@ -8539,7 +9207,7 @@ def _execute_goal_slices(
                 flush=True,
             )
             continue
-        if (resume or skip_passed) and _chain_is_parked_awaiting(existing):
+        if (resume or skip_passed or is_followup) and _chain_is_parked_awaiting(existing):
             # Parked on supervisor / Hub five-way (awaiting_supervisor,
             # paused_wallclock / paused_limit). Restart / reschedule must NOT
             # skip this slice and open the next planned pack (hub-k7c s2
@@ -8570,7 +9238,16 @@ def _execute_goal_slices(
                 flush=True,
             )
             break
-        if resume and existing_state in ("failed", "escalated", "cancelled"):
+        if is_followup and existing_state == "running" and not resume:
+            # emit_split_followup already opened this child in the parent
+            # slice's turn. Do not start a second ACP session for it.
+            print(
+                f"[trial-broker] goal {goal_id} follow-up {slice_id} "
+                "already launching; not opening it again",
+                flush=True,
+            )
+            continue
+        if (resume or is_followup) and existing_state in ("failed", "escalated", "cancelled"):
             all_pass = False
             goal_state["last_chain_state"] = existing_state
             goal_state["status"] = existing_state
@@ -8599,18 +9276,10 @@ def _execute_goal_slices(
         goal_state["slices"] = list(dict.fromkeys(list(goal_state.get("slices") or []) + [slice_id]))
         _write_goal(goal_state)
 
-        # Index of this spec in the planned list (stable order).
-        try:
-            spec_idx = next(
-                i for i, s in enumerate(slice_specs) if str(s.get("slice")) == slice_id
-            )
-        except StopIteration:
-            spec_idx = 0
-        slice_gate_policy = (
-            planned_policies[spec_idx]
-            if spec_idx < len(planned_policies)
-            else GE.GATE_POLICY_PER_SLICE
-        )
+        if is_followup:
+            slice_gate_policy = GE.GATE_POLICY_PER_SLICE
+        else:
+            slice_gate_policy = policy_by_slice.get(slice_id, GE.GATE_POLICY_PER_SLICE)
         chain_job = {
             "id": job.get("id") or f"goal-chain-{slice_id}",
             "type": "chain",
@@ -8702,6 +9371,14 @@ def _execute_goal_slices(
             m["slices_completed"] = int(m.get("slices_completed") or 0) + 1
             _write_goal(goal_state)
             done_slices.append(slice_id)
+            continue
+        if state == "split":
+            goal_state = _read_goal(goal_id) or goal_state
+            _insert_split_followups(slice_specs, goal_state)
+            print(
+                f"[trial-broker] slice {slice_id} split; follow-up is next, not a park",
+                flush=True,
+            )
             continue
         if _chain_is_parked_awaiting(final_chain):
             # Hot path: pause / max_rounds / questions parked mid-Goal. Never
@@ -9213,10 +9890,10 @@ def _park_pause_split_chain_reply(
     *,
     awaiting_reason: str,
 ) -> int:
-    """Record split and stay parked. Do not open impl rN+1.
+    """Record split. Open a follow-up slice when the supervisor emits one.
 
-    ``awaiting_reason`` stays ``pause_split`` / ``pause_split:{kind}``.
-    Hub must not remap it to ``max_rounds`` before replying.
+    Does not open impl rN+1. If no pack lands, ``awaiting_reason`` stays
+    ``pause_split`` / ``pause_split:{kind}``.
     """
     parent_goal_id = _resolve_parent_goal_id(job, chain)
     goal_obj = _read_goal(parent_goal_id) if parent_goal_id else None
@@ -9225,8 +9902,31 @@ def _park_pause_split_chain_reply(
         "at": _iso(),
         "via": "chain-reply",
         "reason": awaiting_reason,
-        "note": "pause split: remaining work → new slice / Hub Goal; chain stays parked",
+        "note": "pause split: remaining work → new slice; do not reopen this impl",
     }
+    _write_chain(chain)
+    opened = False
+    try:
+        opened = emit_split_followup(
+            job,
+            chain,
+            goal_obj,
+            findings=[],
+            reason=awaiting_reason,
+            source="pause_split_chain_reply",
+            round_n=int(chain.get("awaiting_answer_for_round") or 1),
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[trial-broker] pause split chain-reply follow-up error: {e}", flush=True)
+        opened = False
+    if opened:
+        out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+        print(
+            f"[trial-broker] chain-reply pause split follow-up opened "
+            f"slice={slice_id} outbox={out.name}",
+            flush=True,
+        )
+        return 0
     chain["state"] = "awaiting_supervisor"
     chain["awaiting_reason"] = awaiting_reason
     _write_chain(chain)
@@ -9240,7 +9940,7 @@ def _park_pause_split_chain_reply(
         _write_goal(goal_obj)
     out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
     print(
-        f"[trial-broker] chain-reply pause split recorded "
+        f"[trial-broker] chain-reply pause split parked "
         f"slice={slice_id} reason={awaiting_reason} outbox={out.name}",
         flush=True,
     )
@@ -9500,6 +10200,23 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         shutil.move(str(dest), str(FAILED / dest.name))
         return 1
     if chain.get("state") != "awaiting_supervisor":
+        # Auto path already opened the follow-up. Do not reopen the old impl
+        # and do not emit a second slice.
+        if (
+            str(chain.get("state") or "") == "split"
+            and _split_followup_is_open(chain)
+            and parse_max_rounds_decision(
+                {"decision": job.get("decision"), "answer": job.get("answer")},
+                str(job.get("answer") or ""),
+            ) == "split"
+        ):
+            out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
+            print(
+                f"[trial-broker] chain-reply split already opened "
+                f"slice={slice_id} outbox={out.name}",
+                flush=True,
+            )
+            return 0
         err = f"chain state is {chain.get('state')}, expected awaiting_supervisor"
         print(f"[trial-broker] FAIL {err}", flush=True)
         (FAILED / f"{dest.stem}.error.json").write_text(
@@ -9509,9 +10226,8 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
         return 1
 
     # Pause parks (pause_split / pause_continue / pause_new_ticket) accept the
-    # supervisor decision directly. pause_split + split stays parked — Hub does
-    # not remap awaiting_reason to max_rounds first. max_rounds handling below
-    # is unchanged.
+    # supervisor decision directly. pause_split + split tries one follow-up
+    # slice and does not reopen impl. max_rounds + split does the same.
     awaiting_reason = str(chain.get("awaiting_reason") or "")
     if _pause_reply_family(awaiting_reason):
         pause_kind, pause_payload = _apply_pause_chain_reply(
@@ -9581,19 +10297,39 @@ def run_chain_reply_job(path: Path, job: dict) -> int:
                 "via": "chain-reply",
                 "reason": touch_reason,
                 "findings": findings[:20],
-                "note": "remaining P0/P1 → new slice; Goal resumable",
+                "note": "remaining P0/P1 → new slice; do not reopen this impl",
             }
-            chain["awaiting_reason"] = "max_rounds_split"
             _write_chain(chain)
-            if goal_obj is not None:
-                goal_obj["supervisor_decision"] = dict(chain["supervisor_decision"])
-                goal_obj["awaiting_reason"] = "max_rounds_split"
-                goal_obj["status"] = "running"
-                goal_obj["last_chain_state"] = "awaiting_supervisor"
-                _write_goal(goal_obj)
+            opened = False
+            reply_text = str(job.get("answer") or "").strip()
+            follow_reason = touch_reason if not reply_text else f"{touch_reason}\n{reply_text}"
+            try:
+                opened = emit_split_followup(
+                    job,
+                    chain,
+                    goal_obj,
+                    findings=findings,
+                    reason=follow_reason,
+                    source="max_rounds_chain_reply",
+                    round_n=round_n,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[trial-broker] chain-reply split follow-up error: {e}", flush=True)
+                opened = False
+            if not opened:
+                chain["state"] = "awaiting_supervisor"
+                chain["awaiting_reason"] = "max_rounds_split"
+                _write_chain(chain)
+                if goal_obj is not None:
+                    goal_obj["supervisor_decision"] = dict(chain["supervisor_decision"])
+                    goal_obj["awaiting_reason"] = "max_rounds_split"
+                    goal_obj["status"] = "running"
+                    goal_obj["last_chain_state"] = "awaiting_supervisor"
+                    _write_goal(goal_obj)
             out = _terminal_outbox(job, chain, dest, ok=True, notify=False)
             print(
-                f"[trial-broker] chain-reply max_rounds split recorded "
+                f"[trial-broker] chain-reply max_rounds split "
+                f"{'opened' if opened else 'parked'} "
                 f"slice={slice_id} outbox={out.name}",
                 flush=True,
             )
@@ -10022,12 +10758,17 @@ def run_ticket_job(path: Path, job: dict) -> int:
                 _ticket_goal_terminal(goal_id, "escalated", reason=reason)
                 break
             else:
-                # parked / split — keep Goal running/awaiting; not failed.
-                status = "awaiting_supervisor"
-                reason = reason
+                # parked keeps the ticket awaiting. A split that opened a
+                # follow-up is done with this ticket (the child chain runs).
+                gnow = _read_goal(goal_id) if goal_id else goal_obj
+                if outcome == "split" and _split_followup_is_open(None, gnow):
+                    status = "ok"
+                    reason = ""
+                else:
+                    status = "awaiting_supervisor"
                 print(
                     f"[trial-broker] ticket {job['ticket']} max_rounds {outcome} "
-                    f"r{round_n}",
+                    f"r{round_n} status={status}",
                     flush=True,
                 )
                 break

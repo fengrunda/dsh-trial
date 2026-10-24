@@ -3,8 +3,9 @@
 
 pause_split + decision=split does not reopen impl rN+1. It tries one
 follow-up slice; if that emit does not land a pack, the chain stays parked.
-max_rounds_split + decision=split does not reopen the old impl either; it
-tries the same follow-up emit.
+max_rounds_split + decision=split does not reopen the old impl either. It
+tries the same one-slice follow-up, then the parent is always superseded
+(awaiting cleared). A rejected emit does not re-park the parent.
 """
 from __future__ import annotations
 
@@ -166,8 +167,8 @@ def test_pause_split_chain_reply_does_not_open_impl_round(tmp_path: Path):
         assert "不要重写整个 Goal" in ask
 
 
-def test_max_rounds_split_chain_reply_unchanged(tmp_path: Path):
-    """Do not reopen the old impl. Do try to open one follow-up slice."""
+def test_max_rounds_split_chain_reply_terminalizes_parent(tmp_path: Path):
+    """Do not reopen the old impl. Do try one follow-up. Parent is superseded."""
     patcher, dirs = _patched_dirs(tmp_path)
     with patcher:
         slice_id, goal_id = _write_parked(
@@ -199,15 +200,16 @@ def test_max_rounds_split_chain_reply_unchanged(tmp_path: Path):
         assert launched == []
         chain = _read(dirs, "chains", slice_id)
         goal = _read(dirs, "goals", goal_id)
-        assert chain["state"] == "awaiting_supervisor"
-        assert chain["awaiting_reason"] == "max_rounds_split"
+        # Shared closeout: the parent chain never stays awaiting.
+        assert chain["state"] == "superseded"
+        assert "awaiting_reason" not in chain
+        assert "awaiting_reason" not in goal
         assert chain["supervisor_decision"]["decision"] == "split"
         assert chain["supervisor_decision"]["via"] == "chain-reply"
+        assert chain["supervisor_decision"]["source"] == "chain-reply"
         assert "do not reopen this impl" in str(chain["supervisor_decision"].get("note") or "")
         assert len(chain["rounds"]) == 2
         assert goal["status"] == "running"
-        assert goal["awaiting_reason"] == "max_rounds_split"
-        assert goal["last_chain_state"] == "awaiting_supervisor"
         assert not list(dirs["packs"].glob("*-reply-r*.pack.md"))
         ask = (dirs["packs"] / f"{slice_id}-split-r2.pack.md").read_text(encoding="utf-8")
         assert "split remaining P0" in ask
@@ -262,9 +264,10 @@ def test_max_rounds_split_chain_reply_launches_one_followup(tmp_path: Path):
         chain = _read(dirs, "chains", slice_id)
         goal = _read(dirs, "goals", goal_id)
         child = _read(dirs, "chains", child_id)
-        assert chain["state"] == "split"
+        assert chain["state"] == "superseded"
+        assert chain["superseded_reason"] == "max_rounds_split"
         assert len(chain["rounds"]) == 2
-        assert chain.get("awaiting_reason") in (None, "")
+        assert "awaiting_reason" not in chain
         assert child["state"] == "PASS"
         assert child_id in goal["slices"]
         assert goal["split_followup"]["slice"] == child_id
@@ -303,8 +306,8 @@ def test_max_rounds_split_rejects_two_slices(tmp_path: Path):
         assert rc == 0
         chain = _read(dirs, "chains", slice_id)
         goal = _read(dirs, "goals", goal_id)
-        assert chain["state"] == "awaiting_supervisor"
-        assert chain["awaiting_reason"] == "max_rounds_split"
+        assert chain["state"] == "superseded"
+        assert "awaiting_reason" not in chain
         assert len(chain["rounds"]) == 2
         assert "split_followup" not in goal
         assert not (dirs["chains"] / "a.json").is_file()

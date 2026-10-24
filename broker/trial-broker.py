@@ -5324,7 +5324,8 @@ _CHAIN_TERMINAL_STATES = frozenset(
 # Terminal states that do not block a Goal from being done.
 _CHAIN_DONE_OK_STATES = frozenset({"PASS", "superseded"})
 # Parked awaiting_reason prefixes: a split / pause park can be superseded by a
-# goal close. Other parks stay untouched.
+# goal close. ``awaiting_supervisor`` is always supersedable regardless of the
+# reason; for any other parked state only these prefixes qualify.
 _SUPERSEDE_AWAITING_PREFIXES = ("max_rounds", "pause_")
 
 
@@ -10940,16 +10941,15 @@ def _ignore_late_chain_reply(
     """Idempotent no-op for a reply that arrived for an already-closed Goal.
 
     The Goal is never written and the chain keeps its ``state`` /
-    ``awaiting_reason``; only ``late_chain_reply_ignored`` accumulates, once per
-    (decision, reason). ``rc=0`` so Hub retries do not storm FAILED.
+    ``awaiting_reason``; only ``late_chain_reply_ignored`` accumulates, at most
+    once per ``decision`` (the first ``reason`` is kept, so a later reply with a
+    different ``awaiting_reason`` does not add a second marker). ``rc=0`` so Hub
+    retries do not storm FAILED.
     """
     entries = [
         dict(e) for e in (chain.get("late_chain_reply_ignored") or []) if isinstance(e, dict)
     ]
-    if not any(
-        str(e.get("decision") or "") == decision and str(e.get("reason") or "") == reason
-        for e in entries
-    ):
+    if not any(str(e.get("decision") or "") == decision for e in entries):
         entries.append({"at": _iso(), "decision": decision, "reason": reason})
         chain["late_chain_reply_ignored"] = entries
         _write_chain(chain)

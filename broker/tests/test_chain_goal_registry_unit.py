@@ -251,6 +251,43 @@ def test_late_split_reply_is_idempotent(tmp_path: Path):
         assert not list(dirs["failed"].glob("*.json"))
 
 
+def test_late_reply_marker_dedupes_by_decision(tmp_path: Path):
+    """Same decision with a different reason keeps a single marker (first reason)."""
+    patcher, dirs = _patched_dirs(tmp_path)
+    with patcher:
+        goal_id = "late-goal"
+        slice_id = "late-goal-s1"
+        _write_goal(
+            dirs,
+            {
+                "goal": goal_id,
+                "status": "done",
+                "brief": "x",
+                "slices": [slice_id],
+            },
+        )
+        chain_path = _write_chain(dirs, _parked_chain(slice_id, goal_id, tmp_path))
+        dest = dirs["processing"] / "late.json"
+        dest.write_text("{}", encoding="utf-8")
+
+        for reason in ("max_rounds_split", "goal terminal"):
+            assert (
+                tb._ignore_late_chain_reply(
+                    tb._read_chain(slice_id),
+                    dest,
+                    slice_id,
+                    decision="split",
+                    reason=reason,
+                )
+                == 0
+            )
+
+        chain = _read(chain_path)
+        assert len(chain["late_chain_reply_ignored"]) == 1
+        assert chain["late_chain_reply_ignored"][0]["reason"] == "max_rounds_split"
+        assert chain["state"] == "awaiting_supervisor"
+
+
 def test_missing_goal_refuses_chain(tmp_path: Path):
     """d) Unknown Goal id: refused into FAILED, no orphan chain state."""
     patcher, dirs = _patched_dirs(tmp_path)

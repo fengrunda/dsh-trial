@@ -436,6 +436,32 @@ def resolve_limits(job: dict | None = None, goal: dict | None = None) -> dict:
     return effective
 
 
+def goal_supervisor_cap(goal: dict | None, job: dict | None = None, default: int = 8) -> int:
+    """Effective ``max_supervisor_tickets`` for a Goal.
+
+    A goal-update raise (``limits_overrides``) wins; otherwise the Goal's
+    top-level value, then the job snapshot, then ``default``. Every supervisor
+    ticket-cap check must use this instead of reading the top-level field, which
+    a goal-update used to leave at its creation-time value.
+    """
+    goal = goal or {}
+    job = job or {}
+    ov = goal.get("limits_overrides")
+    cands = [
+        ov.get("max_supervisor_tickets") if isinstance(ov, dict) else None,
+        goal.get("max_supervisor_tickets"),
+        job.get("max_supervisor_tickets"),
+    ]
+    for v in cands:
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            continue
+        if iv > 0:
+            return iv
+    return int(default)
+
+
 def apply_goal_update(goal: dict, update: dict) -> dict:
     """Apply type:goal-update fields onto goal. Supports cancel + limit bumps."""
     if update.get("cancel") or str(update.get("action") or "").lower() in ("cancel", "abort"):
@@ -463,6 +489,9 @@ def apply_goal_update(goal: dict, update: dict) -> dict:
         eff[k] = overrides[k]
         eff["_sources"][k] = "update"
     goal["limits_effective"] = {k: eff[k] for k in DEFAULT_LIMITS}
+    if "max_supervisor_tickets" in changed:
+        # Supervisor ticket-cap checks historically read the top-level field.
+        goal["max_supervisor_tickets"] = overrides["max_supervisor_tickets"]
     goal["limits_sources"] = eff["_sources"]
     goal["last_update_at"] = now_iso()
     goal["last_update_fields"] = changed

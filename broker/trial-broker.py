@@ -914,6 +914,11 @@ def load_job(path: Path) -> dict:
             "resume": bool(data.get("resume")),
             "requeue_supervisor": data.get("requeue_supervisor"),
             "supervisor_note": data.get("supervisor_note"),
+            # action=done: accept_slices (alias slices) must reach close_done,
+            # otherwise a parked slice can never be accepted explicitly.
+            "accept_slices": data.get("accept_slices"),
+            "slices": data.get("slices"),
+            "close_reason": data.get("close_reason"),
         }
 
     if jtype == "goal":
@@ -12285,9 +12290,12 @@ def _close_goal_as_done(
             # count it as a completed slice.
             accepted.append(sid)
             continue
-        if not _matched(sid) and _chain_is_supersedable_parked(chain):
-            # A parked sibling must not veto a done Goal. Supersede it (not
-            # PASS) and remember it; metrics stay PASS-only.
+        explicit_accept = bool(accept_set) and _matched(sid)
+        if not explicit_accept and _chain_is_supersedable_parked(chain):
+            # A parked slice must not veto a done Goal. Supersede it (not
+            # PASS) and remember it; metrics stay PASS-only. This also covers
+            # accept_slices empty (accept-all): parked slices are superseded,
+            # never silently promoted to PASS.
             if _mark_chain_superseded(
                 chain,
                 reason=f"goal_close_done:{reason}",
@@ -12295,7 +12303,9 @@ def _close_goal_as_done(
             ):
                 accepted.append(sid)
                 continue
-        if state not in ("escalated", "failed", "cancelled"):
+        if state not in ("escalated", "failed", "cancelled") and not (
+            explicit_accept and _chain_is_supersedable_parked(chain)
+        ):
             raise ValueError(
                 f"close_done: slice {sid} state={state or 'unknown'} is not terminal"
             )
@@ -12306,6 +12316,8 @@ def _close_goal_as_done(
         chain["state"] = VERDICT_PASS
         chain["last_verdict"] = VERDICT_PASS
         chain["error"] = ""
+        chain.pop("awaiting_reason", None)
+        chain.pop("max_rounds_decision_pending", None)
         chain["ops_close_done"] = True
         chain["salvage_note"] = (
             f"closed as PASS by goal-update action=done ({reason})"
@@ -12526,6 +12538,19 @@ def _run_goal_update_job_body(path: Path, job: dict) -> int:
     return 0
 
 
+_MAX_ROUNDS_PARK_REASONS = frozenset({"max_rounds", "max_rounds_split"})
+
+
+def _is_max_rounds_park(reason: str) -> bool:
+    return str(reason or "").strip() in _MAX_ROUNDS_PARK_REASONS
+
+
+def _is_wakeable_park_reason(reason: str) -> bool:
+    """paused_* and max_rounds* parks are woken the same way by goal-update."""
+    r = str(reason or "").strip()
+    return r in PS.PAUSE_KINDS or _is_max_rounds_park(r)
+
+
 def _parked_pause_chain(goal: dict) -> dict | None:
     """Last slice chain when it is parked awaiting a pause-kind supervisor decision."""
     slices = goal.get("slices") or []
@@ -12534,7 +12559,7 @@ def _parked_pause_chain(goal: dict) -> dict | None:
     chain = _read_chain(str(slices[-1]))
     if not chain or str(chain.get("state") or "") != "awaiting_supervisor":
         return None
-    if str(chain.get("awaiting_reason") or "") not in PS.PAUSE_KINDS:
+    if not _is_wakeable_park_reason(str(chain.get("awaiting_reason") or "")):
         return None
     return chain
 
@@ -12574,6 +12599,10 @@ def _requeue_parked_pause_supervisor(
         )
         return 0
     pause_kind = str(chain.get("awaiting_reason") or "")
+    if _is_max_rounds_park(pause_kind):
+        return _requeue_parked_max_rounds_supervisor(
+            goal, job, dest, chain, note=note, cap=cap, used=used
+        )
     rounds = chain.get("rounds") or []
     round_n = max(1, int(chain.get("awaiting_answer_for_round") or len(rounds) or 1))
     impl_ticket = _paused_impl_ticket(chain, slice_id, round_n)
@@ -12657,6 +12686,102 @@ def _requeue_parked_pause_supervisor(
         chain = _read_chain(slice_id) or chain
         return _dispatch_continue_same_rounds(chain_job, chain, dest, slice_id)
     return _settle_parent_goal_after_resume(goal_id, chain_job, slice_id, dest, rc)
+
+
+def _requeue_parked_max_rounds_supervisor(
+    goal: dict,
+    job: dict,
+    dest: Path,
+    chain: dict,
+    *,
+    note: str,
+    cap: int,
+    used: int,
+) -> int:
+    """Re-ask the max_rounds supervisor for a chain parked at max_rounds.
+
+    Same contract as the pause requeue: stays parked when the supervisor returns
+    nothing. A decision (inplace|split|escalate) is applied through the normal
+    chain-reply path (bonus guard, split closeout, escalate), with ``note``
+    carried into the answer so it lands in the reply pack.
+    """
+    goal_id = str(goal.get("goal"))
+    slice_id = str(chain["slice"])
+    pending = chain.get("max_rounds_decision_pending") or {}
+    rounds = chain.get("rounds") or []
+    round_n = int(
+        pending.get("round_n")
+        or chain.get("awaiting_answer_for_round")
+        or len(rounds)
+        or 1
+    )
+    max_rounds = int(chain.get("max_rounds") or pending.get("max_rounds") or 2)
+    findings = list(pending.get("findings") or goal.get("last_gate_findings") or [])
+    reason = str(pending.get("reason") or "max_rounds goal-update wake")
+    note = note.strip()
+    if note:
+        reason = f"{reason}\n\nOps/Hub note: {note}"
+    chain_job = {
+        "id": f"requeue-{slice_id}",
+        "type": "chain",
+        "slice": slice_id,
+        "goal": goal_id,
+        "cwd": goal.get("cwd") or chain.get("cwd") or "/workspace",
+        "supervisor_profile": goal.get("supervisor_profile"),
+        "auto_supervisor_answer": True,
+    }
+    goal["status"] = "running"
+    goal["resumed_at"] = _iso()
+    goal["last_requeue_supervisor"] = {
+        "at": _iso(), "pause_kind": chain.get("awaiting_reason"), "note": note[:500],
+    }
+    _write_goal(goal)
+    print(
+        f"[trial-broker] goal {goal_id} requeue supervisor slice={slice_id} "
+        f"max_rounds park={chain.get('awaiting_reason')} tickets={used}/{cap}",
+        flush=True,
+    )
+    try:
+        decision = auto_supervisor_max_rounds_decision(
+            chain_job,
+            chain,
+            round_n=round_n,
+            max_rounds=max_rounds,
+            findings=findings,
+            reason=reason[:4000],
+            goal=_read_goal(goal_id) or goal,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort; stay parked
+        print(f"[trial-broker] max_rounds requeue supervisor error: {e}", flush=True)
+        decision = None
+    if decision not in _MAX_ROUNDS_DECISIONS:
+        g2 = _read_goal(goal_id) or goal
+        g2["last_chain_state"] = "awaiting_supervisor"
+        g2["awaiting_reason"] = chain.get("awaiting_reason")
+        _write_goal(g2)
+        shutil.move(str(dest), str(OUTBOX / dest.name))
+        print(
+            f"[trial-broker] goal {goal_id} requeue: max_rounds supervisor "
+            f"decision empty; stays parked",
+            flush=True,
+        )
+        return 0
+    answer = f"Supervisor decision={decision} (goal-update wake)."
+    if note:
+        answer += f" {note}"
+    reply_path = INBOX / f"requeue-reply-{slice_id}.json"
+    reply_job = {
+        "id": f"requeue-reply-{slice_id}",
+        "type": "chain-reply",
+        "slice": slice_id,
+        "goal": goal_id,
+        "decision": decision,
+        "answer": answer,
+    }
+    reply_path.parent.mkdir(parents=True, exist_ok=True)
+    reply_path.write_text(json.dumps(reply_job, ensure_ascii=False), encoding="utf-8")
+    shutil.move(str(dest), str(OUTBOX / dest.name))
+    return run_chain_reply_job(reply_path, load_job(reply_path))
 
 
 def _resume_goal_chain(goal: dict) -> int:

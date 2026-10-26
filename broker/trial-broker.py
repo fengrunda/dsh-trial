@@ -118,6 +118,7 @@ from typing import Iterator
 from zoneinfo import ZoneInfo
 import threading
 import trial_lib as T
+_goal_supervisor_cap = T.goal_supervisor_cap  # bound at import; tests may mock T
 import pause_supervisor as PS
 import trial_mailbox as TM
 import gate_effort as GE
@@ -911,6 +912,8 @@ def load_job(path: Path) -> dict:
             "inplace_rework_max_findings": data.get("inplace_rework_max_findings"),
             "action": data.get("action"),
             "resume": bool(data.get("resume")),
+            "requeue_supervisor": data.get("requeue_supervisor"),
+            "supervisor_note": data.get("supervisor_note"),
         }
 
     if jtype == "goal":
@@ -5921,7 +5924,7 @@ def auto_supervisor_answer(job: dict, chain: dict, *, round_n: int, block: dict)
     """Wake dsh supervisor to answer foreman question; return answer text or None."""
     goal_id = job.get("goal") or chain.get("goal")
     goal = _read_goal(goal_id) if goal_id else None
-    max_sup = int((goal or {}).get("max_supervisor_tickets") or job.get("max_supervisor_tickets") or 8)
+    max_sup = _goal_supervisor_cap(goal, job)
     if goal and int(goal.get("supervisor_ticket_count") or 0) >= max_sup:
         print(f"[trial-broker] supervisor ticket cap {max_sup} reached", flush=True)
         return None
@@ -6246,11 +6249,7 @@ def auto_supervisor_max_rounds_decision(
     goal_id = job.get("goal") or chain.get("goal")
     if goal is None and goal_id:
         goal = _read_goal(goal_id)
-    max_sup = int(
-        (goal or {}).get("max_supervisor_tickets")
-        or job.get("max_supervisor_tickets")
-        or 8
-    )
+    max_sup = _goal_supervisor_cap(goal, job)
     if goal and int(goal.get("supervisor_ticket_count") or 0) >= max_sup:
         print(f"[trial-broker] supervisor ticket cap {max_sup} reached (max_rounds)", flush=True)
         return None
@@ -6350,11 +6349,7 @@ def auto_supervisor_pause_decision(
     goal_id = job.get("goal") or chain.get("goal")
     if goal is None and goal_id:
         goal = _read_goal(goal_id)
-    max_sup = int(
-        (goal or {}).get("max_supervisor_tickets")
-        or job.get("max_supervisor_tickets")
-        or 8
-    )
+    max_sup = _goal_supervisor_cap(goal, job)
     if goal and int(goal.get("supervisor_ticket_count") or 0) >= max_sup:
         print(f"[trial-broker] supervisor ticket cap {max_sup} reached (pause)", flush=True)
         return None
@@ -6567,11 +6562,7 @@ def auto_supervisor_machine_block_decision(
     goal_id = job.get("goal") or chain.get("goal")
     if goal is None and goal_id:
         goal = _read_goal(goal_id)
-    max_sup = int(
-        (goal or {}).get("max_supervisor_tickets")
-        or job.get("max_supervisor_tickets")
-        or 8
-    )
+    max_sup = _goal_supervisor_cap(goal, job)
     if goal and int(goal.get("supervisor_ticket_count") or 0) >= max_sup:
         print(f"[trial-broker] supervisor ticket cap {max_sup} reached (machine block)", flush=True)
         return None
@@ -6674,11 +6665,14 @@ def _resume_paused_impl_continue_same(
     timeout = base_timeout + add_timeout
     prompt_path = ARTIFACT_ROOT / f"{ticket or 'impl'}.continue-same-prompt.txt"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt_path.write_text(
+    sup_note = str(chain.pop("pause_supervisor_note", "") or "").strip()
+    prompt_text = (
         "按监理 continue_same 续跑原会话。勿重做已完成工作。"
-        "从停下的地方继续，做完按原 pack 交摘要。\n",
-        encoding="utf-8",
+        "从停下的地方继续，做完按原 pack 交摘要。\n"
     )
+    if sup_note:
+        prompt_text += f"监理指令（goal-update supervisor_note）：{sup_note[:2000]}\n"
+    prompt_path.write_text(prompt_text, encoding="utf-8")
     chain["last_continue_same"] = {
         "ticket": ticket,
         "resume": True,
@@ -7142,9 +7136,7 @@ def emit_split_followup(
             return _open_recorded_split_followup(
                 job, chain, g, spec, source=source, round_n=round_n,
             )
-    max_sup = int(
-        g.get("max_supervisor_tickets") or job.get("max_supervisor_tickets") or 8
-    )
+    max_sup = _goal_supervisor_cap(g, job)
     if int(g.get("supervisor_ticket_count") or 0) >= max_sup:
         print(
             f"[trial-broker] supervisor ticket cap {max_sup} reached (split)",
@@ -12484,6 +12476,14 @@ def _run_goal_update_job_body(path: Path, job: dict) -> int:
         _write_goal(goal)
         return _resume_goal_chain(goal)
 
+    # A raised supervisor-ticket cap (or requeue_supervisor=true) re-queues a
+    # chain parked at a pause kind because the cap was hit: ask the supervisor
+    # again, with an optional supervisor_note, instead of leaving it parked.
+    if _should_requeue_parked_pause(goal, job, bumped):
+        return _requeue_parked_pause_supervisor(
+            goal, job, dest, note=str(job.get("supervisor_note") or "")
+        )
+
     # failed is not a normal resume. Only a missing-summary false fail that
     # already has gate PASS may continue, and only onto slices that are not
     # already PASS. A real failure is rejected.
@@ -12524,6 +12524,139 @@ def _run_goal_update_job_body(path: Path, job: dict) -> int:
         flush=True,
     )
     return 0
+
+
+def _parked_pause_chain(goal: dict) -> dict | None:
+    """Last slice chain when it is parked awaiting a pause-kind supervisor decision."""
+    slices = goal.get("slices") or []
+    if not slices:
+        return None
+    chain = _read_chain(str(slices[-1]))
+    if not chain or str(chain.get("state") or "") != "awaiting_supervisor":
+        return None
+    if str(chain.get("awaiting_reason") or "") not in PS.PAUSE_KINDS:
+        return None
+    return chain
+
+
+def _should_requeue_parked_pause(goal: dict, job: dict, bumped: set) -> bool:
+    if str(goal.get("status") or "") not in ("running", "awaiting_supervisor", "paused"):
+        return False
+    if not (job.get("requeue_supervisor") or "max_supervisor_tickets" in bumped):
+        return False
+    return _parked_pause_chain(goal) is not None
+
+
+def _requeue_parked_pause_supervisor(
+    goal: dict, job: dict, dest: Path, *, note: str = ""
+) -> int:
+    """Re-ask the pause supervisor for a chain parked by the ticket cap.
+
+    Stays parked (no state change) when the cap is still reached or the
+    supervisor returns no decision. Otherwise applies the decision through the
+    normal pause router; ``continue_same`` re-enters the paused impl session
+    carrying ``note`` into its prompt.
+    """
+    goal_id = str(goal.get("goal"))
+    chain = _parked_pause_chain(goal)
+    if chain is None:
+        shutil.move(str(dest), str(OUTBOX / dest.name))
+        return 0
+    slice_id = str(chain["slice"])
+    cap = _goal_supervisor_cap(goal, job)
+    used = int(goal.get("supervisor_ticket_count") or 0)
+    if used >= cap:
+        shutil.move(str(dest), str(OUTBOX / dest.name))
+        print(
+            f"[trial-broker] goal {goal_id} requeue skipped: supervisor "
+            f"tickets {used} >= cap {cap}",
+            flush=True,
+        )
+        return 0
+    pause_kind = str(chain.get("awaiting_reason") or "")
+    rounds = chain.get("rounds") or []
+    round_n = max(1, int(chain.get("awaiting_answer_for_round") or len(rounds) or 1))
+    impl_ticket = _paused_impl_ticket(chain, slice_id, round_n)
+    pack_for_impl = str(chain.get("pending_impl_pack") or chain.get("pack") or "")
+    note = note.strip()
+    chain_job = {
+        "id": f"requeue-{slice_id}",
+        "type": "chain",
+        "slice": slice_id,
+        "pack": chain.get("pack"),
+        "acceptance": chain.get("acceptance"),
+        "profile": goal.get("profile") or chain.get("profile") or "acp-lite",
+        "gate_profile": chain.get("gate_profile") or goal.get("gate_profile") or goal.get("profile") or "acp-lite",
+        "cwd": goal.get("cwd") or chain.get("cwd") or "/workspace",
+        "max_rounds": int(chain.get("max_rounds") or goal.get("max_rounds") or 2),
+        "notify": goal.get("notify"),
+        "notify_dry_run": goal.get("notify_dry_run"),
+        "notify_prefix": goal.get("notify_prefix"),
+        "goal": goal_id,
+        "from_goal": True,
+        "auto_supervisor_answer": True,
+        "defer_supervisor_close": True,
+        "gate_policy": chain.get("gate_policy") or GE.GATE_POLICY_PER_SLICE,
+        "gate_grain": chain.get("gate_grain"),
+        "gate_deferred_slices": list(chain.get("gate_deferred_slices") or []),
+    }
+    if goal.get("supervisor_profile") is not None:
+        chain_job["supervisor_profile"] = goal.get("supervisor_profile")
+    goal["status"] = "running"
+    goal["resumed_at"] = _iso()
+    goal["last_requeue_supervisor"] = {
+        "at": _iso(), "pause_kind": pause_kind, "note": note[:500],
+    }
+    _write_goal(goal)
+    print(
+        f"[trial-broker] goal {goal_id} requeue supervisor slice={slice_id} "
+        f"pause_kind={pause_kind} tickets={used}/{cap}",
+        flush=True,
+    )
+    decision = auto_supervisor_pause_decision(
+        chain_job,
+        chain,
+        round_n=round_n,
+        pause_kind=pause_kind,
+        goal=_read_goal(goal_id) or goal,
+        notes=(note or "goal-update 追加监理额度后重新请监理收口")[:2000],
+        impl_ticket=impl_ticket,
+    )
+    if not decision:
+        # Still parked; keep chain/goal awaiting for a manual chain-reply.
+        chain = _read_chain(slice_id) or chain
+        chain["state"] = "awaiting_supervisor"
+        chain["awaiting_reason"] = pause_kind
+        _write_chain(chain)
+        g2 = _read_goal(goal_id) or goal
+        g2["last_chain_state"] = "awaiting_supervisor"
+        g2["awaiting_reason"] = pause_kind
+        _write_goal(g2)
+        shutil.move(str(dest), str(OUTBOX / dest.name))
+        print(
+            f"[trial-broker] goal {goal_id} requeue: supervisor decision empty; stays parked",
+            flush=True,
+        )
+        return 0
+    chain = _read_chain(slice_id) or chain
+    if note:
+        chain["pause_supervisor_note"] = note
+        _write_chain(chain)
+    rc = route_pause_decision(
+        chain_job,
+        chain,
+        dest,
+        decision=decision,
+        pause_kind=pause_kind,
+        round_n=round_n,
+        pack_for_impl=pack_for_impl,
+        goal_obj=_read_goal(goal_id) or goal,
+        impl_ticket=impl_ticket,
+    )
+    if rc == CONTINUE_SAME_INLINE:
+        chain = _read_chain(slice_id) or chain
+        return _dispatch_continue_same_rounds(chain_job, chain, dest, slice_id)
+    return _settle_parent_goal_after_resume(goal_id, chain_job, slice_id, dest, rc)
 
 
 def _resume_goal_chain(goal: dict) -> int:

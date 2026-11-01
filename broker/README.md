@@ -152,8 +152,20 @@ python3 ./broker/trial-watchdog.py --once --dry-run   # 只打印 payload，不�
    三选一 inplace(+1) / split / escalate。闸审触顶造成的 `blocked` 留在这条决策里。
 9. `split` 只收一个跟进片。pack 在磁盘上就追加到同一 Goal 并打开；没有新 pack 就停住，
    后面已经计划好的片也不跳过。
-10. 终态写 `thin-state/chains/<slice>.json` + outbox。终态 kind 才通知 Hub。
+10. 终态写 `thin-state/chains/<slice>.json` + outbox。终态 kind 才通知。
     过渡事件也进 outbox，kind 是过渡名。`notify_dry_run` 不发 webhook。
+
+### notify 路由
+
+`notify` 仍默认走 Hub。`hub` / `khub` / `true` / `1` / `yes` 的命令行与 webhook 跟以前一样（`khub-dsh-complete-notify.py` + `~/.dsh/supervisor/khub-complete-webhook.json` 或 `DSH_KHUB_COMPLETE_WEBHOOK_*`）。
+
+`notify: "excel"` 走另一条路由，**不**读、不改 hub 那份 webhook 文件。运行时配置（不进 git）是 `~/.dsh/supervisor/notify-routes.json`：
+
+```json
+{"version": 1, "routes": {"excel": {"url_env": "PI_CB_EXCEL_URL", "key_env": "PI_CB_EXCEL_KEY", "url": "https://example.invalid/excel"}}}
+```
+
+URL 先看 `url_env`，否则用 `url`。Key 先看 `key_env`，否则读 `box-secrets.json` 的 `card.<key_env>`，不会打进日志。也可以 `notify: ["hub", "excel"]` 按顺序各发一次。未知路由名只打日志并跳过，不会悄悄改发 hub。路由文件缺失时，excel 失败并写明缺文件。`DSH_NOTIFY_ROUTES` 可改这份路径（测试用）。
 
 读不懂的闸审摘要交给同一个 Goal 监理会话 `supervisor-goal-<id>`。提示词是 `supervisor-machine-block`（三选一 `rerun_gate` / `question` / `escalate`），不是暂停五选一。已经 `opened` 但还没有 `decision` 的停住链允许再交一次；写下 `decision`（含空字符串）或 `retry>=1` 之后不再交。看门狗仍不直接写 `escalated`。这条交接上已写下的 `pause_decision`/`continue_same` 按只重跑闸审执行，不再重问。
 
@@ -190,7 +202,7 @@ worktree 不要放进仓库目录里面。同一条分支不能检出两份。
 
 1. **永不**对 `broker-khub-prod` 跑 restart / resume / prompt。  
 2. 执行票 **禁止** `room_*` / join；本 broker 也不做房间 ensure。  
-3. 不打印 API key；完成 webhook 仅 job 显式 `notify: hub` 时才调。  
+3. 不打印 API key；完成 webhook 仅在 Goal/job 显式打开 `notify` 时调用（`hub` 走原 webhook，`excel` 等走 `notify-routes.json`）。  
 4. 角色间消息 **只**经 bounded pack/summary 文件，不经房间。
 
 ## Eager-offload 与 GC

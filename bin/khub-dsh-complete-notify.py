@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""POST a Hermes/dsh completion notice to Knowledge Hub 开发's webhook routine.
+"""POST a Hermes/dsh completion notice to a webhook.
 
-Auth: Authorization Bearer from env DSH_KHUB_COMPLETE_WEBHOOK_KEY, or
-/home/box/sand-data/box-secrets.json card.DSH_KHUB_COMPLETE_WEBHOOK_KEY.
-URL: --url, env DSH_KHUB_COMPLETE_WEBHOOK_URL, or config file
-(default /home/box/.dsh/supervisor/khub-complete-webhook.json).
+Hub (default, no --route, or --route hub/khub/true/1/yes):
+  Auth: Authorization Bearer from env DSH_KHUB_COMPLETE_WEBHOOK_KEY, or
+  /home/box/sand-data/box-secrets.json card.DSH_KHUB_COMPLETE_WEBHOOK_KEY.
+  URL: --url, env DSH_KHUB_COMPLETE_WEBHOOK_URL, or config file
+  (default /home/box/.dsh/supervisor/khub-complete-webhook.json).
+
+Named route (--route excel, any name other than the hub aliases):
+  URL and key come only from ~/.dsh/supervisor/notify-routes.json
+  (override with --routes-config or env DSH_NOTIFY_ROUTES).
+  URL: env <url_env>, else the route's url field.
+  Key: env <key_env>, else box-secrets card.<key_env>.
+  Does not read or write khub-complete-webhook.json and does not fall back
+  to the hub webhook.
 
 Never prints the secret.
 """
@@ -23,6 +32,8 @@ from pathlib import Path
 
 DEFAULT_CONFIG = Path("/home/box/.dsh/supervisor/khub-complete-webhook.json")
 BOX_SECRETS = Path("/home/box/sand-data/box-secrets.json")
+# Hub aliases keep the legacy webhook path. They are not entries in notify-routes.json.
+HUB_ROUTE_NAMES = frozenset({"hub", "khub", "true", "1", "yes"})
 
 # Board-refresh hook (fire-and-forget). The refresh script itself is never run
 # for real by unit tests: tests point DSH_BOARD_REFRESH_BIN at a stub/fake.
@@ -73,6 +84,100 @@ def _load_key() -> str:
     raise SystemExit(
         "missing DSH_KHUB_COMPLETE_WEBHOOK_KEY "
         "(env or box-secrets card.DSH_KHUB_COMPLETE_WEBHOOK_KEY)"
+    )
+
+
+def _routes_path(explicit: str) -> Path:
+    """notify-routes.json: --routes-config, else DSH_NOTIFY_ROUTES, else ~/.dsh/supervisor/."""
+    raw = (explicit or "").strip()
+    if not raw:
+        raw = (os.environ.get("DSH_NOTIFY_ROUTES") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".dsh" / "supervisor" / "notify-routes.json"
+
+
+def _route_spec(route: str, path: Path) -> dict:
+    """Load one named route. Never falls back to the hub webhook."""
+    if not path.is_file():
+        raise SystemExit(
+            f"notify route {route!r}: routes file missing: {path} "
+            f"(refusing to fall back to hub webhook)"
+        )
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(
+            f"notify route {route!r}: failed reading {path}: {e} "
+            f"(refusing to fall back to hub webhook)"
+        ) from e
+    if not isinstance(doc, dict):
+        raise SystemExit(
+            f"notify route {route!r}: {path} must be a JSON object "
+            f"(refusing to fall back to hub webhook)"
+        )
+    routes = doc.get("routes")
+    if not isinstance(routes, dict):
+        raise SystemExit(
+            f"notify route {route!r}: no routes object in {path} "
+            f"(refusing to fall back to hub webhook)"
+        )
+    spec = routes.get(route)
+    if not isinstance(spec, dict):
+        for key, val in routes.items():
+            if str(key).strip().lower() == route and isinstance(val, dict):
+                spec = val
+                break
+        else:
+            known = ", ".join(sorted(str(k) for k in routes)) or "(none)"
+            raise SystemExit(
+                f"notify route {route!r}: unknown route in {path} (known: {known}); "
+                f"refusing to fall back to hub webhook"
+            )
+    return spec
+
+
+def _load_route_url(route: str, path: Path, url_override: str) -> tuple[dict, str]:
+    """Resolve a named route's URL. ``--url`` wins; hub env/config are not consulted."""
+    spec = _route_spec(route, path)
+    override = (url_override or "").strip()
+    if override:
+        return spec, override
+    url_env = str(spec.get("url_env") or "").strip()
+    url = (os.environ.get(url_env) or "").strip() if url_env else ""
+    if not url:
+        url = str(spec.get("url") or "").strip()
+    if not url:
+        hint = url_env or "url_env"
+        raise SystemExit(
+            f"notify route {route!r}: missing url "
+            f"(set {hint} or routes.{route}.url in {path})"
+        )
+    return spec, url
+
+
+def _load_route_key(route: str, spec: dict) -> str:
+    """Key from ``key_env``, else box-secrets ``card.<key_env>``. Never prints the secret."""
+    key_env = str(spec.get("key_env") or "").strip()
+    if not key_env:
+        raise SystemExit(f"notify route {route!r}: missing key_env in route spec")
+    key = (os.environ.get(key_env) or "").strip()
+    if key:
+        return key
+    if BOX_SECRETS.is_file():
+        try:
+            card = json.loads(BOX_SECRETS.read_text(encoding="utf-8")).get("card") or {}
+            found = card.get(key_env)
+            key = (found or "").strip() if isinstance(found, str) else ""
+            if key:
+                return key
+        except (OSError, json.JSONDecodeError) as e:
+            raise SystemExit(
+                f"notify route {route!r}: failed reading box-secrets: {e}"
+            ) from e
+    raise SystemExit(
+        f"notify route {route!r}: missing key "
+        f"(env {key_env} or box-secrets card.{key_env})"
     )
 
 
@@ -285,6 +390,16 @@ def main() -> int:
     ap.add_argument("--json-body", default="", help="raw JSON object string (replaces built payload)")
     ap.add_argument("--dry-run", action="store_true", help="print payload only (no secret)")
     ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument(
+        "--route",
+        default="",
+        help="named route in notify-routes.json; hub/khub/true/1/yes keep the hub webhook",
+    )
+    ap.add_argument(
+        "--routes-config",
+        default="",
+        help="override ~/.dsh/supervisor/notify-routes.json (or env DSH_NOTIFY_ROUTES)",
+    )
     args = ap.parse_args()
 
     if args.json_body:
@@ -306,18 +421,34 @@ def main() -> int:
         # drop nulls for cleaner body
         payload = {k: v for k, v in payload.items() if v is not None}
 
-    url = _load_url(args)
+    route_name = (args.route or "").strip().lower()
+    use_route = bool(route_name) and route_name not in HUB_ROUTE_NAMES
+    route_spec: dict | None = None
+    if use_route:
+        # Named routes never consult the hub webhook env or khub-complete-webhook.json.
+        route_spec, url = _load_route_url(route_name, _routes_path(args.routes_config), args.url or "")
+    else:
+        url = _load_url(args)
+
+    meta = _payload_meta(payload)
+    if use_route:
+        meta = {**meta, "route": route_name}
 
     if args.dry_run:
         print(json.dumps({"url": url, "payload": payload}, ensure_ascii=False, indent=2))
-        append_send_log(_log_rec(_payload_meta(payload), "dry_run", None, 0, True, None))
+        append_send_log(_log_rec(meta, "dry_run", None, 0, True, None))
         return 0
 
     # Async, best-effort: kick the board refresh off *before* the webhook so it
-    # happens whether or not this notification succeeds.
-    _maybe_refresh_board(payload)
+    # happens whether or not this notification succeeds. Named routes (excel, …)
+    # do not touch the hub board.
+    if not use_route:
+        _maybe_refresh_board(payload)
 
-    key = _load_key()
+    if use_route:
+        key = _load_route_key(route_name, route_spec or {})
+    else:
+        key = _load_key()
     # Accept either raw token or already "Bearer …"
     auth = key if key.lower().startswith("bearer ") else f"Bearer {key}"
 
@@ -327,7 +458,7 @@ def main() -> int:
         "Authorization": auth,
         "User-Agent": "khub-dsh-complete-notify/0.1",
     }
-    return send_with_retry(url, data, headers, args.timeout, _payload_meta(payload))
+    return send_with_retry(url, data, headers, args.timeout, meta)
 
 
 if __name__ == "__main__":

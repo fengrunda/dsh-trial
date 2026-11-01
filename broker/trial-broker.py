@@ -1056,10 +1056,11 @@ def quarantine_inbox_reject(path: Path, reason: str, *, raw: dict | None = None)
     }
     notify_result: dict | None = None
     try:
-        notify_result = maybe_notify_hub(
+        pairs = _send_notify_routes(
             job,
             {"status": "failed"},
             {"ticket": job["id"]},
+            _expand_notify_targets(job.get("notify")),
             kind="dsh-trial-inbox-reject",
             extra_summary=f"inbox reject file={name} reason={reason}",
             payload_extra={
@@ -1068,6 +1069,15 @@ def quarantine_inbox_reject(path: Path, reason: str, *, raw: dict | None = None)
                 "suggested_action": "fix inbox JSON (e.g. add type:goal / ticket+pack) and re-drop",
             },
         )
+        if len(pairs) == 1:
+            notify_result = pairs[0][1]
+        elif pairs:
+            notify_result = {
+                "sent": all(info.get("sent") for _, info in pairs),
+                "routes": {route_name: info for route_name, info in pairs},
+            }
+        else:
+            notify_result = {"sent": False, "detail": "no notify route"}
         if not (isinstance(notify_result, dict) and notify_result.get("sent")):
             print(
                 f"[trial-broker] quarantine notify not sent kind=dsh-trial-inbox-reject file={name}",
@@ -1888,8 +1898,8 @@ def _notify_goal_event(
     ``suggested_action`` (structured json-body) so the webhook routine and
     ``khub-dsh-complete-notify.py`` can act without scraping the summary.
     """
-    notify = str(goal.get("notify") or "").strip().lower()
-    if notify not in ("hub", "khub", "true", "1", "yes"):
+    targets = _expand_notify_targets(goal.get("notify"))
+    if not targets:
         return
     job = {
         "notify": goal.get("notify"),
@@ -1937,13 +1947,16 @@ def _notify_goal_event(
     payload_extra = {"reason": reason, "suggested_action": suggested_action}
     if isinstance(extra, dict):
         payload_extra["extra"] = extra
-    info = maybe_notify_hub(
-        job, out_body, result, kind=kind, extra_summary=summary,
-        payload_extra=payload_extra,
+    pairs = _send_notify_routes(
+        job, out_body, result, targets,
+        kind=kind, extra_summary=summary, payload_extra=payload_extra,
     )
-    goal.setdefault("metrics", T.empty_metrics()).setdefault("notify_events", []).append({
-        "at": _iso(), "kind": kind, "info": info,
-    })
+    events = goal.setdefault("metrics", T.empty_metrics()).setdefault("notify_events", [])
+    for name, info in pairs:
+        rec = {"at": _iso(), "kind": kind, "info": info}
+        if name != "hub":
+            rec["route"] = name
+        events.append(rec)
     _write_goal(goal)
 
 
@@ -1967,13 +1980,19 @@ def _notify_awaiting_hub(
     push a ``chain-reply``. Never raises.
     """
     try:
-        notify = ""
+        raw_notify = None
         for src in (job, goal, chain):
-            if isinstance(src, dict) and src.get("notify"):
-                notify = str(src.get("notify")).strip().lower()
-                if notify:
-                    break
-        if notify not in ("hub", "khub", "true", "1", "yes"):
+            if not isinstance(src, dict):
+                continue
+            candidate = src.get("notify")
+            # Same truthiness as the old hub-alias check: 0 / "" / false / []
+            # fall through to the next source (goal, then chain).
+            if not candidate:
+                continue
+            raw_notify = candidate
+            break
+        targets = _expand_notify_targets(raw_notify)
+        if not targets:
             return None
 
         job = job if isinstance(job, dict) else {}
@@ -2043,28 +2062,39 @@ def _notify_awaiting_hub(
             "composition": None,
             "assert_clean": True,
         }
-        info = maybe_notify_hub(
+        pairs = _send_notify_routes(
             notify_job,
             out_body,
             result,
+            targets,
             kind=AWAITING_HUB_NOTIFY_KIND,
             extra_summary=summary,
             payload_extra=payload_extra,
         )
         if goal and goal.get("goal"):
-            goal.setdefault("metrics", T.empty_metrics()).setdefault(
+            events = goal.setdefault("metrics", T.empty_metrics()).setdefault(
                 "notify_events", []
-            ).append({
-                "at": _iso(),
-                "kind": AWAITING_HUB_NOTIFY_KIND,
-                "info": {
-                    "reason": reason,
-                    "slice": slice_id,
-                    "sent": (info or {}).get("sent"),
-                },
-            })
+            )
+            for name, info in pairs:
+                rec = {
+                    "at": _iso(),
+                    "kind": AWAITING_HUB_NOTIFY_KIND,
+                    "info": {
+                        "reason": reason,
+                        "slice": slice_id,
+                        "sent": info.get("sent"),
+                    },
+                }
+                if name != "hub":
+                    rec["route"] = name
+                events.append(rec)
             _write_goal(goal)
-        return info
+        if len(pairs) == 1:
+            return pairs[0][1]
+        return {
+            "sent": all(info.get("sent") for _, info in pairs),
+            "routes": {name: info for name, info in pairs},
+        }
     except Exception as e:  # never block the chain on a notify failure
         print(f"[trial-broker] awaiting-hub notify failed: {e}", flush=True)
         return None
@@ -4365,6 +4395,121 @@ def _peak_prompt(csv_path):
         return (None, 0)
 
 
+_HUB_NOTIFY_ALIASES = frozenset({"hub", "khub", "true", "1", "yes"})
+_NOTIFY_DISABLED = frozenset({"0", "false", "no", "off", "none", "null"})
+
+
+def _notify_routes_file() -> Path:
+    """Runtime route table. Not the hub webhook file."""
+    raw = (os.environ.get("DSH_NOTIFY_ROUTES") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".dsh" / "supervisor" / "notify-routes.json"
+
+
+def _configured_notify_routes(path: Path) -> set[str] | None:
+    """Names in notify-routes.json.
+
+    ``None`` means the file is missing or unreadable. Callers still attempt the
+    named route so the notify script can fail clearly instead of falling back
+    to the hub webhook.
+    """
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[trial-broker] notify routes file unreadable {path}: {e}", flush=True)
+        return None
+    routes = doc.get("routes") if isinstance(doc, dict) else None
+    if not isinstance(routes, dict):
+        return set()
+    return {str(k).strip().lower() for k in routes.keys() if str(k).strip()}
+
+
+def _notify_tokens(notify) -> list[str]:
+    """Flatten a Goal/job ``notify`` value into route tokens."""
+    if notify is None or notify is False:
+        return []
+    if notify is True:
+        return ["hub"]
+    if isinstance(notify, bool):
+        return []
+    if isinstance(notify, int):
+        return _notify_tokens(str(notify))
+    if isinstance(notify, str):
+        token = notify.strip().lower()
+        if not token or token in _NOTIFY_DISABLED:
+            return []
+        return ["hub" if token in _HUB_NOTIFY_ALIASES else token]
+    if isinstance(notify, (list, tuple)):
+        out: list[str] = []
+        for item in notify:
+            out.extend(_notify_tokens(item))
+        return out
+    print(
+        f"[trial-broker] notify value type {type(notify).__name__} ignored",
+        flush=True,
+    )
+    return []
+
+
+def _expand_notify_targets(notify) -> list[str]:
+    """Route names to send, in order. Hub aliases collapse to ``hub``.
+
+    A name absent from an existing notify-routes.json is skipped and logged.
+    A missing routes file keeps the name so the sender reports a clear error.
+    Unknown names never fall back to hub. Duplicate names are sent once.
+    """
+    tokens = _notify_tokens(notify)
+    if not tokens:
+        return []
+    configured: set[str] | None = None
+    loaded = False
+    out: list[str] = []
+    seen: set[str] = set()
+    path = _notify_routes_file()
+    for name in tokens:
+        if name in seen:
+            continue
+        if name != "hub":
+            if not loaded:
+                configured = _configured_notify_routes(path)
+                loaded = True
+            if configured is not None and name not in configured:
+                print(
+                    f"[trial-broker] notify route {name!r} unknown; skip "
+                    f"(file {path}; not falling back to hub)",
+                    flush=True,
+                )
+                seen.add(name)
+                continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _send_notify_routes(job, out_body, result, targets: list[str], **kwargs):
+    """Send one notice per target. ``hub`` omits ``--route`` (legacy argv)."""
+    sent: list[tuple[str, dict]] = []
+    for name in targets:
+        call_kw = dict(kwargs)
+        if name != "hub":
+            call_kw["route"] = name
+        info = maybe_notify_hub(job, out_body, result, **call_kw)
+        if not isinstance(info, dict):
+            info = {"sent": False, "detail": str(info), "kind": kwargs.get("kind")}
+        if name != "hub" and not info.get("sent"):
+            detail = str(info.get("detail") or info.get("error") or "")
+            print(
+                f"[trial-broker] notify route {name!r} failed "
+                f"kind={kwargs.get('kind')}: {detail[-300:]}",
+                flush=True,
+            )
+        sent.append((name, info))
+    return sent
+
+
 def maybe_notify_hub(
     job,
     out_body,
@@ -4373,6 +4518,7 @@ def maybe_notify_hub(
     kind: str = "dsh-trial-complete",
     extra_summary: str = "",
     payload_extra: dict | None = None,
+    route: str | None = None,
 ):
     ticket = result.get("ticket") or job.get("ticket") or job.get("slice") or job.get("id")
     peak, steps = _peak_prompt(result.get("composition") or "")
@@ -4446,6 +4592,11 @@ def maybe_notify_hub(
         ]
         if str(job.get("notify_dry_run") or "").lower() in ("true", "1", "yes"):
             cmd.append("--dry-run")
+    route_name = str(route or "").strip().lower()
+    if route_name in _HUB_NOTIFY_ALIASES:
+        route_name = ""
+    if route_name:
+        cmd.extend(["--route", route_name])
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         return {
@@ -4577,22 +4728,30 @@ def dispatch_event(
         "slice": event["slice"],
     }
     try:
-        maybe_notify_hub(
-            notify_job,
-            out_body,
-            {"ticket": event["slice"] or event["goal"] or event["kind"]},
-            kind=event["kind"],
-            extra_summary=(
+        notify_kwargs = {
+            "kind": event["kind"],
+            "extra_summary": (
                 f"dsh-trial-event kind={event['kind']} goal={event['goal']} "
                 f"slice={event['slice']} decision={body['decision']}"
             ),
-            payload_extra={
+            "payload_extra": {
                 "goal": event["goal"],
                 "slice": event["slice"],
                 "decision": body["decision"],
                 "reason": event.get("reason") or body["decision"],
             },
-        )
+        }
+        ticket = {"ticket": event["slice"] or event["goal"] or event["kind"]}
+        # No explicit route (unset / off): keep the historical single hub POST.
+        # An explicit name is resolved; unknown names are skipped, not sent to hub.
+        if not _notify_tokens(notify_job.get("notify")):
+            maybe_notify_hub(notify_job, out_body, ticket, **notify_kwargs)
+        else:
+            _send_notify_routes(
+                notify_job, out_body, ticket,
+                _expand_notify_targets(notify_job.get("notify")),
+                **notify_kwargs,
+            )
     except Exception as e:  # noqa: BLE001 — outbox already landed
         print(f"[trial-broker] event notify failed: {e}", flush=True)
     return action
@@ -11990,13 +12149,17 @@ def run_ticket_job(path: Path, job: dict) -> int:
     }
     if reason:
         out_body["reason"] = reason
-    notify = str(job.get("notify") or "").strip().lower()
-    if notify in ("hub", "khub", "true", "1", "yes"):
+    targets = _expand_notify_targets(job.get("notify"))
+    if targets:
         if goal_id:
             # Decision D: a mapped Goal terminal is the single Hub wake.
             out_body["notify_skipped_reason"] = "goal_terminal_notify"
         else:
-            out_body["notify"] = maybe_notify_hub(job, out_body, result)
+            pairs = _send_notify_routes(job, out_body, result, targets)
+            if len(pairs) == 1:
+                out_body["notify"] = pairs[0][1]
+            elif pairs:
+                out_body["notify"] = [info for _, info in pairs]
     out_path.write_text(json.dumps(out_body, ensure_ascii=False, indent=2) + "\n")
     maybe_offload_gc(force=True)
 

@@ -181,7 +181,8 @@ python3 /workspace/dsh-trial/broker/trial-broker.py --status
 | 增量 | `trial-broker.py --events-since <cursor.json>`（`--peek` 不前移） |
 
 2026-10-22 起的自动循环（blocked 先问监理、触顶复用 `supervisor-goal-<id>`、split 打开一个跟进片、暂停五选一）以 [broker/README.md](../broker/README.md) 为准。本节上面的「监理是 Hub Bot」是 2026-09-24 的旧写法。使用方投 Goal，不写 pack，不回答 question。
-| 通知 | `notify: "hub"` → kind `dsh-trial-chain`（可用 `notify_dry_run`） |
+
+通知：`notify: "hub"`（以及 `khub` / `true` / `1` / `yes`）仍走 `khub-dsh-complete-notify.py` 和 `~/.dsh/supervisor/khub-complete-webhook.json`。`notify: "excel"` 只读 `~/.dsh/supervisor/notify-routes.json` 里的 `excel`（`url_env` / `key_env`，key 也可落在 `box-secrets.json` 的 `card.<key_env>`），不读、不改 hub webhook 文件。`notify: ["hub","excel"]` 按顺序各发一次。未知路由名打日志后跳过，不回落 hub。`notify_dry_run: true` 只打印 payload。详见 [broker/README.md](../broker/README.md) 的「notify 路由」。
 
 示例：`/workspace/dsh-trial/broker/examples/job-chain-scratch.json`  
 烟雾仓：`/workspace/dsh-trial/scratch-repo`（勿 push）。  

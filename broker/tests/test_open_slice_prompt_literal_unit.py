@@ -209,17 +209,61 @@ def test_foreman_prompt_interpolates_cwd(sb: Sandbox):
 
 
 def test_gate_prompt_carries_the_review_caliber(sb: Sandbox):
-    # The 5-line caliber is frozen in broker GATE_PRINCIPLES_BLOCK; the shell
+    # Evidence caliber is frozen in broker GATE_PRINCIPLES_BLOCK; the shell
     # path must render the same keywords (heading appears exactly once).
     proc = sb.run_print_prompt("gate")
     assert proc.returncode == 0, proc.stderr
     out = proc.stdout
-    for kw in ("P0–P1", "P2", "只读复核", "paused_limit", "28 步"):
+    for kw in (
+        "TDD 证据",
+        "实证运行",
+        "猜测性风险",
+        "不判 HOLD",
+        "禁止要求",
+        "兜底",
+        "摘要 + 失败用例",
+        "日志落盘",
+        "paused_limit",
+        "28 步",
+        "env_blocked",
+    ):
         assert kw in out, kw
     assert out.count("## 审核原则") == 1
+    assert "## 测试口径" in out
+    assert "设计对齐 / P0–P1" not in out
+    assert "只读复核" not in out
     # paused_limit summaries must carry the two step keys (r2 P1)
     assert '"used_steps"' in out, out
     assert '"remaining"' in out, out
+
+
+def test_foreman_prompt_requires_tdd_red_green_and_real_run(sb: Sandbox):
+    proc = sb.run_print_prompt("foreman")
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout
+    assert "先红后绿" in out or ("先" in out and "跑出红" in out and "到绿" in out)
+    assert "tdd_red" in out and "tdd_green" in out and "run_evidence" in out
+    assert "真实运行" in out
+    assert "不得为过审" in out and "兜底" in out
+    assert "摘要 + 失败用例" in out and "日志落盘" in out
+    assert "不跑全量" in out
+
+
+def test_supervisor_prompts_align_evidence_caliber(sb: Sandbox):
+    plan = sb.run_print_prompt("supervisor-plan")
+    assert plan.returncode == 0, plan.stderr
+    assert "测试 path" in plan.stdout
+    assert "运行验证" in plan.stdout
+    assert "全量回归" in plan.stdout
+    assert "兜底" in plan.stdout
+    answer = sb.run_print_prompt("supervisor-answer")
+    assert answer.returncode == 0, answer.stderr
+    assert "兜底" in answer.stdout
+    assert "猜测性风险" in answer.stdout
+    close = sb.run_print_prompt("supervisor-close")
+    assert close.returncode == 0, close.stderr
+    assert "全量回归" in close.stdout
+    assert "猜测性风险" in close.stdout
 
 
 @pytest.mark.parametrize("mode", MODES)

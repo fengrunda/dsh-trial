@@ -226,9 +226,10 @@ trial-broker 在**每 job 结束**与**空闲轮询（≥1h）**时调用 GC（`
 
 ## Gate 硬规则
 
-- 任一 acceptance 未满足，或 findings 含 **P0/P1** ⇒ **HOLD**（即便模型写 PASS，broker `enforce_gate_verdict` 会覆盖）。  
+- 提示词口径（2026-11-06）：审查 = 证据核对。只核 TDD 证据（先红后绿且钉住 Done when）、实证运行覆盖验收点、符合 pack/设计与 Forbidden 且未越界。猜测性风险无红测或可复现步骤只记 note，不判 HOLD；禁止要求工头加没有测试支撑的兜底分支。环境类失败写 `status=env_blocked`。
+- 状态机未改：任一 unmet_acceptance，或 findings 含 **P0/P1** ⇒ **HOLD**（即便模型写 PASS，broker `enforce_gate_verdict` 会覆盖）。提示词要求只把上述三类证据问题写成 P0/P1 或 unmet_acceptance。  
 - 仅 P2 ⇒ 允许 PASS。  
-- 机器块建议含 `unmet_acceptance` 列表。
+- 机器块建议含 `unmet_acceptance` 列表。约 28 步未定论仍写 `paused_limit`（`used_steps` / `remaining`）。
 
 ## Gate 推理档位分级
 
@@ -237,12 +238,14 @@ trial-broker 在**每 job 结束**与**空闲轮询（≥1h）**时调用 GC（`
 - 分级由 `broker/gate_effort.py` 在 `open-slice.sh` 里对每张票热生效（无需重启 broker），只影响 gate 票且未显式传 `--reasoning-effort` 时。
 - `DSH_GATE_TIERING=0` 关闭分级；介质档位注意：适配器只认 off/low/high/max，`medium` 实际等于 `high`，故 medium risk 取 `low`。
 
-## 三层测试口径（定点优先；全量交 CI）
+## 测试口径（L1 定点；全量仅合入前）
 
-- slice pack frontmatter 用 `tests:`（或 `test_paths:`）列定点测试 path；正文里反引号包住的 `pytest …` / `python3 -m pytest …` 命令也会被原样收集。
-- 只有跨模块改动或切 tip 前才写 `full_suite: true`：按测试所在目录分批 `python3 -m pytest -q <dir>`，失败不阻断后续批次；日常 slice 不要写。
-- 都没写时兜底：gate 按 pack diff 里的改动文件映射 `test_<stem>*.py` / `<stem>_test.py`，找不到则「无对应测试，不跑测试，只读审查」；foreman 输出按改动文件找对应测试的规则，找不到写 `no_targeted_tests`。
-- 逻辑在 `broker/pytest_scope.py`，由 `open-slice.sh` 对每张 foreman/gate 票热注入（只需重跑脚本，无需重启 broker）；`DSH_TEST_POLICY=0` 关闭。
+- 工头按 TDD：先写/改测试跑红，再改实现到绿，并做一次真实运行验证覆盖 Done when。只跑本片新写测试 + 直接受影响测试文件（L1），绿了就停。
+- slice pack frontmatter 用 `tests:`（或 `test_paths:`）列这些测试 path；正文里反引号包住的 `pytest …` / `python3 -m pytest …` 命令也会被原样收集。Done when 应写相关测试 path 与运行验证方式。
+- 全量回归只在合入前由监理按批次跑一次：那时才写 `full_suite: true`（按目录分批 `python3 -m pytest -q <dir>`，失败不阻断后续批次）。日常 slice 不要写。
+- 都没写时兜底：gate 按 pack diff 映射 `test_<stem>*.py` / `<stem>_test.py`，找不到则「无对应测试，不跑测试」（缺 TDD 证据按审核原则记 HOLD，不做静态挑刺）；foreman 要求先写测试跑红，不要用 `no_targeted_tests` 跳过。
+- 测试输出只回传摘要 + 失败用例；完整日志落盘（如 `<cwd>/.dsh-test-logs/<ticket>-<n>.log`），对话里只留路径。
+- 逻辑在 `broker/pytest_scope.py`，由 `open-slice.sh` 对每张 foreman/gate 票热注入（只需重跑脚本，无需重启 broker）；`DSH_TEST_POLICY=0` 关闭。审核原则块同样由 `open-slice.sh` 每票现读。
 
 ## 验收
 

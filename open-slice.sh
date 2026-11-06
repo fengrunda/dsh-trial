@@ -195,9 +195,16 @@ build_prompt_foreman() {
 - 若收到 `[step-budget] …硬阈值` 或工具被拦截：立即写 summary，`status=paused_limit`，notes 写清已用步数与剩余工作；**不要**继续探索。墙钟超时同理可用 `paused_wallclock`。broker 会交监理五选一（继续/新开/收尾/拆分/升级），不会机械 closeout。
 - 大工具输出已由 eager-offload 裁剪：优先 offset/limit 读所需片段，不要为「看全量」空转。
 
+## TDD 与实证运行（强制；先红后绿）
+- 按 TDD：先写/改测试并跑出红（记录 FAIL 命令与失败用例），再改实现到绿（记录 PASS）。然后做一次真实运行验证（拉起程序/接口/页面，留命令输出或响应或日志路径）覆盖 Done when 验收点。
+- 只跑本片新写测试 + 直接受影响测试文件（L1），绿了就停，不跑全量。
+- 不得为过审加没有测试撑着的防御性兜底分支。
+- 测试只回传摘要 + 失败用例；完整日志落盘（如 `<artifact或cwd>/.dsh-test-logs/<ticket>-<n>.log` 或现有 artifact 目录），对话/摘要里只留路径。例如 `pytest -q ... > log 2>&1; tail -n 30 log`，或 `-rf` 只列失败。
+- 机器块可写可选键 `tdd_red` / `tdd_green` / `run_evidence`（broker 解析不强制这三键）。
+
 ## 强制步骤：
 1. design_pack_read path=「@@PACK_BASENAME@@」。
-2. 按 pack 的 Done when / Steps 做最少必要改动（可用 edit/write/bash 做 git 与文件；禁止 room_*）。
+2. 按 pack 的 Done when / Steps 做最少必要改动（可用 edit/write/bash 做 git 与文件；禁止 room_*）。先红后绿，再做真实运行验证。
 3. **仅当**歧义真实影响 Done-when：调 `ask_supervisor`；**超时/失败**（timed_out / degrade）时不要干等，写 summary status=question，并把同样的问题放进 questions。
 4. 改完**先**把关票摘要（含机器块，status=done）按第 5 步格式写到「@@SUMMARY_OUT@@」，**再**调 `submit_for_review`（务必带 usage_prompt；summary 未落盘/为空会被 broker 直接退回，不启动 gate、不计轮次）：
    - 返回 PASS → 确认摘要为最终版后停止。
@@ -215,6 +222,9 @@ build_prompt_foreman() {
   "base": "diff 基 sha 或空（改动前）",
   "questions": ["若 status=question 时的问题"],
   "notes": "一两句；fresh 交接必须含 rework_fresh",
+  "tdd_red": "可选。FAIL 命令、失败用例与日志路径",
+  "tdd_green": "可选。PASS 命令与日志路径",
+  "run_evidence": "可选。真实运行的命令输出、响应或日志路径，覆盖 Done when",
   "finding_resolutions": [
     {"finding": "…或 tier+issue 摘要", "change": "file:line 或路径+符号", "status": "fixed|deferred|wontfix", "reason": "未改时必填"}
   ]
@@ -241,20 +251,22 @@ build_prompt_gate() {
   local _tpl
   _tpl="$(cat <<'PROMPT'
 你是 Route C 设计审查中票（gate / design-gate 风格）。**禁止 join 任何 team-room**，禁止一切 room_*。
-本票只读审查：对照 pack 内 acceptance + 工头摘要 + diff，做 **delta-only / 分层** 审查。不要改业务源码。
+本票只做证据核对：对照 pack 内 acceptance + 工头摘要（含 TDD 红绿与实证运行记录）+ diff。不要改业务源码。不要做没有测试或复现步骤的静态风险挑刺。
 
-## 裁决硬规则（必须遵守；broker 会二次强制）
-- **任一 acceptance 条目未满足** → verdict 必须 **HOLD**（写入 unmet_acceptance）。
-- **任一 P0 或 P1 finding** → verdict 必须 **HOLD**。
-- **仅有 P2 nits、且全部 acceptance 满足** → **PASS**（P2 仍写入 findings）。
-- 禁止「口头 PASS 但 findings 含 P0/P1」；禁止把缺测/缺边界当成 P2。
+## 裁决硬规则（必须遵守；细则见文末「审核原则」）
+- 只核三件事：(a) TDD 证据：本片测试先红后绿且钉住 Done when；(b) 实证运行证据覆盖验收点；(c) 符合 pack/设计与 Forbidden、未越界。
+- HOLD 只有三类，并写入 unmet_acceptance 或 P0/P1（须附证据）：缺测试或未先红/未绿；缺运行证据或不覆盖验收点；偏离设计/越界/安全数据风险。
+- 猜测性风险（「可能空指针」「可能并发乱序」等）必须附能跑红的测试或可复现步骤，否则只记 note，不判 HOLD、不进返工。
+- minor/P2 判 PASS 附备注。禁止要求工头加没有测试支撑的兜底分支。
+- 不重跑工头已跑绿的测试，只核记录；记录缺失时才补跑一次定点测试。只看增量；复审只核上轮未过项。
+- 环境类失败（依赖缺失、端口、超时、内存闸、上游 LLM/网络）→ status=env_blocked，不判 HOLD。不要把环境失败记成 P0/P1 或 unmet_acceptance。
 
 强制步骤：
 1. design_pack_read path=「@@PACK_BASENAME@@」（gate pack：原 pack 引用、acceptance、工头摘要、diff）。
-2. 只审 delta；逐条对照 acceptance，列出 unmet_acceptance。
+2. 只审 delta；逐条对照 acceptance 是否有 TDD 证据与实证运行覆盖，列出 unmet_acceptance。
    若本 pack 是 **delta / fix pack**（含 prior_findings 或前轮 findings）：
-   **只复审** ① 上轮 prior findings 是否已修，② 新 diff 是否引入回归；**不要**重审整仓或重复提出已修项。
-3. Findings 分层：P0 阻塞 / P1 应修（含缺单测、缺 acceptance 要求的边界）/ P2 nits。
+   **只复审** ① 上轮未过项是否已修，② 新 diff 是否破坏 TDD/运行证据或越界；**不要**重审整仓或重复提出已修项。
+3. 只有上述三类 HOLD 才写 P0/P1；猜测性风险只记 note 或 minor/P2。禁止要求工头加没有测试支撑的兜底分支。
 4. 把审查结论写入：「@@SUMMARY_OUT@@」
    必须含短文 + **一个** 机器可读 fenced json：
 ```json
@@ -269,6 +281,7 @@ build_prompt_gate() {
    若到约 28 步仍未定论（见「审核原则」末条），机器块改用
    `{"status": "paused_limit", "used_steps": <已用步数>, "remaining": "<剩余待判一句话>", "findings": [...]}`：
    **status=paused_limit 时 `used_steps` 与 `remaining` 两键必填**，勿写空 HOLD、勿留空 verdict。
+   环境类失败改用 `{"status": "env_blocked", "notes": "<依赖/端口/超时/内存闸/上游 LLM/网络>", "findings": []}`，不判 HOLD。
 5. 写完 verdict 文件后停止；不要 Approve/gh；不要改 src。
 
 硬禁：room_*；改业务仓；push / gh / dsh-trial-pr；打印 API key。
@@ -288,8 +301,9 @@ build_prompt_supervisor_plan() {
 读 design_pack_read path=「@@PACK_BASENAME@@」（Goal brief）。然后：
 1. 拆 **1..max_slices** 个最小 slice（max_slices 见 brief pack frontmatter，缺省 1）；每个 slice 写一个有界 pack（相对名见 brief 的 suggested_pack，或自定 <slice>.pack.md）。
 2. Pack 必须经文件写入：@@DSH_HOME@@/supervisor/thin-state/packs/<name>.pack.md（可用 write/edit；禁止 bash cat 大段灌上下文）。
-3. Pack 的 Steps/Done when 须可执行、可验收；**不要**故意留歧义。仅当实现歧义**真实影响** Done-when（缺参/冲突/不可验证）时，才要求工头用 ask_supervisor；文案风格等无关紧要的细节自行合理默认并写进 pack。
-   - Pack frontmatter 写 `tests:`（定点测试 path 列表，如 `tests/test_x.py`，逗号或 YAML 数组均可）；只有跨模块改动或切 tip 前才写 `full_suite: true`（按目录分批全量），日常 slice 不要写。
+3. Pack 的 Steps/Done when 须可执行、可验收；**不要**故意留歧义。Done when 写相关测试 path 与运行验证方式（如何拉起程序/接口/页面核对验收点）。仅当实现歧义**真实影响** Done-when（缺参/冲突/不可验证）时，才要求工头用 ask_supervisor；文案风格等无关紧要的细节自行合理默认并写进 pack。
+   - Pack frontmatter 写 `tests:`（本片新写测试 + 直接受影响测试 path，如 `tests/test_x.py`，逗号或 YAML 数组均可）。全量回归不要写进日常 slice；只在合入前由监理按批次跑一次，那时才写 `full_suite: true`。
+   - 不要要求审查员做静态风险挑刺，也不要要求工头加没有测试撑着的防御性兜底分支。
 4. 更新或创建 Goal 状态文件：@@DSH_HOME@@/supervisor/thin-state/goals/<goal_id>.json （goal_id 见 brief）。
 5. 关票摘要写到：「@@SUMMARY_OUT@@」，文末 **一个** fenced json（多 slice 用 emit_chains）：
 ```json
@@ -329,6 +343,7 @@ build_prompt_supervisor_answer() {
   "notes": "可选"
 }
 ```
+裁决只澄清可执行规则、测试 path 与运行验证方式。不要要求工头加没有测试支撑的兜底分支，也不要把猜测性风险写成必须返工。
 硬禁：room_*；push / gh / dsh-trial-pr；空泛回复；打印 API key。
 Done when: summary 含 chain_reply + answer 非空。
 PROMPT
@@ -358,6 +373,7 @@ build_prompt_supervisor_close() {
 `dsh-trial-pr push-and-pr --repo <fengrunda/knowledge-hub|fengrunda/memory-as-training> --cwd <repo> --branch <feature> --title "…" --body "…"`
 仍禁 force / merge / 其他仓 / 裸 `git push` / 裸 `gh`。PR URL 写入 report 与机器块 pr_url。
 若失败/escalated：goal_status 用 failed 或 escalated，action 仍可读 goal_done 或 goal_report。
+若需全量回归，只在合入前由监理按批次跑一次。不要把猜测性风险当成未完成。
 硬禁：room_*；改业务 src；裸 push/gh；force/merge；打印 API key / GH_TOKEN。
 Done when: goals JSON 已更新 +（若要求 PR 则已有 open PR URL）+ summary 机器块。
 PROMPT
@@ -479,7 +495,7 @@ else
   esac
 fi
 
-# 三层测试口径热注入：foreman/gate 只跑 pack 列出的定点测试，全量交 CI。
+# 测试口径热注入：foreman/gate 只跑 L1（本片新测试 + 直接受影响测试），全量仅合入前。
 # 逻辑在 broker/pytest_scope.py，每张票重新执行本脚本即热生效；DSH_TEST_POLICY=0 可关闭。
 # --print-prompt 是纯 dry-run（不落盘、不跑子进程），故跳过本段以免 git ls-files 探针。
 if [[ ( "$PROMPT_MODE" == "foreman" || "$PROMPT_MODE" == "gate" ) \
@@ -490,15 +506,20 @@ if [[ ( "$PROMPT_MODE" == "foreman" || "$PROMPT_MODE" == "gate" ) \
   fi
 fi
 
-# 审核口径唯一权威 5 条（dsh-gate-ab-20261021-s2）：与 broker GATE_PRINCIPLES_BLOCK
-# 逐字一致（tests/test_gate_prompt_caliber_unit.py 锁住）。一次定稿，勿逐轮改措辞。
-# 只补注意力/轮次口径，不重写人格；DSH_GATE_PRINCIPLES=0 可关。
+# 审核口径唯一权威块（2026-11-06 证据核对）：与 broker GATE_PRINCIPLES_BLOCK
+# 逐字一致（tests/test_gate_prompt_caliber_unit.py 锁住）。DSH_GATE_PRINCIPLES=0 可关。
 if [[ "$PROMPT_MODE" == "gate" && "${DSH_GATE_PRINCIPLES:-1}" != "0" ]]; then
   PROMPT="$PROMPT"$'\n\n''## 审核原则
-- 只核三件事：pack Done-when / 设计对齐 / P0–P1；其余细节不审。
-- 只有 P2 时判 PASS，P2 写进 findings 备注，不得因 P2 HOLD。
-- 工头摘要已有同命令结果则只读复核，不重跑。
-- 全量回归交 CI；定点测试缺证据才补跑一次。
+- 审查 = 证据核对，测试分层控节奏。只核三件事：(a) TDD 证据：本片测试先红后绿且钉住 Done when；(b) 实证运行证据覆盖验收点；(c) 符合 pack/设计与 Forbidden、未越界。
+- 猜测性风险（「可能空指针」「可能并发乱序」等）必须附能跑红的测试或可复现步骤，否则只记 note，不判 HOLD、不进返工。
+- HOLD 只有三类：缺测试或未先红/未绿；缺运行证据或不覆盖验收点；偏离设计/越界/安全数据风险（附证据）。minor/P2 判 PASS 附备注。
+- 禁止要求工头加没有测试支撑的兜底分支。
+- 不重跑工头已跑绿的测试，只核记录；记录缺失时才补跑一次定点测试。只看增量；复审只核上轮未过项。
+- 环境类失败（依赖缺失、端口、超时、内存闸、上游 LLM/网络）→ 机器块写 status=env_blocked，不要写 verdict=HOLD，也不要把环境失败记成 P0/P1 或 unmet_acceptance。
+
+## 测试口径
+- 只跑本片新写测试 + 直接受影响测试文件（L1）；绿了就停，不跑全量。全量回归只在合入前由监理按批次跑一次。
+- 测试只回传摘要 + 失败用例；完整日志落盘（如 `<artifact或cwd>/.dsh-test-logs/<ticket>-<n>.log` 或现有 artifact 目录），对话/摘要里只留路径。例如 `pytest -q ... > log 2>&1; tail -n 30 log`，或 `-rf` 只列失败。
 - 到约 28 步仍未定论：summary 写 status=paused_limit（勿空 HOLD），交监理五选一。'
 fi
 

@@ -192,8 +192,10 @@ def test_gate_fallback_without_tests(tmp_path):
     diff = "```diff\ndiff --git a/src/foo.py b/src/foo.py\n--- a/src/foo.py\n+++ b/src/foo.py\n```\n"
     pack = _pack(tmp_path, "", diff)
     out = pytest_scope.build_section("gate", str(pack), str(repo))
-    assert "无对应测试，不跑测试，只读审查" in out
-    assert "pytest" not in out
+    assert "无对应测试，不跑测试" in out
+    assert "只读审查" not in out
+    assert "- `python3 -m pytest" not in out
+    assert "- `pytest " not in out
 
 
 def test_foreman_without_tests_rule(tmp_path):
@@ -201,6 +203,16 @@ def test_foreman_without_tests_rule(tmp_path):
     out = pytest_scope.build_section("foreman", str(pack), str(tmp_path))
     assert "no_targeted_tests" in out
     assert "test_foo*.py" in out
+    assert "先" in out and "跑红" in out
+
+
+def test_both_modes_require_log_on_disk(tmp_path):
+    pack = _pack(tmp_path, "tests: tests/test_a.py\n")
+    for mode in ("foreman", "gate"):
+        out = pytest_scope.build_section(mode, str(pack), str(tmp_path))
+        assert "摘要 + 失败用例" in out, mode
+        assert "日志落盘" in out, mode
+        assert ".dsh-test-logs" in out, mode
 
 
 def test_cli_error_prints_empty_exit_zero(tmp_path):

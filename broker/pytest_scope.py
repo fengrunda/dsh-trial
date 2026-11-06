@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""三层测试口径注入（纯标准库，可 import，也可 CLI）。
+"""测试口径注入（纯标准库，可 import，也可 CLI）。
 
-规则：工头/gate 只跑 pack 列出的定点测试；全量回归交 PR 的 CI；只有 pack
-显式 `full_suite: true`（跨模块改动 / 切 tip 前）才分批全量。
-broker 每张票重新执行 open-slice.sh，因此放在这里即可热生效。
+规则：工头/gate 只跑本片新写测试 + 直接受影响测试文件（L1），绿了就停；
+全量回归只在合入前由监理按批次跑一次。只有 pack 显式 `full_suite: true`
+才按目录分批全量。broker 每张票重新执行 open-slice.sh，因此放在这里即可热生效。
 
 CLI: python3 pytest_scope.py --mode foreman|gate <pack_path> <cwd>
 任何异常都打印空并 exit 0 —— 失败=不注入，保持原 prompt。
@@ -15,12 +15,21 @@ import subprocess
 import sys
 from pathlib import Path
 
-HEADING = "## 测试口径（定点优先；全量交 CI）"
+HEADING = "## 测试口径（L1 定点；全量仅合入前）"
 HARD_RULE = (
-    "只跑上面列出的测试，**不要**自行升级到全仓/全量"
-    "（全量回归由 PR 的 CI 负责）。"
+    "只跑本片新写测试 + 直接受影响测试文件（L1），绿了就停，**不要**自行升级到全仓/全量"
+    "（全量回归只在合入前由监理按批次跑一次）。"
 )
-GATE_NOTE = "工头摘要已有同命令结果时可只读复核，不必重跑；只审 delta。"
+GATE_NOTE = (
+    "不重跑工头已跑绿的测试，只核记录；记录缺失时才补跑一次定点测试。"
+    "只看增量；复审只核上轮未过项。"
+    "猜测性风险无红测或可复现步骤只记 note，不判 HOLD。"
+)
+LOG_DISCIPLINE = (
+    "测试只回传摘要 + 失败用例；完整日志落盘"
+    "（如 `<artifact或cwd>/.dsh-test-logs/<ticket>-<n>.log` 或现有 artifact 目录），"
+    "对话/摘要里只留路径。例如 `pytest -q ... > log 2>&1; tail -n 30 log`，或 `-rf` 只列失败。"
+)
 
 _BACKTICK_RE = re.compile(r"`([^`\n]+)`")
 _DIFF_BLOCK_RE = re.compile(r"```diff\s*\n(.*?)```", re.DOTALL)
@@ -187,6 +196,8 @@ def _cmd_line(cmds: list[str]) -> list[str]:
 
 
 def _section(lines: list[str]) -> str:
+    if LOG_DISCIPLINE not in lines:
+        lines = [*lines, LOG_DISCIPLINE]
     return "\n".join(lines).strip() + "\n"
 
 
@@ -196,7 +207,7 @@ def _fallback_gate(pack_text: str, cwd: str) -> str:
     if not tests:
         return _section([
             HEADING, "",
-            "无对应测试，不跑测试，只读审查。",
+            "无对应测试，不跑测试。缺 TDD 证据按审核原则记 HOLD，不要用静态猜测挑刺。",
             "",
             HARD_RULE,
             GATE_NOTE,
@@ -215,10 +226,12 @@ def _fallback_foreman() -> str:
     return _section([
         HEADING, "",
         "规则（本 pack 未列 tests，也没有定点命令）：",
-        "- 改完后，对每个改动的源文件 `foo.py`，用 `git ls-files` 找对应的 "
-        "`test_foo*.py` / `foo_test.py`（仓内任意目录），只跑这些测试"
-        "（`python3 -m pytest -q <files>`）。",
-        "- 找不到对应测试就不跑；并在摘要 notes 写 `no_targeted_tests`。",
+        "- 按 TDD：先为 Done when 写/改测试并跑红，再改实现到绿；只跑本片新写测试 + "
+        "直接受影响测试文件（`python3 -m pytest -q <files>`）。",
+        "- 改动的源文件 `foo.py` 用 `git ls-files` 找对应的 "
+        "`test_foo*.py` / `foo_test.py`（仓内任意目录）。",
+        "- 找不到可挂靠的测试文件就新建；不要在摘要 notes 写 `no_targeted_tests` 跳过。"
+        "不得为过审加没有测试撑着的防御性兜底分支。",
         "",
         HARD_RULE,
     ])
@@ -269,7 +282,7 @@ def build_section(mode: str, pack_path: str, cwd: str) -> str:
                 batches.append(f"python3 -m pytest -q {d}")
         return _section([
             HEADING, "",
-            "本 pack 显式要求全量：按下列目录分批跑（逐批记录结果，"
+            "本 pack 显式要求全量：仅合入前由监理按下列目录分批跑（逐批记录结果，"
             "某批失败不阻断后续批次）：",
             *_cmd_line(batches),
             "",

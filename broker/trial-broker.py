@@ -170,16 +170,23 @@ MAX_DIFF_BYTES = int(os.environ.get("TRIAL_MAX_DIFF_BYTES", "6144"))
 PROD_BROKER = DSH_HOME / "broker-khub-prod"
 PROD_RESTART = DSH_HOME / "bin" / "khub-broker-restart.sh"
 
-# Gate review caliber (slice dsh-gate-ab-20261021-s2): one authoritative 5-line
-# block, injected verbatim both by open-slice.sh (PROMPT_MODE=gate) and by the
-# gate packs written below. Wording is frozen — do not re-litigate it per round.
+# Gate review caliber (2026-11-06): evidence check, not static nitpicking.
+# One authoritative block, injected verbatim both by open-slice.sh
+# (PROMPT_MODE=gate) and by the gate packs written below. open-slice.sh must
+# stay byte-for-byte with this string (tests/test_gate_prompt_caliber_unit.py).
 GATE_SOFT_MAX_STEPS = 28
 
 GATE_PRINCIPLES_BLOCK = f"""## 审核原则
-- 只核三件事：pack Done-when / 设计对齐 / P0–P1；其余细节不审。
-- 只有 P2 时判 PASS，P2 写进 findings 备注，不得因 P2 HOLD。
-- 工头摘要已有同命令结果则只读复核，不重跑。
-- 全量回归交 CI；定点测试缺证据才补跑一次。
+- 审查 = 证据核对，测试分层控节奏。只核三件事：(a) TDD 证据：本片测试先红后绿且钉住 Done when；(b) 实证运行证据覆盖验收点；(c) 符合 pack/设计与 Forbidden、未越界。
+- 猜测性风险（「可能空指针」「可能并发乱序」等）必须附能跑红的测试或可复现步骤，否则只记 note，不判 HOLD、不进返工。
+- HOLD 只有三类：缺测试或未先红/未绿；缺运行证据或不覆盖验收点；偏离设计/越界/安全数据风险（附证据）。minor/P2 判 PASS 附备注。
+- 禁止要求工头加没有测试支撑的兜底分支。
+- 不重跑工头已跑绿的测试，只核记录；记录缺失时才补跑一次定点测试。只看增量；复审只核上轮未过项。
+- 环境类失败（依赖缺失、端口、超时、内存闸、上游 LLM/网络）→ 机器块写 status=env_blocked，不要写 verdict=HOLD，也不要把环境失败记成 P0/P1 或 unmet_acceptance。
+
+## 测试口径
+- 只跑本片新写测试 + 直接受影响测试文件（L1）；绿了就停，不跑全量。全量回归只在合入前由监理按批次跑一次。
+- 测试只回传摘要 + 失败用例；完整日志落盘（如 `<artifact或cwd>/.dsh-test-logs/<ticket>-<n>.log` 或现有 artifact 目录），对话/摘要里只留路径。例如 `pytest -q ... > log 2>&1; tail -n 30 log`，或 `-rf` 只列失败。
 - 到约 {GATE_SOFT_MAX_STEPS} 步仍未定论：summary 写 status=paused_limit（勿空 HOLD），交监理五选一。"""
 
 
@@ -3398,11 +3405,11 @@ summary_out: $DSH_HOME/supervisor/thin-state/summaries/{_gate_summary_name_for_p
 {GATE_PRINCIPLES_BLOCK}
 
 ## Done when
-- Delta-only: verify prior findings fixed; note any new P0/P1.
+- 复审只核上轮未过项，以及新 diff 是否破坏 TDD 证据、实证运行或越界；猜测性风险无红测或可复现步骤只记 note，不判 HOLD。
 - 禁止通读全文件/原 pack/全仓；只核对上述 diff 与 FAIL 清单，必要时 sed -n 小段。
-- Write verdict PASS|HOLD with machine json (findings/unmet_acceptance).
+- Write verdict PASS|HOLD with machine json (findings/unmet_acceptance). 环境类失败写 status=env_blocked，不判 HOLD。
 - 到约 28 步仍未定论：机器块写 status=paused_limit 并带 used_steps / remaining 两键（勿空 HOLD）。
-- No room_*; do not modify business src.
+- 禁止要求工头加没有测试支撑的兜底分支。No room_*; do not modify business src.
 """
 
     body = _assemble(diff, foreman_text, findings_json)
@@ -3771,10 +3778,10 @@ max_bytes_hint: {MAX_PACK_BYTES}
 {GATE_PRINCIPLES_BLOCK}
 
 ## Done when
-- Write verdict to summary_out with machine json block (verdict PASS|HOLD + findings).
+- Write verdict to summary_out with machine json block (verdict PASS|HOLD + findings). 环境类失败写 status=env_blocked，不判 HOLD。
 - 到约 28 步仍未定论：机器块写 status=paused_limit 并带 used_steps / remaining 两键（勿空 HOLD）。
-- 禁止通读全文件/原 pack/全仓；只核对上述 diff 与 FAIL 清单，必要时 sed -n 小段。
-- Delta-only review; no room_*; do not modify business src.
+- 禁止通读全文件/原 pack/全仓；只核对上述 diff、TDD/运行证据与上轮未过项，必要时 sed -n 小段。
+- 只看增量；禁止要求工头加没有测试支撑的兜底分支。no room_*; do not modify business src.
 """
     path.write_text(body, encoding="utf-8")
     # If over cap, shrink diff section further
@@ -3974,11 +3981,14 @@ max_bytes_hint: {MAX_PACK_BYTES}
 {diff}
 ```
 
+{GATE_PRINCIPLES_BLOCK}
+
 ## Done when
 - Write verdict to summary_out with machine json block (verdict PASS|HOLD + findings).
-- 一次审整 PR：注意力不丢不偏、符合设计；P2 措辞不默认 HOLD。
+- 复审只核各片 TDD 证据、实证运行与是否越界；minor/P2 判 PASS 附备注。环境类失败写 status=env_blocked，不判 HOLD。
+- 到约 28 步仍未定论：机器块写 status=paused_limit 并带 used_steps / remaining 两键（勿空 HOLD）。
 - 禁止通读全仓；只核上述 diff 与各片摘要。
-- Delta-only review; no room_*; do not modify business src.
+- 禁止要求工头加没有测试支撑的兜底分支。no room_*; do not modify business src.
 """
     path.write_text(body, encoding="utf-8")
     for _ in range(4):
@@ -4103,6 +4113,7 @@ RESOLUTION_TERMINAL_STATUSES = ("fixed", "deferred", "wontfix", "resolved")
 
 _FIX_PACK_DONE_WHEN = """## Done when
 - Fix every P0/P1 finding above; keep changes minimal.
+- 按 TDD：先写/改能跑红的测试，再改实现到绿；不得为过审加没有测试撑着的防御性兜底分支。
 - For EACH finding write a `finding_resolutions` entry in the summary machine block:
   `{"finding": "…or tier+issue", "change": "file:line or path+symbol", "status": "fixed|deferred|wontfix", "reason": "required when not fixed"}`.
 - Unfixed P0/P1: use status=blocked/question, or keep reworking inplace and call submit_for_review again. Never status=done with an unresolved P0/P1.
@@ -4374,6 +4385,7 @@ max_bytes_hint: {MAX_PACK_BYTES}
 
 ## Done when
 - Incorporate the supervisor answer; continue implementation.
+- 按 TDD 先红后绿，并做一次真实运行验证覆盖 Done when；不得加没有测试撑着的兜底分支。
 - Write the foreman structured summary machine block.
 - No room_*.
 

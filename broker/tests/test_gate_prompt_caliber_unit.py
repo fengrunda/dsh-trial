@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Gate review caliber: one frozen 5-line block, one soft step cap.
+"""Gate review caliber: evidence check (TDD + run + design), one soft step cap.
 
-Regression lock for dsh-gate-ab-20261021-s2:
+Regression lock (2026-11-06 口径，取代「只核 Done-when / 设计对齐 / P0–P1」):
 
   a. ``GATE_PRINCIPLES_BLOCK`` is the single authority; ``open-slice.sh``
      (``PROMPT_MODE=gate``) must render it byte-for-byte;
   b. ``build_gate_pack`` and ``build_delta_gate_pack`` both inject it right
      before ``## Done when`` — so delta/rev packs cannot lose the caliber;
-  c. the block carries the four keywords the gate relies on
-     (``P0–P1`` / ``P2`` / ``只读复核`` / ``paused_limit``) plus the soft cap 28;
+  c. the block carries TDD 证据 / 实证运行 / 猜测性风险不判 HOLD / 禁止兜底 /
+     测试日志落盘，并保留 paused_limit 与软上限 28;
   d. ``role_step_budget("gate", ...)`` resolves gate_max_steps -> role table ->
      28 without raising on bad values, and ``_spawn_env("gate")`` exports
      ``DSH_GATE_MAX_STEPS`` for the plugin hint (temp limits only).
@@ -33,7 +33,19 @@ _spec.loader.exec_module(tb)
 
 T = tb.T
 REPO = ROOT.parent
-KEYWORDS = ("P0–P1", "P2", "只读复核", "paused_limit")
+KEYWORDS = (
+    "TDD 证据",
+    "实证运行",
+    "猜测性风险",
+    "不判 HOLD",
+    "禁止要求",
+    "兜底",
+    "摘要 + 失败用例",
+    "日志落盘",
+    "paused_limit",
+    "env_blocked",
+)
+OLD_CALIBER = ("设计对齐 / P0–P1", "只读复核")
 
 
 def _open_slice_block() -> str:
@@ -84,12 +96,17 @@ def _delta_pack_body(tmp_path: Path) -> str:
 # ---------------------------------------------------------------------------
 # a. one frozen block, rendered identically by both injection paths
 # ---------------------------------------------------------------------------
-def test_block_is_the_five_line_caliber():
+def test_block_is_the_evidence_caliber():
     lines = tb.GATE_PRINCIPLES_BLOCK.strip().splitlines()
     assert lines[0] == "## 审核原则"
-    assert len(lines) == 6, lines  # heading + 5 rules
+    assert "## 测试口径" in tb.GATE_PRINCIPLES_BLOCK
     for kw in KEYWORDS:
         assert kw in tb.GATE_PRINCIPLES_BLOCK, kw
+    assert "猜测性风险" in tb.GATE_PRINCIPLES_BLOCK and "不判 HOLD" in tb.GATE_PRINCIPLES_BLOCK
+    assert "禁止要求" in tb.GATE_PRINCIPLES_BLOCK and "兜底" in tb.GATE_PRINCIPLES_BLOCK
+    assert "摘要 + 失败用例" in tb.GATE_PRINCIPLES_BLOCK and "日志落盘" in tb.GATE_PRINCIPLES_BLOCK
+    for old in OLD_CALIBER:
+        assert old not in tb.GATE_PRINCIPLES_BLOCK, old
     assert tb.GATE_SOFT_MAX_STEPS == 28
     assert f"约 {tb.GATE_SOFT_MAX_STEPS} 步" in tb.GATE_PRINCIPLES_BLOCK
 
